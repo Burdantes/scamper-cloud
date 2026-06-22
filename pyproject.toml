@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scamperctl"
+version = "0.1.0"
+description = "Provision GCP measurement VMs and deploy containerized experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+scamperctl = "scamperctl.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["scamperctl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

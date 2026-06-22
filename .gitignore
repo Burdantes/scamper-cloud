@@ -1,0 +1,26 @@
+# Local profiles, run inventories, and generated startup scripts
+.scamper/
+
+# Measurement inputs and outputs stay outside the public control plane
+datasets/
+outputs/
+*.warts
+
+# Credentials and environment configuration
+.env
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store

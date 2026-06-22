@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+
+_NAME_PATTERN = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def validate_resource_name(value: str, field_name: str = "name") -> str:
+    if not _NAME_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"{field_name} must start with a lowercase letter, contain only "
+            "lowercase letters, numbers, or hyphens, and be at most 63 characters"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class GCPProfile:
+    name: str
+    project: str
+    configuration: str = "default"
+    use_iap: bool = False
+
+    def __post_init__(self) -> None:
+        validate_resource_name(self.name, "profile name")
+        if not self.project.strip():
+            raise ValueError("project cannot be empty")
+        if not self.configuration.strip():
+            raise ValueError("gcloud configuration cannot be empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": "gcp",
+            "project": self.project,
+            "configuration": self.configuration,
+            "use_iap": self.use_iap,
+        }
+
+    @classmethod
+    def from_dict(cls, name: str, value: dict[str, Any]) -> "GCPProfile":
+        if value.get("provider") != "gcp":
+            raise ValueError(f"profile {name!r} is not a GCP profile")
+        return cls(
+            name=name,
+            project=str(value["project"]),
+            configuration=str(value.get("configuration", "default")),
+            use_iap=bool(value.get("use_iap", False)),
+        )
+
+
+@dataclass(frozen=True)
+class Instance:
+    name: str
+    zone: str
+    machine_type: str
+    external_ip: str | None = None
+    status: str = "UNKNOWN"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "zone": self.zone,
+            "machine_type": self.machine_type,
+            "external_ip": self.external_ip,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "Instance":
+        return cls(
+            name=str(value["name"]),
+            zone=str(value["zone"]),
+            machine_type=str(value["machine_type"]),
+            external_ip=value.get("external_ip"),
+            status=str(value.get("status", "UNKNOWN")),
+        )
+
+
+@dataclass(frozen=True)
+class Deployment:
+    experiment: str
+    image: str
+    registry_auth: str
+    target_file: str
+    scamper_args: str
+    deployed_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "experiment": self.experiment,
+            "image": self.image,
+            "registry_auth": self.registry_auth,
+            "target_file": self.target_file,
+            "scamper_args": self.scamper_args,
+            "deployed_at": self.deployed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "Deployment":
+        return cls(
+            experiment=str(value["experiment"]),
+            image=str(value["image"]),
+            registry_auth=str(value.get("registry_auth", "auto")),
+            target_file=str(value["target_file"]),
+            scamper_args=str(value["scamper_args"]),
+            deployed_at=str(value["deployed_at"]),
+        )
+
+
+@dataclass(frozen=True)
+class RunInventory:
+    run_id: str
+    profile: str
+    project: str
+    machine_type: str
+    created_at: str = field(default_factory=utc_now)
+    instances: tuple[Instance, ...] = ()
+    deployments: tuple[Deployment, ...] = ()
+    destroyed_at: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_resource_name(self.run_id, "run ID")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "provider": "gcp",
+            "run_id": self.run_id,
+            "profile": self.profile,
+            "project": self.project,
+            "machine_type": self.machine_type,
+            "created_at": self.created_at,
+            "instances": [instance.to_dict() for instance in self.instances],
+            "deployments": [deployment.to_dict() for deployment in self.deployments],
+            "destroyed_at": self.destroyed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "RunInventory":
+        if value.get("provider") != "gcp":
+            raise ValueError("only GCP run inventories are currently supported")
+        return cls(
+            run_id=str(value["run_id"]),
+            profile=str(value["profile"]),
+            project=str(value["project"]),
+            machine_type=str(value["machine_type"]),
+            created_at=str(value["created_at"]),
+            instances=tuple(Instance.from_dict(item) for item in value.get("instances", [])),
+            deployments=tuple(
+                Deployment.from_dict(item) for item in value.get("deployments", [])
+            ),
+            destroyed_at=value.get("destroyed_at"),
+        )
