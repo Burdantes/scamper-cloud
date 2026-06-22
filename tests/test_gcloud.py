@@ -47,7 +47,7 @@ def test_every_gcloud_command_pins_configuration_and_project() -> None:
         "--service-account=measurement-vm@example-project.iam.gserviceaccount.com"
         in command
     )
-    assert "--scopes=https://www.googleapis.com/auth/cloud-platform" in command
+    assert "--scopes=https://www.googleapis.com/auth/devstorage.read_only" in command
 
 
 def test_create_instance_parses_external_ip() -> None:

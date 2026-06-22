@@ -110,7 +110,7 @@ class GCloudClient:
             args.extend(
                 [
                     f"--service-account={service_account}",
-                    "--scopes=https://www.googleapis.com/auth/cloud-platform",
+                    "--scopes=https://www.googleapis.com/auth/devstorage.read_only",
                 ]
             )
         args.append("--format=json")

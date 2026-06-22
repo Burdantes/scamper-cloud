@@ -36,6 +36,10 @@ The operator creating VMs also needs permission to attach this service account,
 normally `iam.serviceAccounts.actAs` through Service Account User on the chosen
 identity.
 
+`scamperctl` attaches the identity with the read-only storage OAuth scope used
+for Artifact Registry pulls. IAM and access scopes are both enforced, so the
+service account still needs `roles/artifactregistry.reader` on the repository.
+
 ## How image pulls authenticate
 
 When `--registry-auth artifact-registry` is selected, `scamperctl` runs the

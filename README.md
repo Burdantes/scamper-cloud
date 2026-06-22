@@ -81,6 +81,9 @@ scamperctl provision \
 
 Provisioning installs Docker but does not copy experiment code or credentials.
 `--max-vms` is a cost-safety ceiling, including when `--zones all` is used.
+When a service account is attached, the VM receives only the read-only storage
+OAuth scope needed to pull Artifact Registry images; it does not receive a broad
+`cloud-platform` token.
 
 ## 3. Deploy a private experiment image
 
