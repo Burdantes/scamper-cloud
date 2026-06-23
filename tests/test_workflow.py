@@ -4,7 +4,7 @@ from typing import Sequence
 import pytest
 
 from scamperctl.gcloud import GCloudClient
-from scamperctl.models import CostGuard, GCPProfile, Instance, RunInventory
+from scamperctl.models import CostGuard, GCPProfile, Instance, RunInventory, SSHAccess
 from scamperctl.runner import CommandResult
 from scamperctl.store import Store
 from scamperctl.workflow import (
@@ -14,6 +14,7 @@ from scamperctl.workflow import (
     deployment_commands,
     instance_name,
     one_zone_per_region,
+    prepare_ssh_metadata,
     provision,
     resolved_registry_auth,
 )
@@ -139,6 +140,47 @@ def test_cost_guard_adds_server_side_auto_delete(tmp_path: Path) -> None:
 
     assert "--max-run-duration=5400s" in command
     assert "--instance-termination-action=DELETE" in command
+
+
+def test_provision_plan_attaches_collaborator_public_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gcloud_client = client()
+    monkeypatch.setattr(gcloud_client, "project_os_login_enabled", lambda: False)
+    access = SSHAccess(
+        username="collaborator",
+        public_key="ssh-ed25519 cmVwcmVzZW50YXRpdmUta2V5 collaborator@test",
+    )
+    options = ProvisionOptions(
+        run_id="shared",
+        zones=("us-central1-a",),
+        machine_type="e2-small",
+        max_vms=1,
+        ssh_access=access,
+    )
+
+    plan = build_provision_plan(gcloud_client, options, tmp_path / "startup.sh")
+    command = plan["instances"][0]["command"]
+    metadata_path = tmp_path / "ssh-keys"
+
+    assert metadata_path.read_text(encoding="utf-8") == access.metadata_line + "\n"
+    assert any(f"ssh-keys={metadata_path}" in arg for arg in command)
+    assert plan["ssh_access"]["username"] == "collaborator"
+    assert access.public_key not in str(plan)
+
+
+def test_metadata_ssh_access_rejects_os_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gcloud_client = client()
+    monkeypatch.setattr(gcloud_client, "project_os_login_enabled", lambda: True)
+    access = SSHAccess(
+        username="collaborator",
+        public_key="ssh-ed25519 cmVwcmVzZW50YXRpdmUta2V5 collaborator@test",
+    )
+
+    with pytest.raises(ValueError, match="OS Login is enabled"):
+        prepare_ssh_metadata(gcloud_client, access, tmp_path)
 
 
 def test_long_instance_names_remain_valid() -> None:

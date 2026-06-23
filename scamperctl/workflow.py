@@ -15,6 +15,7 @@ from scamperctl.models import (
     Deployment,
     Instance,
     RunInventory,
+    SSHAccess,
     utc_now,
     validate_resource_name,
 )
@@ -41,6 +42,7 @@ class ProvisionOptions:
     service_account: str | None = None
     max_vms: int = 20
     cost_guard: CostGuard | None = None
+    ssh_access: SSHAccess | None = None
 
     def __post_init__(self) -> None:
         validate_resource_name(self.run_id, "run ID")
@@ -75,6 +77,24 @@ def instance_name(run_id: str, zone: str, index: int) -> str:
         return candidate
     digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:8]
     return f"{candidate[:54].rstrip('-')}-{digest}"
+
+
+def prepare_ssh_metadata(
+    client: GCloudClient,
+    access: SSHAccess | None,
+    run_directory: Path,
+) -> Path | None:
+    if access is None:
+        return None
+    if client.project_os_login_enabled():
+        raise ValueError(
+            "project OS Login is enabled, so Compute Engine would ignore metadata "
+            "SSH keys; grant the collaborator an OS Login IAM role instead"
+        )
+    path = run_directory / "ssh-keys"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(access.metadata_line + "\n", encoding="utf-8")
+    return path
 
 
 def shell_join(args: Iterable[str]) -> str:
@@ -203,6 +223,11 @@ def build_provision_plan(
         if options.cost_guard is not None
         else None
     )
+    ssh_keys_file = prepare_ssh_metadata(
+        client,
+        options.ssh_access,
+        startup_path.parent,
+    )
     instances: list[dict[str, Any]] = []
     for zone in zones:
         for index in range(1, options.count_per_zone + 1):
@@ -219,6 +244,7 @@ def build_provision_plan(
                 startup_script=startup_path,
                 service_account=options.service_account,
                 max_run_duration_seconds=max_run_duration_seconds,
+                ssh_keys_file=ssh_keys_file,
             )
             instances.append({"name": name, "zone": zone, "command": command})
 
@@ -236,6 +262,15 @@ def build_provision_plan(
         "region_count": len({region_from_zone(zone) for zone in zones}),
         "vm_count": count,
         "cost_guard": options.cost_guard.to_dict() if options.cost_guard else None,
+        "ssh_access": (
+            {
+                "username": options.ssh_access.username,
+                "fingerprint": options.ssh_access.fingerprint,
+                "metadata_file": str(ssh_keys_file),
+            }
+            if options.ssh_access is not None
+            else None
+        ),
         "estimated_cost_ceiling": cost_ceiling,
         "warnings": (
             []
@@ -300,6 +335,11 @@ def provision(
             max_run_duration_seconds=(
                 ceil(options.cost_guard.max_runtime_hours * 3600)
                 if options.cost_guard is not None
+                else None
+            ),
+            ssh_keys_file=(
+                store.run_directory(options.run_id) / "ssh-keys"
+                if options.ssh_access is not None
                 else None
             ),
         )

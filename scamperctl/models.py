@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import base64
 import re
+from binascii import Error as Base64Error
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha256
 from math import isfinite
 from typing import Any
 
 
 _NAME_PATTERN = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_SSH_USER_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+_SUPPORTED_SSH_KEY_TYPES = {
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "sk-ssh-ed25519@openssh.com",
+    "ssh-ed25519",
+    "ssh-rsa",
+}
 
 
 def utc_now() -> str:
@@ -125,6 +138,45 @@ class CostGuard:
             max_runtime_hours=float(value["max_runtime_hours"]),
             max_estimated_cost_usd=float(value["max_estimated_cost_usd"]),
         )
+
+
+@dataclass(frozen=True)
+class SSHAccess:
+    username: str
+    public_key: str
+
+    def __post_init__(self) -> None:
+        if self.username == "root" or not _SSH_USER_PATTERN.fullmatch(self.username):
+            raise ValueError(
+                "SSH username must be a non-root Linux username containing only "
+                "lowercase letters, numbers, underscores, or hyphens"
+            )
+        if len(self.public_key.splitlines()) != 1:
+            raise ValueError("SSH public key must contain exactly one line")
+        parts = self.public_key.strip().split()
+        if len(parts) < 2 or parts[0] not in _SUPPORTED_SSH_KEY_TYPES:
+            raise ValueError("file does not contain a supported OpenSSH public key")
+        encoded = parts[1]
+        try:
+            decoded = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4),
+                validate=True,
+            )
+        except (Base64Error, ValueError) as err:
+            raise ValueError("SSH public key body is not valid base64") from err
+        if not decoded:
+            raise ValueError("SSH public key body cannot be empty")
+
+    @property
+    def metadata_line(self) -> str:
+        return f"{self.username}:{self.public_key.strip()}"
+
+    @property
+    def fingerprint(self) -> str:
+        encoded = self.public_key.strip().split()[1]
+        decoded = base64.b64decode(encoded + "=" * (-len(encoded) % 4))
+        digest = base64.b64encode(sha256(decoded).digest()).decode("ascii")
+        return f"SHA256:{digest.rstrip('=')}"
 
 
 @dataclass(frozen=True)

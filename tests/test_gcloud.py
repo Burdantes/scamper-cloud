@@ -41,6 +41,7 @@ def test_every_gcloud_command_pins_configuration_and_project() -> None:
         startup_script=Path("startup.sh"),
         service_account="measurement-vm@example-project.iam.gserviceaccount.com",
         max_run_duration_seconds=3600,
+        ssh_keys_file=Path("ssh-keys"),
     )
 
     assert "--configuration=research" in command
@@ -53,6 +54,7 @@ def test_every_gcloud_command_pins_configuration_and_project() -> None:
     assert "--scopes=https://www.googleapis.com/auth/devstorage.read_only" in command
     assert "--max-run-duration=3600s" in command
     assert "--instance-termination-action=DELETE" in command
+    assert any("ssh-keys=ssh-keys" in arg for arg in command)
 
 
 def test_machine_type_zone_listing_parses_zone_urls() -> None:
@@ -64,6 +66,18 @@ def test_machine_type_zone_listing_parses_zone_urls() -> None:
 
     assert client.list_machine_type_zones("e2-small") == ["us-central1-a"]
     assert "--filter=name=e2-small" in runner.commands[0]
+
+
+def test_project_os_login_detection() -> None:
+    response = CommandResult(
+        stdout=(
+            '{"commonInstanceMetadata":{"items":['
+            '{"key":"enable-oslogin","value":"TRUE"}]}}'
+        )
+    )
+    client = GCloudClient(profile(), FakeRunner([response]))
+
+    assert client.project_os_login_enabled() is True
 
 
 def test_create_instance_parses_external_ip() -> None:

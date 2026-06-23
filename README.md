@@ -131,6 +131,31 @@ alert rather than automatically cap spending. See
 [Regional fan-out and cost controls](docs/regional-fanout-and-costs.md) for the
 full safety model and command flow.
 
+### Give a collaborator SSH access
+
+Ask the collaborator for their OpenSSH public key (`*.pub`) only. Add these two
+options to the provision command above to attach it to every VM in the run:
+
+```bash
+--ssh-user collaborator \
+--ssh-public-key /path/to/collaborator-id-ed25519.pub
+```
+
+The dry-run plan reports the username and key fingerprint without printing the
+key body. With `--apply`, the public key is added to each VM's instance metadata;
+it is not added project-wide. The collaborator connects with their private key:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 collaborator@VM_EXTERNAL_IP
+```
+
+The collaborator effectively controls the disposable VM and may receive sudo
+access from the Compute Engine guest environment. Keep the VM service account
+least-privileged and restrict TCP/22 ingress to trusted source addresses. If OS
+Login is enabled for the project, metadata keys are ignored and the plan fails
+with guidance instead of creating inaccessible VMs. See
+[Collaborator SSH access](docs/collaborator-ssh.md) for details.
+
 ## 3. Deploy a private experiment image
 
 Grant the VM service account Artifact Registry Reader access to the private

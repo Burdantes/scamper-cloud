@@ -77,6 +77,28 @@ class GCloudClient:
             raise CommandFailed("gcloud machine type zone list did not return a JSON list")
         return sorted(str(value["zone"]).rsplit("/", 1)[-1] for value in values)
 
+    def project_info_args(self) -> list[str]:
+        return self._command(
+            "compute",
+            "project-info",
+            "describe",
+            "--format=json(commonInstanceMetadata.items)",
+        )
+
+    def project_os_login_enabled(self) -> bool:
+        result = self.runner.run(self.project_info_args())
+        value = _parse_json(result.stdout, "checking project OS Login metadata")
+        if not isinstance(value, dict):
+            raise CommandFailed("gcloud project info did not return a JSON object")
+        metadata = value.get("commonInstanceMetadata", {})
+        items = metadata.get("items", []) if isinstance(metadata, dict) else []
+        return any(
+            str(item.get("key", "")).lower() == "enable-oslogin"
+            and str(item.get("value", "")).lower() == "true"
+            for item in items
+            if isinstance(item, dict)
+        )
+
     def machine_type_list_args(self, zone: str) -> list[str]:
         return self._command(
             "compute",
@@ -107,7 +129,11 @@ class GCloudClient:
         startup_script: Path,
         service_account: str | None = None,
         max_run_duration_seconds: int | None = None,
+        ssh_keys_file: Path | None = None,
     ) -> list[str]:
+        metadata_files = f"startup-script={startup_script}"
+        if ssh_keys_file is not None:
+            metadata_files = f"{metadata_files},ssh-keys={ssh_keys_file}"
         args = [
             "compute",
             "instances",
@@ -121,7 +147,7 @@ class GCloudClient:
             f"--network={network}",
             "--tags=scamperctl",
             f"--labels=managed-by=scamperctl,scamper-run={run_id}",
-            f"--metadata-from-file=startup-script={startup_script}",
+            f"--metadata-from-file={metadata_files}",
         ]
         if service_account:
             args.extend(

@@ -11,7 +11,7 @@ from typing import Sequence
 
 from scamperctl.cost import cost_snapshot
 from scamperctl.gcloud import GCloudClient
-from scamperctl.models import CostGuard, GCPProfile
+from scamperctl.models import CostGuard, GCPProfile, SSHAccess
 from scamperctl.runner import CommandFailed, SubprocessRunner
 from scamperctl.store import Store, default_home
 from scamperctl.workflow import (
@@ -77,6 +77,20 @@ def cost_guard_from_args(args: argparse.Namespace) -> CostGuard | None:
     )
 
 
+def ssh_access_from_args(args: argparse.Namespace) -> SSHAccess | None:
+    if args.ssh_user is None and args.ssh_public_key is None:
+        return None
+    if args.ssh_user is None or args.ssh_public_key is None:
+        raise ValueError("--ssh-user and --ssh-public-key must be provided together")
+    try:
+        public_key = args.ssh_public_key.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as err:
+        raise FileNotFoundError(
+            f"SSH public key file not found: {args.ssh_public_key}"
+        ) from err
+    return SSHAccess(username=args.ssh_user, public_key=public_key)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scamperctl",
@@ -132,6 +146,15 @@ def build_parser() -> argparse.ArgumentParser:
     provision_parser.add_argument(
         "--service-account",
         help="service account email to attach to each VM",
+    )
+    provision_parser.add_argument(
+        "--ssh-user",
+        help="Linux username to create for a collaborator on every VM",
+    )
+    provision_parser.add_argument(
+        "--ssh-public-key",
+        type=Path,
+        help="collaborator OpenSSH public-key file; never provide a private key",
     )
     provision_parser.add_argument("--max-vms", type=int, default=20)
     provision_parser.add_argument(
@@ -291,6 +314,7 @@ def execute(args: argparse.Namespace) -> int:
             service_account=args.service_account,
             max_vms=args.max_vms,
             cost_guard=cost_guard_from_args(args),
+            ssh_access=ssh_access_from_args(args),
         )
         startup_path = store.run_directory(args.run) / "startup.sh"
         startup_path.parent.mkdir(parents=True, exist_ok=True)
