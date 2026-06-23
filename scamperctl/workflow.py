@@ -4,11 +4,14 @@ import hashlib
 import json
 import shlex
 from dataclasses import dataclass, replace
+from math import ceil
 from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
 
+from scamperctl.cost import planned_cost_ceiling
 from scamperctl.gcloud import GCloudClient
 from scamperctl.models import (
+    CostGuard,
     Deployment,
     Instance,
     RunInventory,
@@ -22,6 +25,7 @@ from scamperctl.store import Store
 REMOTE_ROOT = "/var/lib/scamperctl"
 DEFAULT_SCAMPER_ARGS = '-c "trace -l 20 -g 8 -w 3 -P ICMP" -p 10000'
 RegistryAuth = Literal["auto", "none", "artifact-registry"]
+ONE_PER_REGION = "one-per-region"
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class ProvisionOptions:
     network: str = "default"
     service_account: str | None = None
     max_vms: int = 20
+    cost_guard: CostGuard | None = None
 
     def __post_init__(self) -> None:
         validate_resource_name(self.run_id, "run ID")
@@ -47,6 +52,10 @@ class ProvisionOptions:
             raise ValueError("boot disk size must be at least 10 GB")
         if self.max_vms < 1:
             raise ValueError("max VMs must be at least 1")
+
+    @property
+    def uses_one_per_region(self) -> bool:
+        return len(self.zones) == 1 and self.zones[0].lower() == ONE_PER_REGION
 
 
 def startup_script() -> str:
@@ -126,11 +135,39 @@ def image_pull_command(image: str, registry_auth: RegistryAuth) -> str:
     return shell_join(["sudo", "docker", "pull", image])
 
 
-def resolve_zones(client: GCloudClient, zones: Sequence[str]) -> tuple[str, ...]:
+def region_from_zone(zone: str) -> str:
+    region, separator, suffix = zone.rpartition("-")
+    if not separator or not region or len(suffix) != 1 or not suffix.isalpha():
+        raise ValueError(f"cannot derive a GCP region from zone {zone!r}")
+    return region
+
+
+def one_zone_per_region(zones: Sequence[str]) -> tuple[str, ...]:
+    selected: dict[str, str] = {}
+    for zone in sorted(dict.fromkeys(zones)):
+        selected.setdefault(region_from_zone(zone), zone)
+    return tuple(selected[region] for region in sorted(selected))
+
+
+def resolve_zones(
+    client: GCloudClient,
+    zones: Sequence[str],
+    machine_type: str,
+) -> tuple[str, ...]:
     if len(zones) == 1 and zones[0].lower() == "all":
         return tuple(client.list_zones())
-    if any(zone.lower() == "all" for zone in zones):
-        raise ValueError("'all' cannot be combined with explicit zones")
+    if len(zones) == 1 and zones[0].lower() == ONE_PER_REGION:
+        active_zones = set(client.list_zones())
+        supported_zones = set(client.list_machine_type_zones(machine_type))
+        available = sorted(active_zones & supported_zones)
+        if not available:
+            raise ValueError(
+                f"machine type {machine_type!r} was not found in any active zone"
+            )
+        return one_zone_per_region(available)
+    sentinels = {"all", ONE_PER_REGION}
+    if any(zone.lower() in sentinels for zone in zones):
+        raise ValueError("location selectors cannot be combined with explicit zones")
     return tuple(dict.fromkeys(zones))
 
 
@@ -139,7 +176,7 @@ def build_provision_plan(
     options: ProvisionOptions,
     startup_path: Path,
 ) -> dict[str, Any]:
-    zones = resolve_zones(client, options.zones)
+    zones = resolve_zones(client, options.zones, options.machine_type)
     count = len(zones) * options.count_per_zone
     if count > options.max_vms:
         raise ValueError(
@@ -147,6 +184,25 @@ def build_provision_plan(
             "increase the limit explicitly after reviewing the cost"
         )
 
+    cost_ceiling = None
+    if options.cost_guard is not None:
+        cost_ceiling = planned_cost_ceiling(
+            vm_count=count,
+            disk_size_gb=options.disk_size_gb,
+            guard=options.cost_guard,
+        )
+        if not cost_ceiling["within_configured_bound"]:
+            raise ValueError(
+                "estimated maximum cost "
+                f"${cost_ceiling['estimated_total_usd']:.2f} exceeds "
+                f"--max-estimated-cost-usd=${options.cost_guard.max_estimated_cost_usd:.2f}"
+            )
+
+    max_run_duration_seconds = (
+        ceil(options.cost_guard.max_runtime_hours * 3600)
+        if options.cost_guard is not None
+        else None
+    )
     instances: list[dict[str, Any]] = []
     for zone in zones:
         for index in range(1, options.count_per_zone + 1):
@@ -162,6 +218,7 @@ def build_provision_plan(
                 run_id=options.run_id,
                 startup_script=startup_path,
                 service_account=options.service_account,
+                max_run_duration_seconds=max_run_duration_seconds,
             )
             instances.append({"name": name, "zone": zone, "command": command})
 
@@ -173,7 +230,21 @@ def build_provision_plan(
         "machine_type": options.machine_type,
         "disk_size_gb": options.disk_size_gb,
         "service_account": options.service_account,
+        "location_selection": (
+            ONE_PER_REGION if options.uses_one_per_region else "zones"
+        ),
+        "region_count": len({region_from_zone(zone) for zone in zones}),
         "vm_count": count,
+        "cost_guard": options.cost_guard.to_dict() if options.cost_guard else None,
+        "estimated_cost_ceiling": cost_ceiling,
+        "warnings": (
+            []
+            if options.cost_guard is not None
+            else [
+                "No cost guard configured; use the estimated-cost, maximum-runtime, "
+                "and maximum-cost flags before applying a wide deployment."
+            ]
+        ),
         "instances": instances,
     }
 
@@ -183,6 +254,13 @@ def provision(
     store: Store,
     options: ProvisionOptions,
 ) -> RunInventory:
+    if options.uses_one_per_region and options.cost_guard is None:
+        raise ValueError(
+            "one-per-region provisioning requires an explicit cost guard; provide "
+            "--estimated-vm-hourly-usd, --estimated-disk-gb-monthly-usd, "
+            "--max-runtime-hours, and --max-estimated-cost-usd"
+        )
+
     run_dir = store.run_directory(options.run_id)
     startup_path = run_dir / "startup.sh"
     startup_path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +280,8 @@ def provision(
         profile=client.profile.name,
         project=client.profile.project,
         machine_type=options.machine_type,
+        disk_size_gb=options.disk_size_gb,
+        cost_guard=options.cost_guard,
     )
     store.save_inventory(inventory)
 
@@ -217,6 +297,11 @@ def provision(
             run_id=options.run_id,
             startup_script=startup_path,
             service_account=options.service_account,
+            max_run_duration_seconds=(
+                ceil(options.cost_guard.max_runtime_hours * 3600)
+                if options.cost_guard is not None
+                else None
+            ),
         )
         inventory = replace(inventory, instances=(*inventory.instances, instance))
         store.save_inventory(inventory)

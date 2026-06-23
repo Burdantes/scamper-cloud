@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
 
@@ -85,6 +86,48 @@ class Instance:
 
 
 @dataclass(frozen=True)
+class CostGuard:
+    estimated_vm_hourly_usd: float
+    estimated_disk_gb_monthly_usd: float
+    max_runtime_hours: float
+    max_estimated_cost_usd: float
+
+    def __post_init__(self) -> None:
+        values = {
+            "estimated VM hourly cost": self.estimated_vm_hourly_usd,
+            "estimated disk GB-month cost": self.estimated_disk_gb_monthly_usd,
+            "maximum runtime": self.max_runtime_hours,
+            "maximum estimated cost": self.max_estimated_cost_usd,
+        }
+        for name, value in values.items():
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive finite number")
+        if self.max_runtime_hours * 3600 < 30:
+            raise ValueError("maximum runtime must be at least 30 seconds")
+        if self.max_runtime_hours > 120 * 24:
+            raise ValueError("maximum runtime cannot exceed 120 days")
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "estimated_vm_hourly_usd": self.estimated_vm_hourly_usd,
+            "estimated_disk_gb_monthly_usd": self.estimated_disk_gb_monthly_usd,
+            "max_runtime_hours": self.max_runtime_hours,
+            "max_estimated_cost_usd": self.max_estimated_cost_usd,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "CostGuard":
+        return cls(
+            estimated_vm_hourly_usd=float(value["estimated_vm_hourly_usd"]),
+            estimated_disk_gb_monthly_usd=float(
+                value["estimated_disk_gb_monthly_usd"]
+            ),
+            max_runtime_hours=float(value["max_runtime_hours"]),
+            max_estimated_cost_usd=float(value["max_estimated_cost_usd"]),
+        )
+
+
+@dataclass(frozen=True)
 class Deployment:
     experiment: str
     image: str
@@ -121,6 +164,8 @@ class RunInventory:
     profile: str
     project: str
     machine_type: str
+    disk_size_gb: int = 20
+    cost_guard: CostGuard | None = None
     created_at: str = field(default_factory=utc_now)
     instances: tuple[Instance, ...] = ()
     deployments: tuple[Deployment, ...] = ()
@@ -137,6 +182,8 @@ class RunInventory:
             "profile": self.profile,
             "project": self.project,
             "machine_type": self.machine_type,
+            "disk_size_gb": self.disk_size_gb,
+            "cost_guard": self.cost_guard.to_dict() if self.cost_guard else None,
             "created_at": self.created_at,
             "instances": [instance.to_dict() for instance in self.instances],
             "deployments": [deployment.to_dict() for deployment in self.deployments],
@@ -152,6 +199,12 @@ class RunInventory:
             profile=str(value["profile"]),
             project=str(value["project"]),
             machine_type=str(value["machine_type"]),
+            disk_size_gb=int(value.get("disk_size_gb", 20)),
+            cost_guard=(
+                CostGuard.from_dict(value["cost_guard"])
+                if value.get("cost_guard")
+                else None
+            ),
             created_at=str(value["created_at"]),
             instances=tuple(Instance.from_dict(item) for item in value.get("instances", [])),
             deployments=tuple(

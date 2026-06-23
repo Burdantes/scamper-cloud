@@ -61,6 +61,22 @@ class GCloudClient:
         values = _parse_json(result.stdout, "listing zones")
         return sorted(str(value["name"]) for value in values)
 
+    def machine_type_zone_list_args(self, machine_type: str) -> list[str]:
+        return self._command(
+            "compute",
+            "machine-types",
+            "list",
+            f"--filter=name={machine_type}",
+            "--format=json(name,zone)",
+        )
+
+    def list_machine_type_zones(self, machine_type: str) -> list[str]:
+        result = self.runner.run(self.machine_type_zone_list_args(machine_type))
+        values = _parse_json(result.stdout, "listing machine type zones")
+        if not isinstance(values, list):
+            raise CommandFailed("gcloud machine type zone list did not return a JSON list")
+        return sorted(str(value["zone"]).rsplit("/", 1)[-1] for value in values)
+
     def machine_type_list_args(self, zone: str) -> list[str]:
         return self._command(
             "compute",
@@ -90,6 +106,7 @@ class GCloudClient:
         run_id: str,
         startup_script: Path,
         service_account: str | None = None,
+        max_run_duration_seconds: int | None = None,
     ) -> list[str]:
         args = [
             "compute",
@@ -111,6 +128,13 @@ class GCloudClient:
                 [
                     f"--service-account={service_account}",
                     "--scopes=https://www.googleapis.com/auth/devstorage.read_only",
+                ]
+            )
+        if max_run_duration_seconds is not None:
+            args.extend(
+                [
+                    f"--max-run-duration={max_run_duration_seconds}s",
+                    "--instance-termination-action=DELETE",
                 ]
             )
         args.append("--format=json")
@@ -152,7 +176,13 @@ class GCloudClient:
         )
 
     def delete_instance(self, instance: Instance) -> None:
-        self.runner.run(self.delete_instance_args(instance))
+        result = self.runner.run(self.delete_instance_args(instance), check=False)
+        if result.returncode == 0:
+            return
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        if "not found" in detail.lower():
+            return
+        raise CommandFailed(f"command failed ({result.returncode}): {detail}")
 
     def ssh_args(self, instance: Instance, remote_command: str) -> list[str]:
         args = self._command(

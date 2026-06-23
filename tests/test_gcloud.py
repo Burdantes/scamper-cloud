@@ -1,9 +1,11 @@
 from pathlib import Path
 from typing import Sequence
 
+import pytest
+
 from scamperctl.gcloud import GCloudClient
-from scamperctl.models import GCPProfile
-from scamperctl.runner import CommandResult
+from scamperctl.models import GCPProfile, Instance
+from scamperctl.runner import CommandFailed, CommandResult
 
 
 class FakeRunner:
@@ -38,6 +40,7 @@ def test_every_gcloud_command_pins_configuration_and_project() -> None:
         run_id="baseline",
         startup_script=Path("startup.sh"),
         service_account="measurement-vm@example-project.iam.gserviceaccount.com",
+        max_run_duration_seconds=3600,
     )
 
     assert "--configuration=research" in command
@@ -48,6 +51,19 @@ def test_every_gcloud_command_pins_configuration_and_project() -> None:
         in command
     )
     assert "--scopes=https://www.googleapis.com/auth/devstorage.read_only" in command
+    assert "--max-run-duration=3600s" in command
+    assert "--instance-termination-action=DELETE" in command
+
+
+def test_machine_type_zone_listing_parses_zone_urls() -> None:
+    response = CommandResult(
+        stdout='[{"name":"e2-small","zone":"projects/p/zones/us-central1-a"}]'
+    )
+    runner = FakeRunner([response])
+    client = GCloudClient(profile(), runner)
+
+    assert client.list_machine_type_zones("e2-small") == ["us-central1-a"]
+    assert "--filter=name=e2-small" in runner.commands[0]
 
 
 def test_create_instance_parses_external_ip() -> None:
@@ -79,3 +95,24 @@ def test_create_instance_parses_external_ip() -> None:
     assert instance.external_ip == "192.0.2.2"
     assert instance.machine_type == "e2-small"
     assert instance.zone == "us-central1-a"
+
+
+def test_delete_instance_treats_not_found_as_success() -> None:
+    runner = FakeRunner(
+        [CommandResult(stderr="The resource was not found", returncode=1)]
+    )
+    client = GCloudClient(profile(), runner)
+
+    client.delete_instance(
+        Instance("scamper-test-us-central1-a-1", "us-central1-a", "e2-small")
+    )
+
+
+def test_delete_instance_preserves_other_failures() -> None:
+    runner = FakeRunner([CommandResult(stderr="permission denied", returncode=1)])
+    client = GCloudClient(profile(), runner)
+
+    with pytest.raises(CommandFailed, match="permission denied"):
+        client.delete_instance(
+            Instance("scamper-test-us-central1-a-1", "us-central1-a", "e2-small")
+        )

@@ -4,11 +4,14 @@ import argparse
 import json
 import logging
 import sys
+import time
+from math import isfinite
 from pathlib import Path
 from typing import Sequence
 
+from scamperctl.cost import cost_snapshot
 from scamperctl.gcloud import GCloudClient
-from scamperctl.models import GCPProfile
+from scamperctl.models import CostGuard, GCPProfile
 from scamperctl.runner import CommandFailed, SubprocessRunner
 from scamperctl.store import Store, default_home
 from scamperctl.workflow import (
@@ -35,6 +38,43 @@ def comma_separated(value: str) -> tuple[str, ...]:
     if not values:
         raise argparse.ArgumentTypeError("provide at least one value")
     return values
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def cost_guard_from_args(args: argparse.Namespace) -> CostGuard | None:
+    values = (
+        args.estimated_vm_hourly_usd,
+        args.estimated_disk_gb_monthly_usd,
+        args.max_runtime_hours,
+        args.max_estimated_cost_usd,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError(
+            "cost guards require --estimated-vm-hourly-usd, "
+            "--estimated-disk-gb-monthly-usd, --max-runtime-hours, and "
+            "--max-estimated-cost-usd together"
+        )
+    return CostGuard(
+        estimated_vm_hourly_usd=args.estimated_vm_hourly_usd,
+        estimated_disk_gb_monthly_usd=args.estimated_disk_gb_monthly_usd,
+        max_runtime_hours=args.max_runtime_hours,
+        max_estimated_cost_usd=args.max_estimated_cost_usd,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--zones",
         required=True,
         type=comma_separated,
-        help="comma-separated zones, or 'all'",
+        help="comma-separated zones, 'all', or 'one-per-region'",
     )
     provision_parser.add_argument("--machine-type", default="e2-small")
     provision_parser.add_argument("--count-per-zone", type=int, default=1)
@@ -94,6 +134,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="service account email to attach to each VM",
     )
     provision_parser.add_argument("--max-vms", type=int, default=20)
+    provision_parser.add_argument(
+        "--estimated-vm-hourly-usd",
+        type=positive_float,
+        help="conservative estimated hourly cost for one VM",
+    )
+    provision_parser.add_argument(
+        "--estimated-disk-gb-monthly-usd",
+        type=positive_float,
+        help="conservative estimated monthly cost for one GB of boot disk",
+    )
+    provision_parser.add_argument(
+        "--max-runtime-hours",
+        type=positive_float,
+        help="hard VM lifetime; VMs are configured to delete at this limit",
+    )
+    provision_parser.add_argument(
+        "--max-estimated-cost-usd",
+        type=positive_float,
+        help="reject plans whose conservative estimate exceeds this amount",
+    )
     provision_parser.add_argument(
         "--apply",
         action="store_true",
@@ -138,6 +198,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="delete resources; without this flag only the plan is printed",
+    )
+
+    cost_parser = subparsers.add_parser(
+        "cost", help="show the current local runtime-based cost estimate"
+    )
+    cost_parser.add_argument("--run", required=True)
+
+    monitor_parser = subparsers.add_parser(
+        "monitor", help="continuously print estimated spend for a run"
+    )
+    monitor_parser.add_argument("--run", required=True)
+    monitor_parser.add_argument("--interval-seconds", type=positive_int, default=60)
+    monitor_parser.add_argument(
+        "--auto-destroy",
+        action="store_true",
+        help="destroy the run early when the configured percentage is reached",
+    )
+    monitor_parser.add_argument(
+        "--auto-destroy-at-percent",
+        type=positive_float,
+        default=90.0,
+        help="runtime or estimated-budget percentage that triggers early deletion",
     )
 
     subparsers.add_parser("runs", help="list locally recorded runs")
@@ -208,6 +290,7 @@ def execute(args: argparse.Namespace) -> int:
             network=args.network,
             service_account=args.service_account,
             max_vms=args.max_vms,
+            cost_guard=cost_guard_from_args(args),
         )
         startup_path = store.run_directory(args.run) / "startup.sh"
         startup_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +359,39 @@ def execute(args: argparse.Namespace) -> int:
         updated = destroy(client, store, inventory)
         print_json(updated.to_dict())
         return 0
+
+    if args.command == "cost":
+        print_json(cost_snapshot(store.get_inventory(args.run)))
+        return 0
+
+    if args.command == "monitor":
+        if args.auto_destroy_at_percent > 100:
+            raise ValueError("--auto-destroy-at-percent cannot exceed 100")
+        trigger_fraction = args.auto_destroy_at_percent / 100
+        while True:
+            inventory = store.get_inventory(args.run)
+            snapshot = cost_snapshot(inventory)
+            print_json(snapshot)
+            if inventory.destroyed_at is not None:
+                return 0
+            should_destroy = args.auto_destroy and max(
+                snapshot["runtime_fraction"], snapshot["cost_fraction"]
+            ) >= trigger_fraction
+            if should_destroy:
+                client = _client_for_run(store, args.run, runner)
+                updated = destroy(client, store, inventory)
+                print_json(
+                    {
+                        "action": "auto-destroyed",
+                        "run_id": updated.run_id,
+                        "destroyed_at": updated.destroyed_at,
+                        "trigger_percent": args.auto_destroy_at_percent,
+                    }
+                )
+                return 0
+            if snapshot["limit_reached"]:
+                return 3
+            time.sleep(args.interval_seconds)
 
     if args.command == "runs":
         print_json([inventory.to_dict() for inventory in store.list_inventories()])

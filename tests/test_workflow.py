@@ -4,14 +4,17 @@ from typing import Sequence
 import pytest
 
 from scamperctl.gcloud import GCloudClient
-from scamperctl.models import GCPProfile, Instance, RunInventory
+from scamperctl.models import CostGuard, GCPProfile, Instance, RunInventory
 from scamperctl.runner import CommandResult
+from scamperctl.store import Store
 from scamperctl.workflow import (
     ProvisionOptions,
     build_deployment_plan,
     build_provision_plan,
     deployment_commands,
     instance_name,
+    one_zone_per_region,
+    provision,
     resolved_registry_auth,
 )
 
@@ -42,6 +45,100 @@ def test_provision_plan_enforces_vm_limit(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="exceeding --max-vms"):
         build_provision_plan(client(), options, tmp_path / "startup.sh")
+
+
+def test_one_zone_per_region_is_deterministic() -> None:
+    assert one_zone_per_region(
+        ("us-central1-c", "europe-west1-b", "us-central1-a", "europe-west1-c")
+    ) == ("europe-west1-b", "us-central1-a")
+
+
+def test_one_per_region_apply_requires_cost_guard(tmp_path: Path) -> None:
+    options = ProvisionOptions(
+        run_id="global",
+        zones=("one-per-region",),
+        machine_type="e2-small",
+        max_vms=50,
+    )
+
+    with pytest.raises(ValueError, match="requires an explicit cost guard"):
+        provision(client(), Store(tmp_path / ".scamper"), options)
+
+
+def test_one_per_region_filters_for_machine_type_availability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gcloud_client = client()
+    monkeypatch.setattr(
+        gcloud_client,
+        "list_zones",
+        lambda: ["europe-west1-b", "europe-west1-c", "us-central1-a"],
+    )
+    monkeypatch.setattr(
+        gcloud_client,
+        "list_machine_type_zones",
+        lambda machine_type: ["europe-west1-c", "us-central1-a"],
+    )
+    options = ProvisionOptions(
+        run_id="global",
+        zones=("one-per-region",),
+        machine_type="e2-small",
+        max_vms=2,
+        cost_guard=CostGuard(
+            estimated_vm_hourly_usd=0.05,
+            estimated_disk_gb_monthly_usd=0.05,
+            max_runtime_hours=1,
+            max_estimated_cost_usd=1,
+        ),
+    )
+
+    plan = build_provision_plan(gcloud_client, options, tmp_path / "startup.sh")
+
+    assert plan["location_selection"] == "one-per-region"
+    assert plan["region_count"] == 2
+    assert [item["zone"] for item in plan["instances"]] == [
+        "europe-west1-c",
+        "us-central1-a",
+    ]
+
+
+def test_provision_plan_enforces_estimated_cost_bound(tmp_path: Path) -> None:
+    options = ProvisionOptions(
+        run_id="global",
+        zones=("us-central1-a", "us-east1-b"),
+        machine_type="e2-small",
+        max_vms=2,
+        cost_guard=CostGuard(
+            estimated_vm_hourly_usd=1,
+            estimated_disk_gb_monthly_usd=1,
+            max_runtime_hours=2,
+            max_estimated_cost_usd=3,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="estimated maximum cost"):
+        build_provision_plan(client(), options, tmp_path / "startup.sh")
+
+
+def test_cost_guard_adds_server_side_auto_delete(tmp_path: Path) -> None:
+    options = ProvisionOptions(
+        run_id="bounded",
+        zones=("us-central1-a",),
+        machine_type="e2-small",
+        max_vms=1,
+        cost_guard=CostGuard(
+            estimated_vm_hourly_usd=0.05,
+            estimated_disk_gb_monthly_usd=0.05,
+            max_runtime_hours=1.5,
+            max_estimated_cost_usd=1,
+        ),
+    )
+
+    plan = build_provision_plan(client(), options, tmp_path / "startup.sh")
+    command = plan["instances"][0]["command"]
+
+    assert "--max-run-duration=5400s" in command
+    assert "--instance-termination-action=DELETE" in command
 
 
 def test_long_instance_names_remain_valid() -> None:

@@ -85,6 +85,52 @@ When a service account is attached, the VM receives only the read-only storage
 OAuth scope needed to pull Artifact Registry images; it does not receive a broad
 `cloud-platform` token.
 
+### One VM per GCP region
+
+Use `--zones one-per-region` to discover active zones where the selected machine
+type is available and choose one deterministic zone from each region. Regional
+fan-out requires an explicit cost guard when `--apply` is used:
+
+```bash
+scamperctl provision \
+  --profile lab \
+  --run global-validation \
+  --zones one-per-region \
+  --machine-type e2-small \
+  --disk-size-gb 10 \
+  --max-vms 50 \
+  --estimated-vm-hourly-usd 0.05 \
+  --estimated-disk-gb-monthly-usd 0.05 \
+  --max-runtime-hours 2 \
+  --max-estimated-cost-usd 6
+```
+
+The rates above are illustrative conservative inputs, not a pricing quote. The
+dry-run plan reports the discovered region and VM counts, selected zones, and
+the estimated maximum. Review that JSON before repeating the command with
+`--apply`.
+
+Every cost-guarded VM is created with a server-side maximum run duration and a
+`DELETE` termination action. This limits runtime even if the controlling laptop
+disconnects. You can inspect the local elapsed-time estimate once or continuously:
+
+```bash
+scamperctl cost --run global-validation
+
+scamperctl monitor \
+  --run global-validation \
+  --interval-seconds 60 \
+  --auto-destroy \
+  --auto-destroy-at-percent 90
+```
+
+The monitor is an immediate estimate based on the conservative rates supplied
+at provisioning time. It excludes network egress, taxes, discounts, and other
+services. Cloud Billing is authoritative but delayed, and Google Cloud budgets
+alert rather than automatically cap spending. See
+[Regional fan-out and cost controls](docs/regional-fanout-and-costs.md) for the
+full safety model and command flow.
+
 ## 3. Deploy a private experiment image
 
 Grant the VM service account Artifact Registry Reader access to the private
