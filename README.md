@@ -59,7 +59,7 @@ The default behavior is a dry run. Review the JSON plan before adding `--apply`:
 ```bash
 scamperctl provision \
   --profile lab \
-  --run smoke-test \
+  --run validation-run \
   --zones us-central1-a \
   --machine-type e2-small \
   --disk-size-gb 10 \
@@ -69,7 +69,7 @@ scamperctl provision \
 # Create the reviewed resources.
 scamperctl provision \
   --profile lab \
-  --run smoke-test \
+  --run validation-run \
   --zones us-central1-a \
   --machine-type e2-small \
   --disk-size-gb 10 \
@@ -92,16 +92,16 @@ repository. Then provide the full image URI and a local target file:
 
 ```bash
 scamperctl deploy \
-  --run smoke-test \
-  --experiment private-smoke \
+  --run validation-run \
+  --experiment icmp-validation \
   --image us-central1-docker.pkg.dev/YOUR_GCP_PROJECT/experiments/scamper:v1 \
   --registry-auth artifact-registry \
   --targets /path/to/private-targets.txt
 
 # Pull the image and start the container on the provisioned VM.
 scamperctl deploy \
-  --run smoke-test \
-  --experiment private-smoke \
+  --run validation-run \
+  --experiment icmp-validation \
   --image us-central1-docker.pkg.dev/YOUR_GCP_PROJECT/experiments/scamper:v1 \
   --registry-auth artifact-registry \
   --targets /path/to/private-targets.txt \
@@ -125,16 +125,16 @@ The experiment container receives:
 ## Collect and destroy
 
 ```bash
-scamperctl status --run smoke-test
+scamperctl status --run validation-run
 
 scamperctl collect \
-  --run smoke-test \
-  --experiment private-smoke \
-  --output outputs/collected
+  --run validation-run \
+  --experiment icmp-validation \
+  --output outputs/measurements/gcp
 
 # Plan first, then delete explicitly.
-scamperctl destroy --run smoke-test
-scamperctl destroy --run smoke-test --apply
+scamperctl destroy --run validation-run
+scamperctl destroy --run validation-run --apply
 ```
 
 Always collect required results before destroying the VMs.
