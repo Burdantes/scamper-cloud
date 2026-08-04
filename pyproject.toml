@@ -11,11 +11,13 @@ requires-python = ">=3.10"
 
 [project.scripts]
 scamperctl = "scamperctl.cli:main"
+scamper-controller = "controller.manage:main"
+scamper-ipv4-targets = "target_generation.ipv4_bgp.generate:main"
 
 [tool.setuptools.packages.find]
-include = ["scamperctl*"]
+include = ["scamperctl*", "controller*", "experiments*", "target_generation*", "legacy*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/required"]
 addopts = "-q"
 pythonpath = ["."]

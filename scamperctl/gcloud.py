@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from scamperctl.models import GCPProfile, Instance
 from scamperctl.runner import CommandFailed, Runner

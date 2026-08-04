@@ -24,7 +24,7 @@ from scamperctl.store import Store
 
 
 REMOTE_ROOT = "/var/lib/scamperctl"
-DEFAULT_SCAMPER_ARGS = '-c "trace -l 20 -g 8 -w 3 -P ICMP" -p 10000'
+DEFAULT_SCAMPER_ARGS = '-c "trace -m 20 -g 8 -w 3 -q 2 -P ICMP" -p 10000'
 RegistryAuth = Literal["auto", "none", "artifact-registry"]
 ONE_PER_REGION = "one-per-region"
 

@@ -1,0 +1,13 @@
+.git
+.github
+.scamper
+.venv
+__pycache__
+*.pyc
+*.warts
+credentials
+datasets
+outputs
+rir-data
+skill-observations
+tests
