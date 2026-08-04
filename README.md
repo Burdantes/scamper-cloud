@@ -1,20 +1,35 @@
 # scamper-cloud
 
-`scamper-cloud` is the public control plane for disposable, Docker-ready
-measurement VMs on Google Cloud. It deliberately separates infrastructure from
-experiment payloads:
+`scamper-cloud` is the control plane and experiment-definition repository for
+disposable measurement VMs. It deliberately separates measurement execution
+from scientific analysis:
 
 ```text
-scamper-cloud (public)       private experiment repository
-  provision VMs               build experiment image
-  deploy an image       <---  publish to private Artifact Registry
-  collect results              keep targets and experiment files private
-  destroy VMs
+scamper-cloud                         sibling VM-analysis repository
+  provision/controller/teardown        decode immutable artifacts
+  scamper_v4_scanning                  map hops to AS/IXP/geolocation
+  RR_v4_scanning                       analyze RR address sequences
+  target generation and contracts      produce derived datasets
 ```
 
-This repository contains no container image, experiment implementation, target
-list, cloud credential, project-specific configuration, or measurement result.
-The CLI accepts those inputs at deployment time.
+This repository contains generic experiment implementations and contracts, but
+no committed target list, credential, project-specific inventory, or result.
+Those inputs are supplied at submission time.
+
+See [Architecture](docs/architecture.md) for the ownership boundary and
+[Testing policy](docs/testing.md) for the required/optional split.
+
+## Supported experiments
+
+- [`experiments/scamper_v4_scanning`](experiments/scamper_v4_scanning): ICMP
+  traceroute to one address per BGP-announced `/24`-equivalent.
+- [`experiments/RR_v4_scanning`](experiments/RR_v4_scanning): one ICMP Record
+  Route probe to each independently versioned RR-responsive target.
+
+The persistent US controller under [`controller`](controller) owns campaigns
+after submission, so the submitting laptop may disconnect. Generate the
+traceroute population once with
+[`target_generation/ipv4_bgp`](target_generation/ipv4_bgp).
 
 ## Requirements
 
@@ -216,14 +231,14 @@ Safe to publish here:
 
 - generic provisioning and teardown code;
 - startup scripts that install Docker;
-- placeholder configuration examples;
+- generic experiment code and placeholder configuration examples;
 - unit tests using documentation-only IP ranges.
 
-Keep elsewhere:
+Keep uncommitted or in configured private storage:
 
 - cloud credentials, access tokens, and service-account keys;
 - real project/account profiles and VM inventories from `.scamper/`;
-- experiment Dockerfiles, source, targets, and measurement results.
+- real targets and measurement results.
 
 See [Private Artifact Registry setup](docs/private-artifact-registry.md) for the
 recommended identity and IAM arrangement.

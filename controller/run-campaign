@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+source /etc/scamper-controller.env
+set +a
+exec "$@"

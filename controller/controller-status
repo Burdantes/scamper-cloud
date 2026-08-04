@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_id=${1:-}
+if [[ -z "${run_id}" ]]; then
+  systemctl list-units 'scamper-campaign-*' --all --no-pager
+  exit 0
+fi
+unit="scamper-campaign-${run_id}.service"
+systemctl status "${unit}" --no-pager || true
+journalctl -u "${unit}" --no-pager -n 100

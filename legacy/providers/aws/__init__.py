@@ -1,0 +1,1 @@
+"""Unsupported AWS compatibility provider."""

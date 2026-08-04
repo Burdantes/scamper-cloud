@@ -4,6 +4,7 @@
 # Measurement inputs and outputs stay outside the public control plane
 datasets/
 outputs/
+target_generation/ipv4_bgp/ribs/
 *.warts
 
 # Credentials and environment configuration
