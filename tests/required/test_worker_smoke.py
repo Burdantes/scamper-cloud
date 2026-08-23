@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[2]
-SMOKE_SCRIPT = REPO_ROOT / "legacy/providers/gcp/worker/scamper-smoke.sh"
+SMOKE_SCRIPT = REPO_ROOT / "providers/gcp/worker/scamper-smoke.sh"
 VM_SCRIPTS = [
-    REPO_ROOT / "legacy/providers/gcp/worker/run-scamper-gcp.sh",
+    REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh",
     REPO_ROOT / "legacy/providers/aws/run-scamper-aws.sh",
     REPO_ROOT / "legacy/providers/azure/run-scamper-azr.sh",
 ]
@@ -91,7 +91,7 @@ def test_vm_scripts_are_valid_bash() -> None:
 
 
 def test_gcp_worker_checkpoints_measurement_artifacts_before_final_status() -> None:
-    script = (REPO_ROOT / "legacy/providers/gcp/worker/run-scamper-gcp.sh").read_text(
+    script = (REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh").read_text(
         encoding="utf-8"
     )
 
@@ -102,7 +102,7 @@ def test_gcp_worker_checkpoints_measurement_artifacts_before_final_status() -> N
 
 
 def test_gcp_worker_can_skip_smoke_probe() -> None:
-    script = (REPO_ROOT / "legacy/providers/gcp/worker/run-scamper-gcp.sh").read_text(
+    script = (REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh").read_text(
         encoding="utf-8"
     )
 

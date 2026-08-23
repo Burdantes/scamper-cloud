@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from legacy.providers.gcp import driver as gcp
+from providers.gcp import driver as gcp
 import pytest
 
 

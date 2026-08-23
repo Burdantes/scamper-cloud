@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from controller import manage, submit
-from legacy.providers.gcp.driver import expected_campaign_artifacts
+from providers.gcp.driver import expected_campaign_artifacts
 
 
 def test_controller_provision_is_us_and_standard() -> None:

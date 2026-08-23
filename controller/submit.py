@@ -8,6 +8,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from providers import driver_module
 
 STATE_ROOT = Path("/var/lib/scamper-controller")
 INSTALL_ROOT = Path("/opt/scamper-cloud/current")
@@ -43,7 +44,7 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
     command = [
         str(INSTALL_ROOT / ".venv/bin/python"),
         "-m",
-        "legacy.providers.gcp.driver",
+        driver_module("gcp"),
         "--apply",
         "--prefix",
         args.run_id,

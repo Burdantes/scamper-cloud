@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol, Sequence
 
-from legacy.providers import settings
+from providers import settings
 
 from legacy.cli import expenses
 from scamperctl.runner import CommandFailed, CommandResult, SubprocessRunner

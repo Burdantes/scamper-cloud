@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 
 SCAMPER_IP_DST = os.environ.get("SCAMPER_IP_DST", "./datasets/ipv4-24")
-SCAMPER_UPLOAD_SCRIPT = "./legacy/providers/gcp/worker/upload.py"
-SCAMPER_SMOKE_SCRIPT = "./legacy/providers/gcp/worker/scamper-smoke.sh"
+SCAMPER_UPLOAD_SCRIPT = "./providers/gcp/worker/upload.py"
+SCAMPER_SMOKE_SCRIPT = "./providers/gcp/worker/scamper-smoke.sh"
 SCAMPER_CAMPAIGN_RUNNER = "./experiments/common/run_campaign.py"
 WARTS_STORAGE_CREDENTIALS = os.environ.get(
     "WARTS_STORAGE_CREDENTIALS", "./credentials/gcp-service-account.json"
 )
 
-GCP_SCAMPER_SCRIPT = "./legacy/providers/gcp/worker/run-scamper-gcp.sh"
+GCP_SCAMPER_SCRIPT = "./providers/gcp/worker/run-scamper-gcp.sh"
 GCP_SCAMPER_SSH_KEY = os.environ.get("GCP_SCAMPER_SSH_KEY", "~/.ssh/nsf")
 GCP_SCAMPER_USER = os.environ.get("GCP_SCAMPER_USER", "scamper-gcp")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "nsf-2148275-66720")

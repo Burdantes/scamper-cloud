@@ -8,7 +8,7 @@ import shlex
 from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
-from legacy.providers import settings
+from providers import settings
 import logging
 import subprocess
 import time

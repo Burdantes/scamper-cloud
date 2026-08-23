@@ -12,7 +12,7 @@ from bisect import bisect_right
 import os
 import time
 import logging
-from legacy.providers import settings
+from providers import settings
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path

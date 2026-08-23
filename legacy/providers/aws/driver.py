@@ -6,7 +6,7 @@ import shlex
 import tarfile
 import urllib.parse
 import urllib.request
-from legacy.providers import settings
+from providers import settings
 import logging
 import subprocess
 import time

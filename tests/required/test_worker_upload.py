@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from legacy.providers.gcp.worker import upload
+from providers.gcp.worker import upload
 
 
 class FakeBlob:
