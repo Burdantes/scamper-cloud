@@ -8,6 +8,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from providers import driver_module
 
 STATE_ROOT = Path("/var/lib/scamper-controller")
 INSTALL_ROOT = Path("/opt/scamper-cloud/current")
@@ -15,6 +16,31 @@ RUN_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 DEFAULT_PAYLOAD = (
     "Academic probing; please reach out to ls3748@columbia.edu to opt out."
 )
+
+
+def assert_controller_origin(allow_foreign: bool = False) -> str:
+    """Refuse to submit a campaign from anywhere but the controller.
+
+    Measurements must originate here so that provisioning, teardown and the job
+    record live on one long-lived host. Campaigns launched from a workstation
+    have no durable job record, so nobody can later tell what was run, with which
+    code, or whether teardown completed - which is how a 44-VM Azure campaign ran
+    for eight days on VMs nobody was tracking.
+
+    Identified by the install root the release process creates, not by hostname,
+    so a rebuilt or renamed controller still qualifies.
+    """
+    if INSTALL_ROOT.is_dir() and STATE_ROOT.is_dir():
+        return "controller"
+    if allow_foreign:
+        return "foreign"
+    raise SystemExit(
+        f"refusing to submit: {INSTALL_ROOT} and {STATE_ROOT} are not both present, "
+        "so this is not the scamper controller. Measurements must originate from "
+        "the controller. Run this on the controller host, or pass "
+        "--allow-foreign-origin if you have accepted that no durable job record "
+        "will exist."
+    )
 
 
 def run_id(value: str) -> str:
@@ -43,7 +69,7 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
     command = [
         str(INSTALL_ROOT / ".venv/bin/python"),
         "-m",
-        "legacy.providers.gcp.driver",
+        driver_module(args.provider),
         "--apply",
         "--prefix",
         args.run_id,
@@ -107,7 +133,15 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Submit a durable GCP scamper campaign."
+        description="Submit a durable scamper campaign from the controller."
+    )
+    parser.add_argument(
+        "--provider",
+        default="gcp",
+        help=(
+            "cloud provider to launch on. Must have a supported campaign driver; "
+            "see providers.DRIVER_MODULES."
+        ),
     )
     parser.add_argument("--run-id", required=True, type=run_id)
     parser.add_argument("--trace-targets", required=True, type=existing_file)
@@ -129,11 +163,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--do-not-probe-file", required=True, type=existing_file)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-foreign-origin",
+        action="store_true",
+        help=(
+            "submit from a host that is not the controller. Recorded in the job "
+            "spec. Use only when you have accepted that no durable job record "
+            "will exist on the controller."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    origin = assert_controller_origin(args.allow_foreign_origin)
     job_dir = STATE_ROOT / "jobs" / args.run_id
     job_spec = job_dir / "job.json"
     if job_spec.exists() and not args.dry_run:
@@ -143,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     spec = {
         "schema_version": 1,
         "run_id": args.run_id,
+        "provider": args.provider,
+        "origin": origin,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "campaign_command": command,
         "systemd_command": service_command,

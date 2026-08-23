@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
 
 from scamperctl.cost import planned_cost_ceiling
-from scamperctl.gcloud import GCloudClient
+from scamperctl.cloud import CloudClient, SupportsOSLogin
 from scamperctl.models import (
     CostGuard,
     Deployment,
@@ -80,13 +80,14 @@ def instance_name(run_id: str, zone: str, index: int) -> str:
 
 
 def prepare_ssh_metadata(
-    client: GCloudClient,
+    client: CloudClient,
     access: SSHAccess | None,
     run_directory: Path,
 ) -> Path | None:
     if access is None:
         return None
-    if client.project_os_login_enabled():
+    # OS Login is GCP-only; providers without it simply have no equivalent check.
+    if isinstance(client, SupportsOSLogin) and client.project_os_login_enabled():
         raise ValueError(
             "project OS Login is enabled, so Compute Engine would ignore metadata "
             "SSH keys; grant the collaborator an OS Login IAM role instead"
@@ -170,7 +171,7 @@ def one_zone_per_region(zones: Sequence[str]) -> tuple[str, ...]:
 
 
 def resolve_zones(
-    client: GCloudClient,
+    client: CloudClient,
     zones: Sequence[str],
     machine_type: str,
 ) -> tuple[str, ...]:
@@ -192,7 +193,7 @@ def resolve_zones(
 
 
 def build_provision_plan(
-    client: GCloudClient,
+    client: CloudClient,
     options: ProvisionOptions,
     startup_path: Path,
 ) -> dict[str, Any]:
@@ -285,7 +286,7 @@ def build_provision_plan(
 
 
 def provision(
-    client: GCloudClient,
+    client: CloudClient,
     store: Store,
     options: ProvisionOptions,
 ) -> RunInventory:
@@ -349,7 +350,7 @@ def provision(
 
 
 def deployment_commands(
-    client: GCloudClient,
+    client: CloudClient,
     instance: Instance,
     *,
     run_id: str,
@@ -409,7 +410,7 @@ def deployment_commands(
 
 
 def build_deployment_plan(
-    client: GCloudClient,
+    client: CloudClient,
     inventory: RunInventory,
     *,
     experiment: str,
@@ -457,7 +458,7 @@ def build_deployment_plan(
 
 
 def deploy(
-    client: GCloudClient,
+    client: CloudClient,
     store: Store,
     inventory: RunInventory,
     *,
@@ -506,7 +507,7 @@ def deploy(
     return updated
 
 
-def status(client: GCloudClient, inventory: RunInventory) -> dict[str, Any]:
+def status(client: CloudClient, inventory: RunInventory) -> dict[str, Any]:
     instances = []
     for instance in inventory.instances:
         try:
@@ -523,7 +524,7 @@ def status(client: GCloudClient, inventory: RunInventory) -> dict[str, Any]:
     }
 
 
-def build_destroy_plan(client: GCloudClient, inventory: RunInventory) -> dict[str, Any]:
+def build_destroy_plan(client: CloudClient, inventory: RunInventory) -> dict[str, Any]:
     return {
         "action": "destroy",
         "run_id": inventory.run_id,
@@ -540,7 +541,7 @@ def build_destroy_plan(client: GCloudClient, inventory: RunInventory) -> dict[st
 
 
 def destroy(
-    client: GCloudClient,
+    client: CloudClient,
     store: Store,
     inventory: RunInventory,
 ) -> RunInventory:
@@ -554,7 +555,7 @@ def destroy(
 
 
 def collect(
-    client: GCloudClient,
+    client: CloudClient,
     inventory: RunInventory,
     *,
     experiment: str,

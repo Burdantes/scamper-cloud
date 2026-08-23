@@ -25,10 +25,10 @@ sudo pip install google-cloud-storage
 run_scamper_smoke_test aws "$TRACE_ARGS"
 
 mkdir -p "$OUTPUT_DIR"
-chmod +x ./run-scamper-campaign.py
+chmod +x ./run_campaign.py
 
 set +e
-sudo /usr/bin/env python3 ./run-scamper-campaign.py \
+sudo /usr/bin/env python3 ./run_campaign.py \
   --targets "$1" \
   --output-prefix "$OUTPUT_PREFIX" \
   --provider "${SCAMPER_PROVIDER:-aws}" \

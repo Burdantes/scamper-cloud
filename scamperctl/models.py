@@ -27,6 +27,25 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_provider(value: str, context: str = "provider") -> str:
+    """Accept only providers with a supported driver.
+
+    Rejecting here means an unsupported provider cannot enter an inventory or a
+    profile at all, rather than failing later inside a workflow. Legacy drivers
+    are not supported paths - see providers/__init__.py.
+    """
+    from providers import supported_providers
+
+    allowed = supported_providers()
+    normalized = str(value).strip().lower()
+    if normalized not in allowed:
+        supported = ", ".join(allowed) or "none"
+        raise ValueError(
+            f"{context} {value!r} is not a supported provider (supported: {supported})"
+        )
+    return normalized
+
+
 def validate_resource_name(value: str, field_name: str = "name") -> str:
     if not _NAME_PATTERN.fullmatch(value):
         raise ValueError(
@@ -37,14 +56,18 @@ def validate_resource_name(value: str, field_name: str = "name") -> str:
 
 
 @dataclass(frozen=True)
-class GCPProfile:
+class Profile:
     name: str
     project: str
     configuration: str = "default"
     use_iap: bool = False
+    provider: str = "gcp"
 
     def __post_init__(self) -> None:
         validate_resource_name(self.name, "profile name")
+        object.__setattr__(
+            self, "provider", validate_provider(self.provider, "profile provider")
+        )
         if not self.project.strip():
             raise ValueError("project cannot be empty")
         if not self.configuration.strip():
@@ -52,21 +75,24 @@ class GCPProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "provider": "gcp",
+            "provider": self.provider,
             "project": self.project,
             "configuration": self.configuration,
             "use_iap": self.use_iap,
         }
 
     @classmethod
-    def from_dict(cls, name: str, value: dict[str, Any]) -> "GCPProfile":
-        if value.get("provider") != "gcp":
-            raise ValueError(f"profile {name!r} is not a GCP profile")
+    def from_dict(cls, name: str, value: dict[str, Any]) -> "Profile":
+        # Inventories written before providers were explicit omit the field.
+        provider = validate_provider(
+            value.get("provider", "gcp"), f"profile {name!r} provider"
+        )
         return cls(
             name=name,
             project=str(value["project"]),
             configuration=str(value.get("configuration", "default")),
             use_iap=bool(value.get("use_iap", False)),
+            provider=provider,
         )
 
 
@@ -217,6 +243,7 @@ class RunInventory:
     project: str
     machine_type: str
     disk_size_gb: int = 20
+    provider: str = "gcp"
     cost_guard: CostGuard | None = None
     created_at: str = field(default_factory=utc_now)
     instances: tuple[Instance, ...] = ()
@@ -225,11 +252,14 @@ class RunInventory:
 
     def __post_init__(self) -> None:
         validate_resource_name(self.run_id, "run ID")
+        object.__setattr__(
+            self, "provider", validate_provider(self.provider, "inventory provider")
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": 1,
-            "provider": "gcp",
+            "provider": self.provider,
             "run_id": self.run_id,
             "profile": self.profile,
             "project": self.project,
@@ -244,9 +274,11 @@ class RunInventory:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RunInventory":
-        if value.get("provider") != "gcp":
-            raise ValueError("only GCP run inventories are currently supported")
+        provider = validate_provider(
+            value.get("provider", "gcp"), "inventory provider"
+        )
         return cls(
+            provider=provider,
             run_id=str(value["run_id"]),
             profile=str(value["profile"]),
             project=str(value["project"]),
@@ -264,3 +296,7 @@ class RunInventory:
             ),
             destroyed_at=value.get("destroyed_at"),
         )
+
+
+# Retained so existing imports keep working after the provider dimension landed.
+GCPProfile = Profile

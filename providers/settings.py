@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 
 SCAMPER_IP_DST = os.environ.get("SCAMPER_IP_DST", "./datasets/ipv4-24")
-SCAMPER_UPLOAD_SCRIPT = "./legacy/providers/gcp/worker/upload.py"
-SCAMPER_SMOKE_SCRIPT = "./legacy/providers/gcp/worker/scamper-smoke.sh"
+SCAMPER_UPLOAD_SCRIPT = "./providers/gcp/worker/upload.py"
+SCAMPER_SMOKE_SCRIPT = "./providers/common/worker/scamper-smoke.sh"
 SCAMPER_CAMPAIGN_RUNNER = "./experiments/common/run_campaign.py"
 WARTS_STORAGE_CREDENTIALS = os.environ.get(
     "WARTS_STORAGE_CREDENTIALS", "./credentials/gcp-service-account.json"
 )
 
-GCP_SCAMPER_SCRIPT = "./legacy/providers/gcp/worker/run-scamper-gcp.sh"
+GCP_SCAMPER_SCRIPT = "./providers/gcp/worker/run-scamper-gcp.sh"
 GCP_SCAMPER_SSH_KEY = os.environ.get("GCP_SCAMPER_SSH_KEY", "~/.ssh/nsf")
 GCP_SCAMPER_USER = os.environ.get("GCP_SCAMPER_USER", "scamper-gcp")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "nsf-2148275-66720")
@@ -34,12 +34,12 @@ GCP_SCOPES = [
     "https://www.googleapis.com/auth/monitoring.write",
 ]
 
-AWS_SCAMPER_VM_SCRIPT = "./legacy/providers/aws/run-scamper-aws.sh"
+AWS_SCAMPER_VM_SCRIPT = "./providers/aws/worker/run-scamper-aws.sh"
 AWS_SCAMPER_SSH_KEY = os.environ.get(
     "AWS_SCAMPER_SSH_KEY", "./credentials/aws-scamper-key-pair.pem"
 )
 AWS_SCAMPER_USER = os.environ.get("AWS_SCAMPER_USER", "ubuntu")
-AZR_SCAMPER_VM_SCRIPT = "./legacy/providers/azure/run-scamper-azr.sh"
+AZR_SCAMPER_VM_SCRIPT = "./providers/azure/worker/run-scamper-azr.sh"
 AZR_SCAMPER_SSH_KEY = os.environ.get(
     "AZR_SCAMPER_SSH_KEY", "./credentials/azr-scamper-key-pair.pem"
 )
