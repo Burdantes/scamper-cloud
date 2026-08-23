@@ -5,11 +5,18 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[2]
-SMOKE_SCRIPT = REPO_ROOT / "providers/gcp/worker/scamper-smoke.sh"
+SMOKE_SCRIPT = REPO_ROOT / "providers/common/worker/scamper-smoke.sh"
 VM_SCRIPTS = [
     REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh",
-    REPO_ROOT / "legacy/providers/aws/run-scamper-aws.sh",
+    REPO_ROOT / "providers/aws/worker/run-scamper-aws.sh",
     REPO_ROOT / "legacy/providers/azure/run-scamper-azr.sh",
+]
+# Worker scripts that a supported driver deploys. Azure is excluded because it
+# has no supported driver yet, and its committed script does not invoke a
+# campaign runner at all.
+SUPPORTED_VM_SCRIPTS = [
+    REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh",
+    REPO_ROOT / "providers/aws/worker/run-scamper-aws.sh",
 ]
 
 
@@ -108,3 +115,57 @@ def test_gcp_worker_can_skip_smoke_probe() -> None:
 
     assert '"${SCAMPER_SKIP_SMOKE:-0}" == "1"' in script
     assert "Skipping Scamper smoke test by request" in script
+
+
+def test_worker_scripts_only_reference_files_that_are_deployed() -> None:
+    """A worker script must not invoke a helper that does not exist.
+
+    Drivers scp the files named in settings onto the VM and flatten them, so a
+    script referring to ./something.py is referring to one of those basenames.
+    The committed AWS script invoked ./run-scamper-campaign.py, which exists
+    nowhere in this repository - the only runner is
+    experiments/common/run_campaign.py. Bash syntax checks pass happily on that,
+    so nothing caught it and the deployed worker had to be patched by hand.
+    """
+    import re
+
+    from providers import settings
+
+    deployed = {
+        Path(value).name: REPO_ROOT / Path(value)
+        for value in (
+            settings.SCAMPER_UPLOAD_SCRIPT,
+            settings.SCAMPER_SMOKE_SCRIPT,
+            settings.SCAMPER_CAMPAIGN_RUNNER,
+            settings.GCP_SCAMPER_SCRIPT,
+            settings.AWS_SCAMPER_VM_SCRIPT,
+        )
+    }
+    for name, path in deployed.items():
+        assert path.is_file(), f"settings names {name} but {path} does not exist"
+
+    for script in SUPPORTED_VM_SCRIPTS:
+        text = script.read_text(encoding="utf-8")
+        referenced = set(re.findall(r"\./([A-Za-z0-9_.-]+\.py)", text))
+        referenced |= set(re.findall(r'\$SCRIPT_DIR/([A-Za-z0-9_.-]+\.sh)', text))
+        missing = sorted(referenced - deployed.keys())
+        assert not missing, (
+            f"{script.name} references {missing}, which no driver deploys; "
+            f"deployed basenames are {sorted(deployed)}"
+        )
+
+
+def test_aws_worker_invokes_the_shared_campaign_runner() -> None:
+    """AWS must use the same provider-neutral runner as GCP, by its real name."""
+    from providers import settings
+
+    text = (REPO_ROOT / "providers/aws/worker/run-scamper-aws.sh").read_text(
+        encoding="utf-8"
+    )
+    runner = Path(settings.SCAMPER_CAMPAIGN_RUNNER).name
+    assert runner == "run_campaign.py"
+    assert f"./{runner}" in text
+    assert "run-scamper-campaign.py" not in text
+    # The runner's required arguments must all be supplied.
+    for required in ("--output-prefix", "--provider", "--region", "--node"):
+        assert required in text, f"AWS worker omits required {required}"
