@@ -2,5 +2,11 @@
 set -euo pipefail
 set -a
 source /etc/scamper-controller.env
+# Provider credentials live in a separate root-only file the operator provisions,
+# so bootstrap can regenerate the config above without touching secrets and
+# secrets never enter the release tarball or the repository.
+if [[ -r /etc/scamper-controller-secrets.env ]]; then
+  source /etc/scamper-controller-secrets.env
+fi
 set +a
 exec "$@"

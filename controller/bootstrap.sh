@@ -50,6 +50,25 @@ PYTHONUNBUFFERED=1
 EOF
 chmod 0644 /etc/scamper-controller.env
 
+# Provider credentials are operator-provisioned, never generated here and never
+# committed. Azure uses DefaultAzureCredential, which on a non-Azure host needs a
+# service principal in the environment; AWS uses the standard boto3 chain.
+if [[ ! -f /etc/scamper-controller-secrets.env ]]; then
+  cat > /etc/scamper-controller-secrets.env <<'SECRETS'
+# Fill in to launch non-GCP campaigns from this controller, then chmod 0600.
+# Azure (service principal):
+#   AZURE_TENANT_ID=
+#   AZURE_CLIENT_ID=
+#   AZURE_CLIENT_SECRET=
+#   AZURE_SUBSCRIPTION_ID=
+# AWS:
+#   AWS_ACCESS_KEY_ID=
+#   AWS_SECRET_ACCESS_KEY=
+#   AWS_DEFAULT_REGION=
+SECRETS
+fi
+chmod 0600 /etc/scamper-controller-secrets.env
+
 install -m 0755 "${release_dir}/controller/controller-status" /usr/local/bin/scamper-controller-status
 install -m 0755 "${release_dir}/controller/run-campaign" /usr/local/bin/scamper-controller-run
 echo "CONTROLLER_READY release=${release} project=${project} bucket=${bucket}"

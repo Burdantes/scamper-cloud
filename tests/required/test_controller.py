@@ -206,3 +206,34 @@ def test_default_worker_size_is_the_providers_own_cheap_default() -> None:
     azure_default = submit.default_worker_machine_type("azure")
     assert azure_default == "Standard_B2ts_v2"
     assert "D2s_v5" not in azure_default
+
+
+def test_controller_installs_every_providers_sdk() -> None:
+    """The controller launches all providers, so it must be able to import them.
+
+    Requirements previously listed GCP libraries only, so an AWS or Azure
+    campaign would have failed at import on the controller - one of the reasons
+    those campaigns ran from unmanaged hosts instead.
+    """
+    requirements = (
+        Path(__file__).resolve().parents[2] / "controller/requirements.txt"
+    ).read_text(encoding="utf-8")
+    for package in ("boto3", "azure-identity", "azure-mgmt-compute", "azure-mgmt-network"):
+        assert package in requirements, f"controller cannot import {package}"
+
+
+def test_provider_credentials_are_not_generated_or_committed() -> None:
+    """Secrets stay in an operator-provisioned file, outside the release."""
+    root = Path(__file__).resolve().parents[2]
+    bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
+    runner = (root / "controller/run-campaign").read_text(encoding="utf-8")
+
+    # The runner loads them if present, so a campaign can authenticate...
+    assert "/etc/scamper-controller-secrets.env" in runner
+    # ...and bootstrap only ever leaves a commented template, locked down.
+    assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
+    for secret in ("AZURE_CLIENT_SECRET=", "AWS_SECRET_ACCESS_KEY="):
+        # Present only as a commented placeholder, never assigned a value.
+        for line in bootstrap.splitlines():
+            if secret in line:
+                assert line.strip().startswith("#"), f"secret assigned in bootstrap: {line}"
