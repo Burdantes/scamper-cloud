@@ -383,6 +383,23 @@ def create_bucket(name):
             return None
         raise
 
+def locations_from_env():
+    """Restrict the campaign to an explicit location list.
+
+    Without this the driver is all-location, so a canary cannot target a chosen
+    region - capping instances to 1 just takes whichever location sorts first.
+    Being able to name the region is what makes a single-region validation
+    possible, e.g. re-running a region that previously produced no topology.
+    """
+    raw = os.environ.get("SCAMPER_AZR_LOCATIONS", "").strip()
+    if not raw:
+        return None
+    requested = [value.strip() for value in raw.split(",") if value.strip()]
+    if not requested:
+        return None
+    return requested
+
+
 def get_locations():
     #Currently using the error msg's list of locations that support public IP creation
     # pip = set('westus,eastus,northeurope,westeurope,eastasia,southeastasia,northcentralus,southcentralus,centralus,eastus2,japaneast,japanwest,brazilsouth,australiaeast,australiasoutheast,centralindia,southindia,westindia,canadacentral,canadaeast,westcentralus,westus2,ukwest,uksouth,koreacentral,koreasouth,francecentral,australiacentral,southafricanorth,uaenorth,switzerlandnorth,germanywestcentral,norwayeast,westus3,jioindiawest,swedencentral,qatarcentral,polandcentral,italynorth,israelcentral,mexicocentral'.split(","))
@@ -406,6 +423,16 @@ def get_locations():
     fallback_locations = [
         location for location in available_locations if location not in preferred
     ]
+    requested = locations_from_env()
+    if requested is not None:
+        unknown = [name for name in requested if name not in available]
+        if unknown:
+            raise SystemExit(
+                f"SCAMPER_AZR_LOCATIONS names locations unavailable in this "
+                f"subscription: {unknown}"
+            )
+        logging.info("restricting to SCAMPER_AZR_LOCATIONS=%s", requested)
+        return requested
     return preferred_locations + fallback_locations
 
 def create_rg(rg_name):

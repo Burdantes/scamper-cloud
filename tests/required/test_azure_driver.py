@@ -203,3 +203,17 @@ def test_driver_takes_its_vm_size_from_settings_not_a_literal() -> None:
     assert "settings.AZR_VM_SIZE" in text
     assert 'vm_size="Standard_' not in text, "VM size must not be a literal"
     assert "D2s_v5" not in text
+
+
+def test_locations_can_be_restricted_for_a_single_region_canary(monkeypatch) -> None:
+    """Capping instances is not region selection; a canary must name its region."""
+    from providers.azure import driver
+
+    monkeypatch.delenv("SCAMPER_AZR_LOCATIONS", raising=False)
+    assert driver.locations_from_env() is None
+
+    monkeypatch.setenv("SCAMPER_AZR_LOCATIONS", "westeurope")
+    assert driver.locations_from_env() == ["westeurope"]
+
+    monkeypatch.setenv("SCAMPER_AZR_LOCATIONS", " westeurope , japaneast ")
+    assert driver.locations_from_env() == ["westeurope", "japaneast"]
