@@ -39,7 +39,7 @@ AWS_SCAMPER_SSH_KEY = os.environ.get(
     "AWS_SCAMPER_SSH_KEY", "./credentials/aws-scamper-key-pair.pem"
 )
 AWS_SCAMPER_USER = os.environ.get("AWS_SCAMPER_USER", "ubuntu")
-AZR_SCAMPER_VM_SCRIPT = "./legacy/providers/azure/run-scamper-azr.sh"
+AZR_SCAMPER_VM_SCRIPT = "./providers/azure/worker/run-scamper-azr.sh"
 AZR_SCAMPER_SSH_KEY = os.environ.get(
     "AZR_SCAMPER_SSH_KEY", "./credentials/azr-scamper-key-pair.pem"
 )

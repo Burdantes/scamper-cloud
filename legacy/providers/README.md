@@ -5,12 +5,23 @@ controller dispatches through `providers.driver_module()`, so no production path
 imports from this directory.
 
 The AWS and Azure drivers remain unsupported historical implementations and no
-production workflow should call them. Their provider logic now has a supported
-home: `providers/aws/client.py` and `providers/azure/client.py` implement the
-`scamperctl.cloud.CloudClient` contract, and both are registered in
-`providers.CLIENT_FACTORIES`. Neither has a campaign driver yet, so
-`providers.driver_module()` still refuses to launch a campaign with them - that
-gap is what remains of the port.
+production workflow should call them. Everything else has been promoted:
+
+- `providers/aws/client.py` and `providers/azure/client.py` implement the
+  `scamperctl.cloud.CloudClient` contract and are registered in
+  `providers.CLIENT_FACTORIES`;
+- the AWS and Azure worker scripts now live under `providers/*/worker/` and
+  delegate to the shared runner, and `providers/settings.py` no longer names any
+  path in this directory.
+
+What remains here is campaign orchestration only - target sharding, artifact
+upload, log packaging, resume - roughly 1,000 lines per provider. Until that is
+ported, `providers.driver_module()` refuses to launch an AWS or Azure campaign,
+which is why neither appears in `DRIVER_MODULES`.
+
+Retired probe configurations are recorded in `docs/probe-configurations.md`
+rather than only surviving in this directory, so promoting the rest of a driver
+does not lose the measurement choices it encoded.
 
 This was violated in practice: a 27-region AWS campaign ran on 2026-08-06 and a
 44-region Azure campaign on 2026-08-13, neither through a supported path. The

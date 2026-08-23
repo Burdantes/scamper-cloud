@@ -9,15 +9,11 @@ SMOKE_SCRIPT = REPO_ROOT / "providers/common/worker/scamper-smoke.sh"
 VM_SCRIPTS = [
     REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh",
     REPO_ROOT / "providers/aws/worker/run-scamper-aws.sh",
-    REPO_ROOT / "legacy/providers/azure/run-scamper-azr.sh",
+    REPO_ROOT / "providers/azure/worker/run-scamper-azr.sh",
 ]
-# Worker scripts that a supported driver deploys. Azure is excluded because it
-# has no supported driver yet, and its committed script does not invoke a
-# campaign runner at all.
-SUPPORTED_VM_SCRIPTS = [
-    REPO_ROOT / "providers/gcp/worker/run-scamper-gcp.sh",
-    REPO_ROOT / "providers/aws/worker/run-scamper-aws.sh",
-]
+# Every promoted worker script delegates to the shared campaign runner, so all
+# of them are held to the deployment contract.
+SUPPORTED_VM_SCRIPTS = list(VM_SCRIPTS)
 
 
 def run_bash(command: str) -> subprocess.CompletedProcess[str]:
@@ -139,6 +135,7 @@ def test_worker_scripts_only_reference_files_that_are_deployed() -> None:
             settings.SCAMPER_CAMPAIGN_RUNNER,
             settings.GCP_SCAMPER_SCRIPT,
             settings.AWS_SCAMPER_VM_SCRIPT,
+            settings.AZR_SCAMPER_VM_SCRIPT,
         )
     }
     for name, path in deployed.items():
@@ -169,3 +166,41 @@ def test_aws_worker_invokes_the_shared_campaign_runner() -> None:
     # The runner's required arguments must all be supplied.
     for required in ("--output-prefix", "--provider", "--region", "--node"):
         assert required in text, f"AWS worker omits required {required}"
+
+
+def test_worker_scripts_do_not_duplicate_the_probe_definition() -> None:
+    """The campaign's probe flags live in the runner, not in each worker script.
+
+    The Azure worker used to call scamper directly with
+    "trace -P UDP-Paris -f 6 -g 10 -q 1", which both produced no provenance
+    metadata and probed differently from every other provider - a trace starting
+    at TTL 6 cannot see the first five hops at all. Those flags are recorded in
+    docs/probe-configurations.md; what must not recur is a worker script quietly
+    running its own measurement.
+    """
+    from experiments.scamper_v4_scanning.experiment import SCAMPER_OPERATION
+
+    canonical = SCAMPER_OPERATION.replace("{payload_option}", "")
+    for script in SUPPORTED_VM_SCRIPTS:
+        text = script.read_text(encoding="utf-8")
+        body = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+        # The measurement itself must go through the runner.
+        assert "./run_campaign.py" in body, f"{script.name} must use the runner"
+        # Any trace args present are for the smoke probe only, and must match
+        # the canonical definition rather than inventing a variant.
+        for line in body.splitlines():
+            if line.startswith("TRACE_ARGS="):
+                assert canonical.strip() in line, (
+                    f"{script.name} smoke args diverge from the canonical "
+                    f"definition: {line}"
+                )
+
+
+def test_probe_configuration_history_is_recorded() -> None:
+    """The retired UDP-Paris configuration must stay documented, not just deleted."""
+    doc = (REPO_ROOT / "docs/probe-configurations.md").read_text(encoding="utf-8")
+    for flag in ("-P UDP-Paris", "-f 6", "-g 10", "-q 1"):
+        assert flag in doc, f"{flag} is no longer recorded anywhere"
+    assert "load-balancer" in doc, "the rationale for UDP-Paris must be preserved"
