@@ -16,8 +16,9 @@ scamperctl workflow before it has a full campaign driver:
     ``python -m <module>`` by the controller.
 
 Registering a provider in only one is the honest state while a port is in
-progress: ``aws`` has a client but not yet a driver, so a workflow can drive it
-while :func:`driver_module` still refuses to launch a campaign with it.
+progress: ``aws`` and ``azure`` have clients but not yet campaign drivers, so a
+workflow can drive them while :func:`driver_module` still refuses to launch a
+campaign with either.
 """
 
 from __future__ import annotations
@@ -42,11 +43,18 @@ def _aws_client(**kwargs: Any) -> Any:
     return AWSClient(**kwargs)
 
 
+def _azure_client(**kwargs: Any) -> Any:
+    from providers.azure.client import AzureClient
+
+    return AzureClient(**kwargs)
+
+
 # provider -> factory returning a CloudClient. Imported lazily so that a missing
 # optional SDK for one provider cannot break the others.
 CLIENT_FACTORIES: dict[str, Callable[..., Any]] = {
     "gcp": _gcp_client,
     "aws": _aws_client,
+    "azure": _azure_client,
 }
 
 

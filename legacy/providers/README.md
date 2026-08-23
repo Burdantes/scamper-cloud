@@ -4,9 +4,13 @@ The GCP driver has been promoted to `providers/gcp` and is no longer here. The
 controller dispatches through `providers.driver_module()`, so no production path
 imports from this directory.
 
-The AWS and Azure drivers are unsupported historical implementations. They are
-kept here so useful provider logic is not lost during cleanup, but their tests
-are optional and no production workflow should call them.
+The AWS and Azure drivers remain unsupported historical implementations and no
+production workflow should call them. Their provider logic now has a supported
+home: `providers/aws/client.py` and `providers/azure/client.py` implement the
+`scamperctl.cloud.CloudClient` contract, and both are registered in
+`providers.CLIENT_FACTORIES`. Neither has a campaign driver yet, so
+`providers.driver_module()` still refuses to launch a campaign with them - that
+gap is what remains of the port.
 
 This was violated in practice: a 27-region AWS campaign ran on 2026-08-06 and a
 44-region Azure campaign on 2026-08-13, neither through a supported path. The

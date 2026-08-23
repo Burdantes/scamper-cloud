@@ -72,23 +72,26 @@ def test_unsupported_provider_is_rejected_at_the_model_boundary() -> None:
     import pytest
     from scamperctl.models import Profile, RunInventory
 
-    # azure has neither a client nor a driver yet, so it cannot enter a model.
+    # An entirely unknown provider cannot enter a model.
     with pytest.raises(ValueError, match="not a supported provider"):
-        Profile(name="p", project="proj", provider="azure")
+        Profile(name="p", project="proj", provider="oracle")
 
     with pytest.raises(ValueError, match="not a supported provider"):
         RunInventory(
             run_id="r", profile="p", project="proj",
-            machine_type="e2-small", provider="azure",
+            machine_type="e2-small", provider="oracle",
         )
 
-    # aws now has a CloudClient, so it is valid in a model...
-    assert Profile(name="p", project="proj", provider="aws").provider == "aws"
-    # ...but still has no campaign driver, which must stay refused.
+    # aws and azure have CloudClients, so they are valid in a model...
+    for provider in ("aws", "azure"):
+        assert Profile(name="p", project="proj", provider=provider).provider == provider
+
+    # ...but neither has a campaign driver, which must stay refused.
     from providers import driver_module
 
-    with pytest.raises(ValueError, match="no supported campaign driver"):
-        driver_module("aws")
+    for provider in ("aws", "azure"):
+        with pytest.raises(ValueError, match="no supported campaign driver"):
+            driver_module(provider)
 
 
 def test_run_inventory_round_trips_provider() -> None:
@@ -146,3 +149,56 @@ def test_aws_client_satisfies_the_contract_and_never_stops_instances() -> None:
 
     # OS Login is GCP-only and must not have been stubbed onto AWS.
     assert not hasattr(client, "project_os_login_enabled")
+
+
+def test_azure_client_always_opens_inbound_icmp_on_create() -> None:
+    """The 2026-08-13 regression: without this rule a traceroute VM sees no path.
+
+    Azure NSGs are stateful per flow, so an echo reply is admitted while an ICMP
+    Time Exceeded from a different source hits DenyAllInbound. 43 of 44 regions
+    recorded destinations and zero intermediate hops because of it.
+    """
+    from providers import client_for
+    from scamperctl.runner import CommandResult
+
+    calls: list[list[str]] = []
+
+    class RecordingRunner:
+        def run(self, args, *, check: bool = True) -> CommandResult:
+            calls.append(list(args))
+            return CommandResult(returncode=0, stdout="{}", stderr="")
+
+    client = client_for(
+        "azure", region="westeurope", resource_group="rg", runner=RecordingRunner()
+    )
+    client.create_instance(name="probe-1")
+
+    joined = [" ".join(c) for c in calls]
+    icmp = [c for c in joined if "nsg" in c and "rule" in c]
+    assert icmp, f"instance creation must add an inbound ICMP rule; saw {joined}"
+    rule = icmp[0]
+    for expected in ("--protocol Icmp", "--direction Inbound", "--access Allow"):
+        assert expected in rule, f"missing {expected!r} in {rule!r}"
+
+
+def test_azure_defaults_to_a_cheap_size_and_deletes_on_teardown() -> None:
+    """D2s_v5 at ~$0.10/hr x 44 VMs, left stopped, cost ~$150/day for 8 days."""
+    from providers import client_for
+    from providers.azure.client import DEFAULT_INSTANCE_TYPE
+    from scamperctl.models import Instance
+
+    assert DEFAULT_INSTANCE_TYPE == "Standard_B2ts_v2"
+    assert "D2s_v5" not in DEFAULT_INSTANCE_TYPE
+
+    client = client_for("azure", region="westeurope", resource_group="rg")
+    create = " ".join(client.create_instance_args(name="probe-1"))
+    assert "Standard_B2ts_v2" in create
+    assert "StandardSSD_LRS" in create  # not the Premium default of D-series
+
+    instance = Instance(name="probe-1", zone="westeurope", machine_type="Standard_B2ts_v2")
+    delete = client.delete_instance_args(instance)
+    assert "delete" in delete
+    # "stop" leaves the VM allocated and billing compute at full rate.
+    assert "stop" not in delete
+    # Deallocate exists, but it is explicitly not teardown.
+    assert "deallocate" in client.deallocate_instance_args(instance)

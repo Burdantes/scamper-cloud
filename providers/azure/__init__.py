@@ -1,0 +1,1 @@
+"""Supported Azure provider."""
