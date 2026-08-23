@@ -34,11 +34,12 @@ def validate_provider(value: str, context: str = "provider") -> str:
     profile at all, rather than failing later inside a workflow. Legacy drivers
     are not supported paths - see providers/__init__.py.
     """
-    from providers import DRIVER_MODULES
+    from providers import supported_providers
 
+    allowed = supported_providers()
     normalized = str(value).strip().lower()
-    if normalized not in DRIVER_MODULES:
-        supported = ", ".join(sorted(DRIVER_MODULES)) or "none"
+    if normalized not in allowed:
+        supported = ", ".join(allowed) or "none"
         raise ValueError(
             f"{context} {value!r} is not a supported provider (supported: {supported})"
         )
