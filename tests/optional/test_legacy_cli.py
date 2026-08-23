@@ -4,7 +4,7 @@ from typing import Sequence
 import pytest
 
 from legacy.cli import cli
-from legacy.cli import expenses
+from providers import expenses
 from scamperctl.runner import CommandResult
 
 

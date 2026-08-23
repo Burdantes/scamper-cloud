@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from legacy.providers.azure import driver as azr
+from providers.azure import driver as azr
 
 
 class FakePoller:

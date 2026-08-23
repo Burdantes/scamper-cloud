@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from legacy.providers.aws import driver as aws
+from providers.aws import driver as aws
 
 
 class FakeInstance:

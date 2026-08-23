@@ -1,35 +1,29 @@
-# Direct-provider compatibility code
+# Retired provider code
 
-The GCP driver has been promoted to `providers/gcp` and is no longer here. The
-controller dispatches through `providers.driver_module()`, so no production path
-imports from this directory.
+This directory no longer holds any provider implementation. The AWS, Azure and
+GCP campaign drivers, worker scripts and clients were all promoted to
+`providers/`, and `providers/settings.py` names no path here.
 
-The AWS and Azure drivers remain unsupported historical implementations and no
-production workflow should call them. Everything else has been promoted:
+No production module imports anything under `legacy/` any more. That is enforced
+in spirit by `providers.driver_module()`, which refuses a provider without a
+supported driver rather than resolving a quarantined path.
 
-- `providers/aws/client.py` and `providers/azure/client.py` implement the
-  `scamperctl.cloud.CloudClient` contract and are registered in
-  `providers.CLIENT_FACTORIES`;
-- the AWS and Azure worker scripts now live under `providers/*/worker/` and
-  delegate to the shared runner, and `providers/settings.py` no longer names any
-  path in this directory.
+## What went wrong while these were quarantined
 
-What remains here is campaign orchestration only - target sharding, artifact
-upload, log packaging, resume - roughly 1,000 lines per provider. Until that is
-ported, `providers.driver_module()` refuses to launch an AWS or Azure campaign,
-which is why neither appears in `DRIVER_MODULES`.
+Both non-GCP campaigns ran outside the supported path, and the drivers kept here
+would have prevented most of it:
 
-Retired probe configurations are recorded in `docs/probe-configurations.md`
-rather than only surviving in this directory, so promoting the rest of a driver
-does not lose the measurement choices it encoded.
+- The Azure driver already set `Standard_B1s`, already created an inbound
+  `AllowICMP` NSG rule, and already deleted its resource group in a `finally`
+  block. The 2026-08-13 campaign used none of that: it ran `Standard_D2s_v5`,
+  had no inbound ICMP rule - so 43 of 44 regions observed destinations and no
+  intermediate hops at all - and left VMs merely stopped, which on Azure still
+  bills compute. Roughly $150/day for eight days, and unusable data.
+- The AWS worker script invoked `./run-scamper-campaign.py`, a filename that
+  exists nowhere, so it could not run as committed and was patched by hand at
+  deploy time.
 
-This was violated in practice: a 27-region AWS campaign ran on 2026-08-06 and a
-44-region Azure campaign on 2026-08-13, neither through a supported path. The
-Azure campaign produced unusable data - 43 of 44 nodes observed no topology at
-all, because the VMs lacked the inbound ICMP allow rule that `create_nsg` in
-this directory already creates. They also ran Standard_D2s_v5 where this driver
-hardcodes Standard_B1s, and were stopped rather than deallocated, which billed
-for eight idle days. Promoting these providers properly is what prevents a
-repeat. Promote a provider
-out of this directory only after porting it to the `scamperctl` inventory,
-cost-guard, experiment, collection, and teardown contracts.
+The lesson is not that the quarantined code was bad. It is that shelving working
+code as "unsupported" pushes people to run something unmaintained instead.
+
+Retired probe configurations are recorded in `docs/probe-configurations.md`.

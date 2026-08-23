@@ -1,1 +1,0 @@
-"""Unsupported Azure compatibility provider."""

@@ -175,7 +175,7 @@ for noisy_logger_name in (
 
 def record_expense_instances(instance_count):
     try:
-        from legacy.cli.expenses import record_provider_instances_from_env
+        from providers.expenses import record_provider_instances_from_env
 
         if record_provider_instances_from_env("azr", instance_count):
             logging.info("Recorded %d instances in the expense ledger", instance_count)

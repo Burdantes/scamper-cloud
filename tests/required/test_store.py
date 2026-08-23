@@ -86,12 +86,16 @@ def test_unsupported_provider_is_rejected_at_the_model_boundary() -> None:
     for provider in ("aws", "azure"):
         assert Profile(name="p", project="proj", provider=provider).provider == provider
 
-    # ...but neither has a campaign driver, which must stay refused.
+    # ...and both now have campaign drivers, so the controller can launch them.
     from providers import driver_module
 
-    for provider in ("aws", "azure"):
-        with pytest.raises(ValueError, match="no supported campaign driver"):
-            driver_module(provider)
+    assert driver_module("aws") == "providers.aws.driver"
+    assert driver_module("azure") == "providers.azure.driver"
+
+    # A provider with neither is still refused, and the message points away
+    # from legacy rather than resolving a quarantined path.
+    with pytest.raises(ValueError, match="no supported campaign driver"):
+        driver_module("oracle")
 
 
 def test_run_inventory_round_trips_provider() -> None:

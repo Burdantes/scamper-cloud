@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+# Filename retains "legacy" deliberately: renaming it would orphan the running
+# ledger, and continuity of spend history matters more than the name.
 DEFAULT_EXPENSE_FILE = Path(".scamper/legacy-expenses.json")
 DEFAULT_BUDGET_USD = 200.0
 

@@ -15,10 +15,10 @@ scamperctl workflow before it has a full campaign driver:
     Providers with a supported end-to-end campaign driver, invoked as
     ``python -m <module>`` by the controller.
 
-Registering a provider in only one is the honest state while a port is in
-progress: ``aws`` and ``azure`` have clients but not yet campaign drivers, so a
-workflow can drive them while :func:`driver_module` still refuses to launch a
-campaign with either.
+A provider needs both to be launchable: a client for the scamperctl workflow and
+a campaign driver for the controller. Registering in only one is the honest state
+mid-port - :func:`driver_module` refuses any provider without an orchestrator
+rather than silently resolving a legacy path.
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ from typing import Any, Callable
 # provider -> importable driver module, used instead of hardcoding paths.
 DRIVER_MODULES: dict[str, str] = {
     "gcp": "providers.gcp.driver",
+    "aws": "providers.aws.driver",
+    "azure": "providers.azure.driver",
 }
 
 

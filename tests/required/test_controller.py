@@ -119,3 +119,54 @@ def test_gcp_artifact_contract_keeps_raw_output_without_full_jsonl() -> None:
     assert any(artifact.endswith(".trace.warts") for artifact in artifacts)
     assert any(artifact.endswith(".rr.warts") for artifact in artifacts)
     assert not any(artifact.endswith(".jsonl") for artifact in artifacts)
+
+
+def test_submit_dispatches_the_requested_provider() -> None:
+    """The controller must be able to launch every provider that has a driver."""
+    from controller import submit
+    from providers import DRIVER_MODULES
+
+    for provider, module in sorted(DRIVER_MODULES.items()):
+        args = argparse.Namespace(
+            provider=provider, run_id="r", log_dir=None,
+            trace_targets=Path("/t"), rr_targets=Path("/r"),
+            bucket="b", object_prefix=None, regions="us-east1",
+            worker_machine_type="e2-micro", worker_image_project=None,
+            worker_image_family=None, measurements="trace,rr",
+            max_instances=None, max_targets=None, trace_rate=1000,
+            rr_rate=1000, rr_timeout=2.0, probe_payload="p",
+            measurement_contact="c", do_not_probe_file=Path("/d"),
+            skip_smoke=False,
+        )
+        command = submit.campaign_command(args, Path("/tmp/job"))
+        assert module in command, f"{provider} must dispatch {module}"
+    # No provider name is hardcoded any more.
+    source = Path(submit.__file__).read_text(encoding="utf-8")
+    assert 'driver_module("gcp")' not in source
+
+
+def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -> None:
+    """Measurements must come from the controller, which owns the job record.
+
+    A campaign launched from a workstation leaves no durable record of what ran,
+    with which code, or whether teardown completed.
+    """
+    import pytest
+
+    from controller import submit
+
+    monkeypatch.setattr(submit, "INSTALL_ROOT", tmp_path / "absent")
+    monkeypatch.setattr(submit, "STATE_ROOT", tmp_path / "also-absent")
+
+    with pytest.raises(SystemExit, match="not the scamper controller"):
+        submit.assert_controller_origin()
+
+    # The escape hatch is explicit and labels the submission.
+    assert submit.assert_controller_origin(allow_foreign=True) == "foreign"
+
+    # On a real controller both roots exist.
+    install, state = tmp_path / "opt", tmp_path / "state"
+    install.mkdir(); state.mkdir()
+    monkeypatch.setattr(submit, "INSTALL_ROOT", install)
+    monkeypatch.setattr(submit, "STATE_ROOT", state)
+    assert submit.assert_controller_origin() == "controller"

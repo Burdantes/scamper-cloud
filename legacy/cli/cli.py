@@ -14,7 +14,7 @@ from typing import Iterable, Mapping, Protocol, Sequence
 
 from providers import settings
 
-from legacy.cli import expenses
+from providers import expenses
 from scamperctl.runner import CommandFailed, CommandResult, SubprocessRunner
 
 
