@@ -20,7 +20,8 @@ KEY_NAME = "aws-scamper-key-pair"
 
 PROJECT = settings.GCP_PROJECT
 
-instance_types = ['t3.micro','t2.micro']
+# Configurable via AWS_INSTANCE_TYPES; default defined in providers/aws/client.py.
+instance_types = settings.AWS_INSTANCE_TYPES
 
 credentials = None
 
@@ -468,7 +469,7 @@ def create_instance(region, zone, sg_id, name):
         logging.info("No matching AMI found in %s", region)
         return None
     ami_id = sorted(images, key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
-    client.describe_instance_types(Filters=[{"Name":"instance-type", "Values":["t2.micro","t3.micro"]}])
+    client.describe_instance_types(Filters=[{"Name":"instance-type", "Values":list(instance_types)}])
     instance = None
 
     for type in instance_types:

@@ -170,3 +170,39 @@ def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -
     monkeypatch.setattr(submit, "INSTALL_ROOT", install)
     monkeypatch.setattr(submit, "STATE_ROOT", state)
     assert submit.assert_controller_origin() == "controller"
+
+
+def test_worker_machine_type_reaches_every_provider() -> None:
+    """--worker-machine-type used to set GCP_MACHINE_TYPE only.
+
+    For AWS and Azure it was therefore silently ignored: their sizes came from
+    literals hardcoded in the drivers that no operator could override. That is
+    how a network-bound campaign ended up on Standard_D2s_v5.
+    """
+    from controller import submit
+
+    expected = {"gcp": "GCP_MACHINE_TYPE", "aws": "AWS_INSTANCE_TYPES", "azure": "AZR_VM_SIZE"}
+    for provider, variable in expected.items():
+        args = argparse.Namespace(
+            provider=provider, run_id="r", worker_machine_type="size-x",
+            worker_image_project=None, worker_image_family=None,
+        )
+        joined = " ".join(submit.systemd_command(args, ["cmd"]))
+        assert f"--setenv={variable}=size-x" in joined, (
+            f"{provider} must receive its size via {variable}: {joined}"
+        )
+    # Every launchable provider must have a route; none may be silently dropped.
+    from providers import DRIVER_MODULES
+
+    assert set(DRIVER_MODULES) <= set(submit.MACHINE_TYPE_ENV)
+
+
+def test_default_worker_size_is_the_providers_own_cheap_default() -> None:
+    """A GCP-shaped default must not leak into an AWS or Azure campaign."""
+    from controller import submit
+
+    assert submit.default_worker_machine_type("gcp").startswith("e2-")
+    assert submit.default_worker_machine_type("aws").startswith("t3.")
+    azure_default = submit.default_worker_machine_type("azure")
+    assert azure_default == "Standard_B2ts_v2"
+    assert "D2s_v5" not in azure_default

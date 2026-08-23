@@ -192,3 +192,14 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["complete"] is False
     assert manifest["failed_nodes"] == ["azr-eastus"]
     assert manifest["object_prefix"] == "runs/azr-test"
+
+
+def test_driver_takes_its_vm_size_from_settings_not_a_literal() -> None:
+    """The size must be overridable; hardcoding it is what cost ~$150/day."""
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "providers/azure/driver.py"
+    text = source.read_text(encoding="utf-8")
+    assert "settings.AZR_VM_SIZE" in text
+    assert 'vm_size="Standard_' not in text, "VM size must not be a literal"
+    assert "D2s_v5" not in text

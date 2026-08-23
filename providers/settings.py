@@ -34,6 +34,37 @@ GCP_SCOPES = [
     "https://www.googleapis.com/auth/monitoring.write",
 ]
 
+# Instance sizing is env-configurable for every provider, not just GCP. The
+# defaults come from the client modules so a provider's cheap default is defined
+# once; hardcoding a size in a driver is what let a network-bound Azure campaign
+# run on Standard_D2s_v5 at roughly ten times the necessary rate.
+def _default(module: str, attribute: str, fallback: str) -> str:
+    try:
+        import importlib
+
+        return str(getattr(importlib.import_module(module), attribute))
+    except Exception:  # pragma: no cover - a missing optional SDK must not break settings
+        return fallback
+
+
+# AWS tries these in order; the first available in the zone wins.
+AWS_INSTANCE_TYPES = [
+    value.strip()
+    for value in os.environ.get(
+        "AWS_INSTANCE_TYPES",
+        f"{_default('providers.aws.client', 'DEFAULT_INSTANCE_TYPE', 't3.micro')},t2.micro",
+    ).split(",")
+    if value.strip()
+]
+AZR_VM_SIZE = os.environ.get(
+    "AZR_VM_SIZE",
+    _default("providers.azure.client", "DEFAULT_INSTANCE_TYPE", "Standard_B2ts_v2"),
+)
+AZR_OS_DISK_SKU = os.environ.get(
+    "AZR_OS_DISK_SKU",
+    _default("providers.azure.client", "DEFAULT_OS_DISK_SKU", "StandardSSD_LRS"),
+)
+
 AWS_SCAMPER_VM_SCRIPT = "./providers/aws/worker/run-scamper-aws.sh"
 AWS_SCAMPER_SSH_KEY = os.environ.get(
     "AWS_SCAMPER_SSH_KEY", "./credentials/aws-scamper-key-pair.pem"

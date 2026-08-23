@@ -586,7 +586,7 @@ def create_vm(rg_name,location,  vm_name, ni_id):
                         version="latest",
                     ),
                 ),
-                hardware_profile=HardwareProfile(vm_size="Standard_B1s"),
+                hardware_profile=HardwareProfile(vm_size=settings.AZR_VM_SIZE),
                 os_profile=OSProfile(
                     computer_name=vm_name,
                     admin_username=settings.AZR_SCAMPER_USER,

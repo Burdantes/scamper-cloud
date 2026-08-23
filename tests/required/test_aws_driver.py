@@ -406,3 +406,14 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["complete"] is False
     assert manifest["failed_nodes"] == ["node-a"]
     assert manifest["object_prefix"] == "runs/aws-test"
+
+
+def test_driver_takes_its_instance_types_from_settings_not_a_literal() -> None:
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "providers/aws/driver.py"
+    text = source.read_text(encoding="utf-8")
+    assert "settings.AWS_INSTANCE_TYPES" in text
+    assert "instance_types = ['t3.micro','t2.micro']" not in text
+    # The describe filter must follow the configured list, not a second literal.
+    assert '"Values":["t2.micro","t3.micro"]' not in text
