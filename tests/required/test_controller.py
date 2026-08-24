@@ -257,3 +257,22 @@ def test_secrets_file_is_readable_by_the_controller_user() -> None:
     assert chown_line, "secrets file must be chown'd to the controller user"
     assert "${controller_user}" in chown_line
     assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
+
+
+def test_bootstrap_points_every_provider_at_the_controllers_own_key() -> None:
+    """Repo-local ./credentials/*.pem paths exist only in a developer checkout.
+
+    A controller-launched Azure campaign failed reading
+    credentials/azr-scamper-key-pair.pem.pub after already creating the NSG and
+    NIC. Using the key bootstrap generates on the host also avoids copying any
+    private key onto the controller.
+    """
+    bootstrap = (
+        Path(__file__).resolve().parents[2] / "controller/bootstrap.sh"
+    ).read_text(encoding="utf-8")
+
+    for variable in ("GCP_SCAMPER_SSH_KEY", "AWS_SCAMPER_SSH_KEY", "AZR_SCAMPER_SSH_KEY"):
+        line = next((l for l in bootstrap.splitlines() if l.startswith(f"{variable}=")), None)
+        assert line, f"{variable} must be written into the controller environment"
+        assert "${state_root}/ssh/id_ed25519" in line, line
+        assert "credentials/" not in line, f"{variable} must not use a repo-local path"

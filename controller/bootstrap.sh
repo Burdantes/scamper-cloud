@@ -44,6 +44,13 @@ GCP_SERVICE_ACCOUNT=${service_account}
 SCAMPER_RESULTS_BUCKET=${bucket}
 GCP_NETWORK_TIER=STANDARD
 GCP_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
+# Every provider uses the key the controller generated for itself above. The
+# defaults in providers/settings.py are repo-local ./credentials/*.pem paths that
+# exist only in a developer checkout, so a controller-launched AWS or Azure
+# campaign died on FileNotFoundError reading the public half. Pointing all three
+# here also means no private key is ever copied onto this host.
+AWS_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
+AZR_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
 GCP_SCAMPER_USER=scamper-gcp
 WARTS_STORAGE_CREDENTIALS=/var/lib/scamper-controller/adc-only.json
 PYTHONUNBUFFERED=1
