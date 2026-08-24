@@ -70,6 +70,15 @@ AWS_SCAMPER_SSH_KEY = os.environ.get(
     "AWS_SCAMPER_SSH_KEY", "./credentials/aws-scamper-key-pair.pem"
 )
 AWS_SCAMPER_USER = os.environ.get("AWS_SCAMPER_USER", "ubuntu")
+# Ubuntu 22.04, not 20.04. The shared runner uses random.Random.randbytes,
+# added in Python 3.9, and Focal ships 3.8 - so an Azure worker on 20.04 passed
+# its smoke test and then died in shuffle_targets. AWS already used Jammy and GCP
+# Debian 11, leaving Azure the only provider that could not run the runner.
+AZR_IMAGE_PUBLISHER = os.environ.get("AZR_IMAGE_PUBLISHER", "canonical")
+AZR_IMAGE_OFFER = os.environ.get("AZR_IMAGE_OFFER", "0001-com-ubuntu-server-jammy")
+AZR_IMAGE_SKU = os.environ.get("AZR_IMAGE_SKU", "22_04-lts-gen2")
+AZR_IMAGE_VERSION = os.environ.get("AZR_IMAGE_VERSION", "latest")
+
 AZR_SCAMPER_VM_SCRIPT = "./providers/azure/worker/run-scamper-azr.sh"
 AZR_SCAMPER_SSH_KEY = os.environ.get(
     "AZR_SCAMPER_SSH_KEY", "./credentials/azr-scamper-key-pair.pem"

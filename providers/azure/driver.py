@@ -610,10 +610,10 @@ def create_vm(rg_name,location,  vm_name, ni_id):
             properties=VirtualMachineProperties(
                 storage_profile=StorageProfile(
                     image_reference=ImageReference(
-                        publisher="canonical",
-                        offer="0001-com-ubuntu-server-focal",
-                        sku="20_04-lts-gen2",
-                        version="latest",
+                        publisher=settings.AZR_IMAGE_PUBLISHER,
+                        offer=settings.AZR_IMAGE_OFFER,
+                        sku=settings.AZR_IMAGE_SKU,
+                        version=settings.AZR_IMAGE_VERSION,
                     ),
                 ),
                 hardware_profile=HardwareProfile(vm_size=settings.AZR_VM_SIZE),

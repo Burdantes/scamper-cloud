@@ -217,3 +217,28 @@ def test_locations_can_be_restricted_for_a_single_region_canary(monkeypatch) -> 
 
     monkeypatch.setenv("SCAMPER_AZR_LOCATIONS", " westeurope , japaneast ")
     assert driver.locations_from_env() == ["westeurope", "japaneast"]
+
+
+def test_worker_image_can_run_the_shared_campaign_runner() -> None:
+    """run_campaign.py uses random.Random.randbytes, which needs Python 3.9+.
+
+    Azure shipped Ubuntu 20.04 (Python 3.8) while AWS used 22.04 and GCP Debian
+    11, so an Azure worker passed its smoke test and then died in
+    shuffle_targets with AttributeError. The image must stay recent enough.
+    """
+    from pathlib import Path
+
+    from providers import settings
+
+    root = Path(__file__).resolve().parents[2]
+    runner = (root / "experiments/common/run_campaign.py").read_text(encoding="utf-8")
+    assert "randbytes" in runner, "test premise: the runner needs Python 3.9+"
+
+    assert "20_04" not in settings.AZR_IMAGE_SKU, (
+        f"Azure image {settings.AZR_IMAGE_SKU} ships Python 3.8, which cannot run "
+        "the shared campaign runner"
+    )
+    assert "focal" not in settings.AZR_IMAGE_OFFER
+    driver = (root / "providers/azure/driver.py").read_text(encoding="utf-8")
+    assert "settings.AZR_IMAGE_SKU" in driver, "image must come from settings"
+    assert 'offer="0001-com-ubuntu-server-focal"' not in driver
