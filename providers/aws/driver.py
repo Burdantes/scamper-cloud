@@ -7,6 +7,10 @@ import tarfile
 import urllib.parse
 import urllib.request
 from providers import settings
+from providers.gcs_credentials import (
+    google_credentials,
+    storage_client as gcs_storage_client,
+)
 import logging
 import subprocess
 import time
@@ -73,14 +77,8 @@ def max_targets_from_env():
 
 
 def get_gcp_credentials():
-    global credentials
-    if credentials is None:
-        from google.oauth2 import service_account
-
-        credentials = service_account.Credentials.from_service_account_file(
-            settings.WARTS_STORAGE_CREDENTIALS
-        )
-    return credentials
+    # Shared with every provider: explicit key if configured, else ADC.
+    return google_credentials()
 
 
 def ec2_client(region):
@@ -150,7 +148,7 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
             attempt += 1
             from google.cloud import storage
 
-            storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+            storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
             logging.info("Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob))
@@ -182,7 +180,7 @@ def aws_timeout_seconds(name, default):
 def uploaded_artifact_sizes(bucket_name, artifact_names):
     from google.cloud import storage
 
-    storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+    storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
     sizes = {}
     for name in artifact_names:
@@ -200,9 +198,7 @@ def incomplete_uploaded_statuses(bucket_name, artifact_names):
     from google.cloud import storage
 
     status_names = [name for name in artifact_names if name.endswith(".status.json")]
-    storage_client = storage.Client.from_service_account_json(
-        settings.WARTS_STORAGE_CREDENTIALS
-    )
+    storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
     incomplete = []
     for name in status_names:

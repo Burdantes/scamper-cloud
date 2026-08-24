@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 from providers import settings
+from providers.gcs_credentials import (
+    google_credentials,
+    storage_client as gcs_storage_client,
+)
 import logging
 import subprocess
 import time
@@ -149,14 +153,8 @@ def get_resource_client():
 
 
 def get_gcp_credentials():
-    global gcp_credential
-    if gcp_credential is None:
-        from google.oauth2 import service_account
-
-        gcp_credential = service_account.Credentials.from_service_account_file(
-            settings.WARTS_STORAGE_CREDENTIALS
-        )
-    return gcp_credential
+    # Shared with every provider: explicit key if configured, else ADC.
+    return google_credentials()
 
 time_format = "%Y-%m-%d %H:%M:%S"
 formatter = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(message)s', datefmt=time_format)
@@ -197,7 +195,7 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
             attempt += 1
             from google.cloud import storage
 
-            storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+            storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
             logging.info("Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob))
