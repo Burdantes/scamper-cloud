@@ -113,6 +113,48 @@ def test_gcp_worker_can_skip_smoke_probe() -> None:
     assert "Skipping Scamper smoke test by request" in script
 
 
+def test_drivers_scp_every_file_their_worker_script_uses() -> None:
+    """Compare the driver's actual scp list against the worker's references.
+
+    An earlier version of this check compared against providers/settings.py
+    rather than the driver, so it passed while the Azure driver omitted
+    SCAMPER_CAMPAIGN_RUNNER from INIT_CMD. The VM then passed its smoke test and
+    died on "chmod: cannot access ./run_campaign.py". What matters is what the
+    driver copies, not what the settings could supply.
+    """
+    import re
+
+    from providers import settings
+
+    cases = [
+        ("providers/gcp/driver.py", "providers/gcp/worker/run-scamper-gcp.sh"),
+        ("providers/aws/driver.py", "providers/aws/worker/run-scamper-aws.sh"),
+        ("providers/azure/driver.py", "providers/azure/worker/run-scamper-azr.sh"),
+    ]
+    for driver_rel, worker_rel in cases:
+        driver = (REPO_ROOT / driver_rel).read_text(encoding="utf-8")
+        worker = (REPO_ROOT / worker_rel).read_text(encoding="utf-8")
+
+        # Basenames the driver actually hands to scp.
+        shipped = set()
+        for name in re.findall(r"settings\.([A-Z_]+)", driver):
+            value = getattr(settings, name, None)
+            if isinstance(value, str) and value.endswith((".py", ".sh", ".json")):
+                shipped.add(Path(value).name)
+
+        body = "\n".join(
+            line for line in worker.splitlines() if not line.lstrip().startswith("#")
+        )
+        referenced = set(re.findall(r"\./([A-Za-z0-9_.-]+\.py)", body))
+        referenced |= set(re.findall(r"\$SCRIPT_DIR/([A-Za-z0-9_.-]+\.sh)", body))
+
+        missing = sorted(referenced - shipped)
+        assert not missing, (
+            f"{Path(driver_rel).parent.name}: worker uses {missing} but the driver "
+            f"never copies them; it ships {sorted(shipped)}"
+        )
+
+
 def test_worker_scripts_only_reference_files_that_are_deployed() -> None:
     """A worker script must not invoke a helper that does not exist.
 

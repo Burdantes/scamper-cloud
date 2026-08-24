@@ -30,6 +30,10 @@ INIT_CMD = ["scp", "-i", settings.AZR_SCAMPER_SSH_KEY,
             settings.WARTS_STORAGE_CREDENTIALS,
             settings.AZR_SCAMPER_VM_SCRIPT,
             settings.SCAMPER_SMOKE_SCRIPT,
+            # The worker delegates to the shared runner, so it must be shipped.
+            # Omitting it left the VM failing on "chmod: cannot access
+            # ./run_campaign.py" after a successful smoke test.
+            settings.SCAMPER_CAMPAIGN_RUNNER,
             settings.SCAMPER_UPLOAD_SCRIPT]
 RESOURCE_GROUP_NAME = "azr-scamper"
 PRIVATE_IP = "10.0.0.4"
