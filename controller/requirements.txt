@@ -2,3 +2,12 @@ google-api-python-client
 google-auth
 google-cloud-storage
 python-dotenv
+# The controller launches every provider, so it needs each provider's SDK. Without
+# these an AWS or Azure campaign fails at import on the controller, which is what
+# pushed those campaigns onto unmanaged hosts.
+boto3
+azure-identity
+azure-mgmt-compute
+azure-mgmt-network
+azure-mgmt-resource
+azure-mgmt-subscription

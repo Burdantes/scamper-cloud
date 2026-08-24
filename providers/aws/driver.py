@@ -7,6 +7,11 @@ import tarfile
 import urllib.parse
 import urllib.request
 from providers import settings
+from providers.preflight import assert_worker_assets
+from providers.gcs_credentials import (
+    google_credentials,
+    storage_client as gcs_storage_client,
+)
 import logging
 import subprocess
 import time
@@ -20,7 +25,8 @@ KEY_NAME = "aws-scamper-key-pair"
 
 PROJECT = settings.GCP_PROJECT
 
-instance_types = ['t3.micro','t2.micro']
+# Configurable via AWS_INSTANCE_TYPES; default defined in providers/aws/client.py.
+instance_types = settings.AWS_INSTANCE_TYPES
 
 credentials = None
 
@@ -72,14 +78,8 @@ def max_targets_from_env():
 
 
 def get_gcp_credentials():
-    global credentials
-    if credentials is None:
-        from google.oauth2 import service_account
-
-        credentials = service_account.Credentials.from_service_account_file(
-            settings.WARTS_STORAGE_CREDENTIALS
-        )
-    return credentials
+    # Shared with every provider: explicit key if configured, else ADC.
+    return google_credentials()
 
 
 def ec2_client(region):
@@ -149,7 +149,7 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
             attempt += 1
             from google.cloud import storage
 
-            storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+            storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
             logging.info("Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob))
@@ -181,7 +181,7 @@ def aws_timeout_seconds(name, default):
 def uploaded_artifact_sizes(bucket_name, artifact_names):
     from google.cloud import storage
 
-    storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+    storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
     sizes = {}
     for name in artifact_names:
@@ -199,9 +199,7 @@ def incomplete_uploaded_statuses(bucket_name, artifact_names):
     from google.cloud import storage
 
     status_names = [name for name in artifact_names if name.endswith(".status.json")]
-    storage_client = storage.Client.from_service_account_json(
-        settings.WARTS_STORAGE_CREDENTIALS
-    )
+    storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
     incomplete = []
     for name in status_names:
@@ -468,7 +466,7 @@ def create_instance(region, zone, sg_id, name):
         logging.info("No matching AMI found in %s", region)
         return None
     ami_id = sorted(images, key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
-    client.describe_instance_types(Filters=[{"Name":"instance-type", "Values":["t2.micro","t3.micro"]}])
+    client.describe_instance_types(Filters=[{"Name":"instance-type", "Values":list(instance_types)}])
     instance = None
 
     for type in instance_types:
@@ -1011,6 +1009,9 @@ def main(argv=None):
     if not args.apply:
         print(json.dumps(plan, indent=2))
         return 0
+
+    # Fail before provisioning if a file the workers need is absent here.
+    assert_worker_assets("aws")
 
     run_aws_scamper(
         log_dir,

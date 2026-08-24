@@ -44,11 +44,41 @@ GCP_SERVICE_ACCOUNT=${service_account}
 SCAMPER_RESULTS_BUCKET=${bucket}
 GCP_NETWORK_TIER=STANDARD
 GCP_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
+# Every provider uses the key the controller generated for itself above. The
+# defaults in providers/settings.py are repo-local ./credentials/*.pem paths that
+# exist only in a developer checkout, so a controller-launched AWS or Azure
+# campaign died on FileNotFoundError reading the public half. Pointing all three
+# here also means no private key is ever copied onto this host.
+AWS_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
+AZR_SCAMPER_SSH_KEY=${state_root}/ssh/id_ed25519
 GCP_SCAMPER_USER=scamper-gcp
 WARTS_STORAGE_CREDENTIALS=/var/lib/scamper-controller/adc-only.json
 PYTHONUNBUFFERED=1
 EOF
 chmod 0644 /etc/scamper-controller.env
+
+# Provider credentials are operator-provisioned, never generated here and never
+# committed. Azure uses DefaultAzureCredential, which on a non-Azure host needs a
+# service principal in the environment; AWS uses the standard boto3 chain.
+if [[ ! -f /etc/scamper-controller-secrets.env ]]; then
+  cat > /etc/scamper-controller-secrets.env <<'SECRETS'
+# Fill in to launch non-GCP campaigns from this controller, then chmod 0600.
+# Azure (service principal):
+#   AZURE_TENANT_ID=
+#   AZURE_CLIENT_ID=
+#   AZURE_CLIENT_SECRET=
+#   AZURE_SUBSCRIPTION_ID=
+# AWS:
+#   AWS_ACCESS_KEY_ID=
+#   AWS_SECRET_ACCESS_KEY=
+#   AWS_DEFAULT_REGION=
+SECRETS
+fi
+# Readable by the controller user, because run-campaign executes as that user
+# via systemd --uid=scamper-controller. Root-owned 0600 would be unreadable to it
+# and every non-GCP campaign would fail with CredentialUnavailableError.
+chown "${controller_user}:${controller_user}" /etc/scamper-controller-secrets.env
+chmod 0600 /etc/scamper-controller-secrets.env
 
 install -m 0755 "${release_dir}/controller/controller-status" /usr/local/bin/scamper-controller-status
 install -m 0755 "${release_dir}/controller/run-campaign" /usr/local/bin/scamper-controller-run

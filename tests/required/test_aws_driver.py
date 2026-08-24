@@ -406,3 +406,52 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["complete"] is False
     assert manifest["failed_nodes"] == ["node-a"]
     assert manifest["object_prefix"] == "runs/aws-test"
+
+
+def test_driver_takes_its_instance_types_from_settings_not_a_literal() -> None:
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "providers/aws/driver.py"
+    text = source.read_text(encoding="utf-8")
+    assert "settings.AWS_INSTANCE_TYPES" in text
+    assert "instance_types = ['t3.micro','t2.micro']" not in text
+    # The describe filter must follow the configured list, not a second literal.
+    assert '"Values":["t2.micro","t3.micro"]' not in text
+
+
+def test_all_providers_resolve_google_credentials_the_same_way() -> None:
+    """AWS and Azure hard-required a key file; GCP already fell back to ADC.
+
+    On the controller, WARTS_STORAGE_CREDENTIALS names a path that was never
+    created, so GCP campaigns ran while AWS and Azure died with FileNotFoundError
+    before provisioning anything. One shared resolver stops the untested paths
+    drifting from the tested one.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("providers/aws/driver.py", "providers/azure/driver.py"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "from providers.gcs_credentials import" in text, rel
+        assert "from_service_account_json" not in text, f"{rel} bypasses the resolver"
+        assert "from_service_account_file" not in text, f"{rel} bypasses the resolver"
+
+
+def test_google_credentials_fall_back_to_adc(monkeypatch, tmp_path) -> None:
+    """A GCE controller has an attached service account; no key file needed."""
+    import providers.gcs_credentials as gc
+    from providers import settings
+
+    monkeypatch.setattr(gc, "_credentials", None)
+    monkeypatch.setattr(settings, "WARTS_STORAGE_CREDENTIALS", str(tmp_path / "absent.json"))
+    called = {}
+
+    def fake_default(scopes=None):
+        called["scopes"] = scopes
+        return ("adc-credentials", "some-project")
+
+    import google.auth
+
+    monkeypatch.setattr(google.auth, "default", fake_default)
+    assert gc.google_credentials() == "adc-credentials"
+    assert called["scopes"] == gc.SCOPES

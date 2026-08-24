@@ -109,8 +109,37 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
     return command
 
 
+# Each provider reads its worker size from a different environment variable, so
+# --worker-machine-type has to be routed to the right one. It previously set only
+# GCP_MACHINE_TYPE, which meant the flag was silently ignored for AWS and Azure -
+# their sizes came from hardcoded literals no operator could override.
+MACHINE_TYPE_ENV = {
+    "gcp": "GCP_MACHINE_TYPE",
+    "aws": "AWS_INSTANCE_TYPES",
+    "azure": "AZR_VM_SIZE",
+}
+
+
+def default_worker_machine_type(provider: str) -> str:
+    """The provider's own cheap default, so no GCP-shaped value leaks across."""
+    from providers import settings
+
+    if provider == "aws":
+        return ",".join(settings.AWS_INSTANCE_TYPES)
+    if provider == "azure":
+        return settings.AZR_VM_SIZE
+    return settings.GCP_MACHINE_TYPE
+
+
 def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
-    environment = [f"--setenv=GCP_MACHINE_TYPE={args.worker_machine_type}"]
+    provider = getattr(args, "provider", "gcp")
+    try:
+        machine_type_env = MACHINE_TYPE_ENV[provider]
+    except KeyError:  # pragma: no cover - driver_module() rejects these earlier
+        raise SystemExit(
+            f"no worker size environment variable is known for provider {provider!r}"
+        ) from None
+    environment = [f"--setenv={machine_type_env}={args.worker_machine_type}"]
     worker_image_project = getattr(args, "worker_image_project", None)
     worker_image_family = getattr(args, "worker_image_family", None)
     if worker_image_project:
@@ -149,7 +178,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--object-prefix")
     parser.add_argument("--regions", required=True)
-    parser.add_argument("--worker-machine-type", default="e2-micro")
+    parser.add_argument(
+        "--worker-machine-type",
+        help=(
+            "worker VM size. Routed to the selected provider's own variable "
+            "(see MACHINE_TYPE_ENV). Defaults to that provider's cheap default "
+            "from providers/settings.py rather than a GCP-shaped value."
+        ),
+    )
     parser.add_argument("--worker-image-project")
     parser.add_argument("--worker-image-family")
     parser.add_argument("--measurements", default="trace,rr")
@@ -178,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     origin = assert_controller_origin(args.allow_foreign_origin)
+    if args.worker_machine_type is None:
+        args.worker_machine_type = default_worker_machine_type(args.provider)
     job_dir = STATE_ROOT / "jobs" / args.run_id
     job_spec = job_dir / "job.json"
     if job_spec.exists() and not args.dry_run:

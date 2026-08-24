@@ -170,3 +170,147 @@ def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -
     monkeypatch.setattr(submit, "INSTALL_ROOT", install)
     monkeypatch.setattr(submit, "STATE_ROOT", state)
     assert submit.assert_controller_origin() == "controller"
+
+
+def test_worker_machine_type_reaches_every_provider() -> None:
+    """--worker-machine-type used to set GCP_MACHINE_TYPE only.
+
+    For AWS and Azure it was therefore silently ignored: their sizes came from
+    literals hardcoded in the drivers that no operator could override. That is
+    how a network-bound campaign ended up on Standard_D2s_v5.
+    """
+    from controller import submit
+
+    expected = {"gcp": "GCP_MACHINE_TYPE", "aws": "AWS_INSTANCE_TYPES", "azure": "AZR_VM_SIZE"}
+    for provider, variable in expected.items():
+        args = argparse.Namespace(
+            provider=provider, run_id="r", worker_machine_type="size-x",
+            worker_image_project=None, worker_image_family=None,
+        )
+        joined = " ".join(submit.systemd_command(args, ["cmd"]))
+        assert f"--setenv={variable}=size-x" in joined, (
+            f"{provider} must receive its size via {variable}: {joined}"
+        )
+    # Every launchable provider must have a route; none may be silently dropped.
+    from providers import DRIVER_MODULES
+
+    assert set(DRIVER_MODULES) <= set(submit.MACHINE_TYPE_ENV)
+
+
+def test_default_worker_size_is_the_providers_own_cheap_default() -> None:
+    """A GCP-shaped default must not leak into an AWS or Azure campaign."""
+    from controller import submit
+
+    assert submit.default_worker_machine_type("gcp").startswith("e2-")
+    assert submit.default_worker_machine_type("aws").startswith("t3.")
+    azure_default = submit.default_worker_machine_type("azure")
+    assert azure_default == "Standard_B2ts_v2"
+    assert "D2s_v5" not in azure_default
+
+
+def test_controller_installs_every_providers_sdk() -> None:
+    """The controller launches all providers, so it must be able to import them.
+
+    Requirements previously listed GCP libraries only, so an AWS or Azure
+    campaign would have failed at import on the controller - one of the reasons
+    those campaigns ran from unmanaged hosts instead.
+    """
+    requirements = (
+        Path(__file__).resolve().parents[2] / "controller/requirements.txt"
+    ).read_text(encoding="utf-8")
+    for package in ("boto3", "azure-identity", "azure-mgmt-compute", "azure-mgmt-network"):
+        assert package in requirements, f"controller cannot import {package}"
+
+
+def test_provider_credentials_are_not_generated_or_committed() -> None:
+    """Secrets stay in an operator-provisioned file, outside the release."""
+    root = Path(__file__).resolve().parents[2]
+    bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
+    runner = (root / "controller/run-campaign").read_text(encoding="utf-8")
+
+    # The runner loads them if present, so a campaign can authenticate...
+    assert "/etc/scamper-controller-secrets.env" in runner
+    # ...and bootstrap only ever leaves a commented template, locked down.
+    assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
+    for secret in ("AZURE_CLIENT_SECRET=", "AWS_SECRET_ACCESS_KEY="):
+        # Present only as a commented placeholder, never assigned a value.
+        for line in bootstrap.splitlines():
+            if secret in line:
+                assert line.strip().startswith("#"), f"secret assigned in bootstrap: {line}"
+
+
+def test_secrets_file_is_readable_by_the_controller_user() -> None:
+    """run-campaign executes as scamper-controller via systemd --uid.
+
+    A root-owned 0600 secrets file is unreadable to it, so every non-GCP campaign
+    fails with CredentialUnavailableError - which is exactly what happened on the
+    first attempt. Ownership must be set, not just the mode.
+    """
+    bootstrap = (
+        Path(__file__).resolve().parents[2] / "controller/bootstrap.sh"
+    ).read_text(encoding="utf-8")
+
+    chown_line = next(
+        (l for l in bootstrap.splitlines()
+         if "chown" in l and "secrets.env" in l), None
+    )
+    assert chown_line, "secrets file must be chown'd to the controller user"
+    assert "${controller_user}" in chown_line
+    assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
+
+
+def test_bootstrap_points_every_provider_at_the_controllers_own_key() -> None:
+    """Repo-local ./credentials/*.pem paths exist only in a developer checkout.
+
+    A controller-launched Azure campaign failed reading
+    credentials/azr-scamper-key-pair.pem.pub after already creating the NSG and
+    NIC. Using the key bootstrap generates on the host also avoids copying any
+    private key onto the controller.
+    """
+    bootstrap = (
+        Path(__file__).resolve().parents[2] / "controller/bootstrap.sh"
+    ).read_text(encoding="utf-8")
+
+    for variable in ("GCP_SCAMPER_SSH_KEY", "AWS_SCAMPER_SSH_KEY", "AZR_SCAMPER_SSH_KEY"):
+        line = next((l for l in bootstrap.splitlines() if l.startswith(f"{variable}=")), None)
+        assert line, f"{variable} must be written into the controller environment"
+        assert "${state_root}/ssh/id_ed25519" in line, line
+        assert "credentials/" not in line, f"{variable} must not use a repo-local path"
+
+
+def test_preflight_names_every_missing_worker_file(monkeypatch, tmp_path) -> None:
+    """A missing worker file used to become an infinite scp retry loop.
+
+    The drivers treat scp failure as transient, so a permanently absent local
+    file provisioned a VM and then retried forever, reporting nothing useful.
+    Three separate outages during controller bring-up had this shape.
+    """
+    import pytest
+
+    from providers import preflight, settings
+
+    real = tmp_path / "present.txt"
+    real.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(settings, "WARTS_STORAGE_CREDENTIALS", str(tmp_path / "gone.json"))
+    monkeypatch.setattr(settings, "AZR_SCAMPER_VM_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_SMOKE_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_UPLOAD_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_CAMPAIGN_RUNNER", str(real))
+    monkeypatch.setattr(settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "nokey"))
+
+    missing = dict(preflight.missing_worker_assets("azure"))
+    assert set(missing) == {"WARTS_STORAGE_CREDENTIALS", "AZR_SCAMPER_SSH_KEY"}
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight.assert_worker_assets("azure")
+    message = str(excinfo.value)
+    assert "Provisioning was not started" in message
+    assert "WARTS_STORAGE_CREDENTIALS" in message and "AZR_SCAMPER_SSH_KEY" in message
+
+
+def test_every_launchable_provider_has_a_preflight_list() -> None:
+    from providers import DRIVER_MODULES
+    from providers.preflight import WORKER_ASSETS
+
+    for provider in DRIVER_MODULES:
+        assert provider in WORKER_ASSETS, f"{provider} has no worker asset list"

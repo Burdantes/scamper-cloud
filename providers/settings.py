@@ -34,11 +34,51 @@ GCP_SCOPES = [
     "https://www.googleapis.com/auth/monitoring.write",
 ]
 
+# Instance sizing is env-configurable for every provider, not just GCP. The
+# defaults come from the client modules so a provider's cheap default is defined
+# once; hardcoding a size in a driver is what let a network-bound Azure campaign
+# run on Standard_D2s_v5 at roughly ten times the necessary rate.
+def _default(module: str, attribute: str, fallback: str) -> str:
+    try:
+        import importlib
+
+        return str(getattr(importlib.import_module(module), attribute))
+    except Exception:  # pragma: no cover - a missing optional SDK must not break settings
+        return fallback
+
+
+# AWS tries these in order; the first available in the zone wins.
+AWS_INSTANCE_TYPES = [
+    value.strip()
+    for value in os.environ.get(
+        "AWS_INSTANCE_TYPES",
+        f"{_default('providers.aws.client', 'DEFAULT_INSTANCE_TYPE', 't3.micro')},t2.micro",
+    ).split(",")
+    if value.strip()
+]
+AZR_VM_SIZE = os.environ.get(
+    "AZR_VM_SIZE",
+    _default("providers.azure.client", "DEFAULT_INSTANCE_TYPE", "Standard_B2ts_v2"),
+)
+AZR_OS_DISK_SKU = os.environ.get(
+    "AZR_OS_DISK_SKU",
+    _default("providers.azure.client", "DEFAULT_OS_DISK_SKU", "StandardSSD_LRS"),
+)
+
 AWS_SCAMPER_VM_SCRIPT = "./providers/aws/worker/run-scamper-aws.sh"
 AWS_SCAMPER_SSH_KEY = os.environ.get(
     "AWS_SCAMPER_SSH_KEY", "./credentials/aws-scamper-key-pair.pem"
 )
 AWS_SCAMPER_USER = os.environ.get("AWS_SCAMPER_USER", "ubuntu")
+# Ubuntu 22.04, not 20.04. The shared runner uses random.Random.randbytes,
+# added in Python 3.9, and Focal ships 3.8 - so an Azure worker on 20.04 passed
+# its smoke test and then died in shuffle_targets. AWS already used Jammy and GCP
+# Debian 11, leaving Azure the only provider that could not run the runner.
+AZR_IMAGE_PUBLISHER = os.environ.get("AZR_IMAGE_PUBLISHER", "canonical")
+AZR_IMAGE_OFFER = os.environ.get("AZR_IMAGE_OFFER", "0001-com-ubuntu-server-jammy")
+AZR_IMAGE_SKU = os.environ.get("AZR_IMAGE_SKU", "22_04-lts-gen2")
+AZR_IMAGE_VERSION = os.environ.get("AZR_IMAGE_VERSION", "latest")
+
 AZR_SCAMPER_VM_SCRIPT = "./providers/azure/worker/run-scamper-azr.sh"
 AZR_SCAMPER_SSH_KEY = os.environ.get(
     "AZR_SCAMPER_SSH_KEY", "./credentials/azr-scamper-key-pair.pem"

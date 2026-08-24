@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 from providers import settings
+from providers.preflight import assert_worker_assets
+from providers.gcs_credentials import (
+    google_credentials,
+    storage_client as gcs_storage_client,
+)
 import logging
 import subprocess
 import time
@@ -25,6 +30,10 @@ INIT_CMD = ["scp", "-i", settings.AZR_SCAMPER_SSH_KEY,
             settings.WARTS_STORAGE_CREDENTIALS,
             settings.AZR_SCAMPER_VM_SCRIPT,
             settings.SCAMPER_SMOKE_SCRIPT,
+            # The worker delegates to the shared runner, so it must be shipped.
+            # Omitting it left the VM failing on "chmod: cannot access
+            # ./run_campaign.py" after a successful smoke test.
+            settings.SCAMPER_CAMPAIGN_RUNNER,
             settings.SCAMPER_UPLOAD_SCRIPT]
 RESOURCE_GROUP_NAME = "azr-scamper"
 PRIVATE_IP = "10.0.0.4"
@@ -149,14 +158,8 @@ def get_resource_client():
 
 
 def get_gcp_credentials():
-    global gcp_credential
-    if gcp_credential is None:
-        from google.oauth2 import service_account
-
-        gcp_credential = service_account.Credentials.from_service_account_file(
-            settings.WARTS_STORAGE_CREDENTIALS
-        )
-    return gcp_credential
+    # Shared with every provider: explicit key if configured, else ADC.
+    return google_credentials()
 
 time_format = "%Y-%m-%d %H:%M:%S"
 formatter = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(message)s', datefmt=time_format)
@@ -197,7 +200,7 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
             attempt += 1
             from google.cloud import storage
 
-            storage_client = storage.Client.from_service_account_json(settings.WARTS_STORAGE_CREDENTIALS)
+            storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
             logging.info("Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob))
@@ -383,6 +386,23 @@ def create_bucket(name):
             return None
         raise
 
+def locations_from_env():
+    """Restrict the campaign to an explicit location list.
+
+    Without this the driver is all-location, so a canary cannot target a chosen
+    region - capping instances to 1 just takes whichever location sorts first.
+    Being able to name the region is what makes a single-region validation
+    possible, e.g. re-running a region that previously produced no topology.
+    """
+    raw = os.environ.get("SCAMPER_AZR_LOCATIONS", "").strip()
+    if not raw:
+        return None
+    requested = [value.strip() for value in raw.split(",") if value.strip()]
+    if not requested:
+        return None
+    return requested
+
+
 def get_locations():
     #Currently using the error msg's list of locations that support public IP creation
     # pip = set('westus,eastus,northeurope,westeurope,eastasia,southeastasia,northcentralus,southcentralus,centralus,eastus2,japaneast,japanwest,brazilsouth,australiaeast,australiasoutheast,centralindia,southindia,westindia,canadacentral,canadaeast,westcentralus,westus2,ukwest,uksouth,koreacentral,koreasouth,francecentral,australiacentral,southafricanorth,uaenorth,switzerlandnorth,germanywestcentral,norwayeast,westus3,jioindiawest,swedencentral,qatarcentral,polandcentral,italynorth,israelcentral,mexicocentral'.split(","))
@@ -406,6 +426,16 @@ def get_locations():
     fallback_locations = [
         location for location in available_locations if location not in preferred
     ]
+    requested = locations_from_env()
+    if requested is not None:
+        unknown = [name for name in requested if name not in available]
+        if unknown:
+            raise SystemExit(
+                f"SCAMPER_AZR_LOCATIONS names locations unavailable in this "
+                f"subscription: {unknown}"
+            )
+        logging.info("restricting to SCAMPER_AZR_LOCATIONS=%s", requested)
+        return requested
     return preferred_locations + fallback_locations
 
 def create_rg(rg_name):
@@ -580,13 +610,13 @@ def create_vm(rg_name,location,  vm_name, ni_id):
             properties=VirtualMachineProperties(
                 storage_profile=StorageProfile(
                     image_reference=ImageReference(
-                        publisher="canonical",
-                        offer="0001-com-ubuntu-server-focal",
-                        sku="20_04-lts-gen2",
-                        version="latest",
+                        publisher=settings.AZR_IMAGE_PUBLISHER,
+                        offer=settings.AZR_IMAGE_OFFER,
+                        sku=settings.AZR_IMAGE_SKU,
+                        version=settings.AZR_IMAGE_VERSION,
                     ),
                 ),
-                hardware_profile=HardwareProfile(vm_size="Standard_B1s"),
+                hardware_profile=HardwareProfile(vm_size=settings.AZR_VM_SIZE),
                 os_profile=OSProfile(
                     computer_name=vm_name,
                     admin_username=settings.AZR_SCAMPER_USER,
@@ -946,6 +976,9 @@ def main(argv=None):
     if not args.apply:
         print(json.dumps(plan, indent=2))
         return 0
+
+    # Fail before provisioning if a file the workers need is absent here.
+    assert_worker_assets("azr")
 
     run_azr_scamper(
         log_dir,
