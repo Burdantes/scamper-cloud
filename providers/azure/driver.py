@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 from providers import settings
+from providers.preflight import assert_worker_assets
 from providers.gcs_credentials import (
     google_credentials,
     storage_client as gcs_storage_client,
@@ -971,6 +972,9 @@ def main(argv=None):
     if not args.apply:
         print(json.dumps(plan, indent=2))
         return 0
+
+    # Fail before provisioning if a file the workers need is absent here.
+    assert_worker_assets("azr")
 
     run_azr_scamper(
         log_dir,

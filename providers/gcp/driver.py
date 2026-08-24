@@ -13,6 +13,7 @@ import os
 import time
 import logging
 from providers import settings
+from providers.preflight import assert_worker_assets
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1573,6 +1574,9 @@ def main(argv=None):
     if not args.apply:
         print(json.dumps(plan, indent=2))
         return 0
+
+    # Fail before provisioning if a file the workers need is absent here.
+    assert_worker_assets("gcp")
 
     run_gcp_scamper(
         log_dir,

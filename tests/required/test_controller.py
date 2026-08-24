@@ -276,3 +276,41 @@ def test_bootstrap_points_every_provider_at_the_controllers_own_key() -> None:
         assert line, f"{variable} must be written into the controller environment"
         assert "${state_root}/ssh/id_ed25519" in line, line
         assert "credentials/" not in line, f"{variable} must not use a repo-local path"
+
+
+def test_preflight_names_every_missing_worker_file(monkeypatch, tmp_path) -> None:
+    """A missing worker file used to become an infinite scp retry loop.
+
+    The drivers treat scp failure as transient, so a permanently absent local
+    file provisioned a VM and then retried forever, reporting nothing useful.
+    Three separate outages during controller bring-up had this shape.
+    """
+    import pytest
+
+    from providers import preflight, settings
+
+    real = tmp_path / "present.txt"
+    real.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(settings, "WARTS_STORAGE_CREDENTIALS", str(tmp_path / "gone.json"))
+    monkeypatch.setattr(settings, "AZR_SCAMPER_VM_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_SMOKE_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_UPLOAD_SCRIPT", str(real))
+    monkeypatch.setattr(settings, "SCAMPER_CAMPAIGN_RUNNER", str(real))
+    monkeypatch.setattr(settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "nokey"))
+
+    missing = dict(preflight.missing_worker_assets("azure"))
+    assert set(missing) == {"WARTS_STORAGE_CREDENTIALS", "AZR_SCAMPER_SSH_KEY"}
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight.assert_worker_assets("azure")
+    message = str(excinfo.value)
+    assert "Provisioning was not started" in message
+    assert "WARTS_STORAGE_CREDENTIALS" in message and "AZR_SCAMPER_SSH_KEY" in message
+
+
+def test_every_launchable_provider_has_a_preflight_list() -> None:
+    from providers import DRIVER_MODULES
+    from providers.preflight import WORKER_ASSETS
+
+    for provider in DRIVER_MODULES:
+        assert provider in WORKER_ASSETS, f"{provider} has no worker asset list"
