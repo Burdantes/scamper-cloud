@@ -67,6 +67,10 @@ if [[ ! -f /etc/scamper-controller-secrets.env ]]; then
 #   AWS_DEFAULT_REGION=
 SECRETS
 fi
+# Readable by the controller user, because run-campaign executes as that user
+# via systemd --uid=scamper-controller. Root-owned 0600 would be unreadable to it
+# and every non-GCP campaign would fail with CredentialUnavailableError.
+chown "${controller_user}:${controller_user}" /etc/scamper-controller-secrets.env
 chmod 0600 /etc/scamper-controller-secrets.env
 
 install -m 0755 "${release_dir}/controller/controller-status" /usr/local/bin/scamper-controller-status

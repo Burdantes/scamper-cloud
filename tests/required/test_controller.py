@@ -237,3 +237,23 @@ def test_provider_credentials_are_not_generated_or_committed() -> None:
         for line in bootstrap.splitlines():
             if secret in line:
                 assert line.strip().startswith("#"), f"secret assigned in bootstrap: {line}"
+
+
+def test_secrets_file_is_readable_by_the_controller_user() -> None:
+    """run-campaign executes as scamper-controller via systemd --uid.
+
+    A root-owned 0600 secrets file is unreadable to it, so every non-GCP campaign
+    fails with CredentialUnavailableError - which is exactly what happened on the
+    first attempt. Ownership must be set, not just the mode.
+    """
+    bootstrap = (
+        Path(__file__).resolve().parents[2] / "controller/bootstrap.sh"
+    ).read_text(encoding="utf-8")
+
+    chown_line = next(
+        (l for l in bootstrap.splitlines()
+         if "chown" in l and "secrets.env" in l), None
+    )
+    assert chown_line, "secrets file must be chown'd to the controller user"
+    assert "${controller_user}" in chown_line
+    assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
