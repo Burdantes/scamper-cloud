@@ -8,7 +8,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from providers import driver_module
+from providers import DRIVER_MODULES, driver_module
 
 STATE_ROOT = Path("/var/lib/scamper-controller")
 INSTALL_ROOT = Path("/opt/scamper-cloud/current")
@@ -66,8 +66,9 @@ def positive_int(value: str) -> int:
 
 
 def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
+    release_root = INSTALL_ROOT.resolve()
     command = [
-        str(INSTALL_ROOT / ".venv/bin/python"),
+        str(release_root / ".venv/bin/python"),
         "-m",
         driver_module(args.provider),
         "--apply",
@@ -83,8 +84,6 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         args.bucket,
         "--object-prefix",
         args.object_prefix or f"runs/{args.run_id}",
-        "--regions",
-        args.regions,
         "--measurements",
         args.measurements,
         "--trace-rate",
@@ -100,6 +99,8 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         "--do-not-probe-file",
         str(args.do_not_probe_file),
     ]
+    if args.regions:
+        command.extend(["--regions", args.regions])
     if args.max_instances is not None:
         command.extend(["--max-instances", str(args.max_instances)])
     if args.max_targets is not None:
@@ -154,7 +155,7 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
         *environment,
         "--uid=scamper-controller",
         "--gid=scamper-controller",
-        f"--working-directory={INSTALL_ROOT}",
+        f"--working-directory={INSTALL_ROOT.resolve()}",
         "/usr/local/bin/scamper-controller-run",
         *command,
     ]
@@ -167,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default="gcp",
+        choices=sorted(DRIVER_MODULES),
         help=(
             "cloud provider to launch on. Must have a supported campaign driver; "
             "see providers.DRIVER_MODULES."
@@ -177,7 +179,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rr-targets", required=True, type=existing_file)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--object-prefix")
-    parser.add_argument("--regions", required=True)
+    parser.add_argument(
+        "--regions",
+        help="comma-separated provider regions; omit to use every available region",
+    )
     parser.add_argument(
         "--worker-machine-type",
         help=(
@@ -228,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         "provider": args.provider,
         "origin": origin,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "release_root": str(INSTALL_ROOT.resolve()),
         "campaign_command": command,
         "systemd_command": service_command,
     }

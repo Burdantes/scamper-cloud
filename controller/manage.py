@@ -10,11 +10,13 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from providers import DRIVER_MODULES
 from controller.target_registry import (
     RegisteredTarget,
     register_local_target,
     remote_target_dir,
     remote_target_path,
+    sha256_file,
     target_id,
 )
 
@@ -30,6 +32,7 @@ DEFAULT_NAME = "scamper-controller-uscentral1"
 DEFAULT_ZONE = "us-central1-c"
 DEFAULT_WORKER_IMAGE_PROJECT = os.environ.get("GCP_WORKER_IMAGE_PROJECT")
 DEFAULT_WORKER_IMAGE_FAMILY = os.environ.get("GCP_WORKER_IMAGE_FAMILY")
+ACTIVE_RELEASE_ROOT = Path("/opt/scamper-cloud/current")
 
 
 def run(command: list[str], apply: bool) -> None:
@@ -88,6 +91,7 @@ def bundle_repository(destination: Path) -> None:
         "datasets",
         "logs",
         "outputs",
+        "skill-observations",
         "warts",
     }
     with tarfile.open(destination, "w:gz") as archive:
@@ -98,6 +102,29 @@ def bundle_repository(destination: Path) -> None:
             if "__pycache__" in relative.parts or path.suffix == ".pyc":
                 continue
             archive.add(path, arcname=relative, recursive=False)
+
+
+def source_revision() -> str:
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return f"{revision}-dirty" if dirty else revision
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def ssh_command(args: argparse.Namespace, remote_command: str) -> list[str]:
@@ -222,14 +249,71 @@ def deploy(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="scamper-controller-") as temp_dir:
         bundle = Path(temp_dir) / f"scamper-cloud-{release}.tar.gz"
         bundle_repository(bundle)
+        bundle_sha256 = sha256_file(bundle)
+        revision = source_revision()
         bootstrap = REPO_ROOT / "controller/bootstrap.sh"
         run(scp_command(args, [bundle, bootstrap], "/tmp/"), args.apply)
         remote = (
             "sudo bash /tmp/bootstrap.sh "
             f"/tmp/{bundle.name} {args.project} {args.service_account} "
-            f"{args.bucket} {release}"
+            f"{args.bucket} {release} {revision} {bundle_sha256}"
         )
         run(ssh_command(args, remote), args.apply)
+
+
+def controller_submission_command(
+    args: argparse.Namespace,
+    trace_target: Path,
+    rr_target: Path,
+    remote_dir: str,
+) -> str:
+    command = [
+        "sudo",
+        str(ACTIVE_RELEASE_ROOT / ".venv/bin/python"),
+        "-m",
+        "controller.submit",
+        "--provider",
+        args.provider,
+        "--run-id",
+        args.run_id,
+        "--trace-targets",
+        str(trace_target),
+        "--rr-targets",
+        str(rr_target),
+        "--do-not-probe-file",
+        f"{remote_dir}/{args.do_not_probe_file.name}",
+        "--bucket",
+        args.bucket,
+        "--measurements",
+        args.measurements,
+        "--max-instances",
+        str(args.max_instances),
+        "--trace-rate",
+        str(args.trace_rate),
+        "--rr-rate",
+        str(args.rr_rate),
+        "--rr-timeout",
+        str(args.rr_timeout),
+        "--probe-payload",
+        args.probe_payload,
+        "--measurement-contact",
+        args.measurement_contact,
+    ]
+    if args.regions:
+        command.extend(["--regions", args.regions])
+    if args.worker_machine_type:
+        command.extend(["--worker-machine-type", args.worker_machine_type])
+    if args.worker_image_project:
+        command.extend(["--worker-image-project", args.worker_image_project])
+    if args.worker_image_family:
+        command.extend(["--worker-image-family", args.worker_image_family])
+    if args.max_targets is not None:
+        command.extend(["--max-targets", str(args.max_targets)])
+    if args.skip_smoke:
+        command.append("--skip-smoke")
+    if not args.apply:
+        command.append("--dry-run")
+    return f"cd {shlex.quote(str(ACTIVE_RELEASE_ROOT))} && {shlex.join(command)}"
 
 
 def submit(args: argparse.Namespace) -> None:
@@ -259,51 +343,10 @@ def submit(args: argparse.Namespace) -> None:
         for name in names
     ]
     run(ssh_command(args, " && ".join(install_parts)), args.apply)
-
-    command = [
-        "sudo",
-        "/opt/scamper-cloud/current/.venv/bin/python",
-        "/opt/scamper-cloud/current/controller/submit.py",
-        "--run-id",
-        args.run_id,
-        "--trace-targets",
-        str(trace_target),
-        "--rr-targets",
-        str(rr_target),
-        "--do-not-probe-file",
-        f"{remote_dir}/{args.do_not_probe_file.name}",
-        "--bucket",
-        args.bucket,
-        "--regions",
-        args.regions,
-        "--worker-machine-type",
-        args.worker_machine_type,
-        "--measurements",
-        args.measurements,
-        "--max-instances",
-        str(args.max_instances),
-        "--trace-rate",
-        str(args.trace_rate),
-        "--rr-rate",
-        str(args.rr_rate),
-        "--rr-timeout",
-        str(args.rr_timeout),
-        "--probe-payload",
-        args.probe_payload,
-        "--measurement-contact",
-        args.measurement_contact,
-    ]
-    if args.worker_image_project:
-        command.extend(["--worker-image-project", args.worker_image_project])
-    if args.worker_image_family:
-        command.extend(["--worker-image-family", args.worker_image_family])
-    if args.max_targets is not None:
-        command.extend(["--max-targets", str(args.max_targets)])
-    if args.skip_smoke:
-        command.append("--skip-smoke")
-    if not args.apply:
-        command.append("--dry-run")
-    run(ssh_command(args, shlex.join(command)), args.apply)
+    remote_command = controller_submission_command(
+        args, trace_target, rr_target, remote_dir
+    )
+    run(ssh_command(args, remote_command), args.apply)
 
 
 def register_targets(args: argparse.Namespace) -> None:
@@ -335,7 +378,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage the persistent GCP controller VM."
+        description="Manage the persistent multi-cloud campaign controller VM."
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
@@ -354,6 +397,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit_parser = subparsers.add_parser("submit")
     add_common(submit_parser)
+    submit_parser.add_argument(
+        "--provider", choices=sorted(DRIVER_MODULES), default="gcp"
+    )
     submit_parser.add_argument("--run-id", required=True)
     trace_targets = submit_parser.add_mutually_exclusive_group(required=True)
     trace_targets.add_argument("--trace-targets", type=Path)
@@ -364,8 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument(
         "--do-not-probe-file", type=Path, default=REPO_ROOT / "config/do-not-probe.txt"
     )
-    submit_parser.add_argument("--regions", required=True)
-    submit_parser.add_argument("--worker-machine-type", default="e2-micro")
+    submit_parser.add_argument(
+        "--regions",
+        help="comma-separated provider regions; omit to use every available region",
+    )
+    submit_parser.add_argument("--worker-machine-type")
     submit_parser.add_argument(
         "--worker-image-project", default=DEFAULT_WORKER_IMAGE_PROJECT
     )
@@ -388,6 +437,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status")
     add_common(status_parser)
     status_parser.add_argument("--run-id")
+
+    for action in ("schedule-status", "schedule-enable", "schedule-disable"):
+        schedule_parser = subparsers.add_parser(action)
+        add_common(schedule_parser)
     return parser
 
 
@@ -401,6 +454,23 @@ def main(argv: list[str] | None = None) -> int:
         register_targets(args)
     elif args.action == "submit":
         submit(args)
+    elif args.action == "schedule-status":
+        remote = (
+            "sudo /usr/local/bin/scamper-controller-monthly check && "
+            "sudo systemctl status scamper-monthly.timer --no-pager"
+        )
+        run(ssh_command(args, remote), args.apply)
+    elif args.action == "schedule-enable":
+        remote = (
+            "sudo /usr/local/bin/scamper-controller-monthly check && "
+            "sudo systemctl enable --now scamper-monthly.timer"
+        )
+        run(ssh_command(args, remote), args.apply)
+    elif args.action == "schedule-disable":
+        run(
+            ssh_command(args, "sudo systemctl disable --now scamper-monthly.timer"),
+            args.apply,
+        )
     else:
         suffix = f" {args.run_id}" if args.run_id else ""
         run(ssh_command(args, f"sudo scamper-controller-status{suffix}"), args.apply)

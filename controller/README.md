@@ -1,10 +1,10 @@
-# Persistent GCP campaign controller
+# Persistent multi-cloud campaign controller
 
 The controller is a small, long-lived GCP VM in `us-central1-c`. It provisions
-short-lived measurement workers, sends each worker its distinct traceroute and
-RR inputs, waits for uploaded artifacts, verifies completion, and deletes the
-workers. Campaigns run as named `systemd` services, so closing the laptop or
-losing the local network does not stop them.
+short-lived GCP, AWS, and Azure measurement workers, sends each worker its
+distinct traceroute and RR inputs, waits for uploaded artifacts, verifies
+completion, and deletes the workers. Campaigns run as named `systemd` services,
+so closing the laptop or losing the local network does not stop them.
 
 Commands are dry runs unless `--apply` is supplied.
 
@@ -13,6 +13,9 @@ python -m controller.manage provision
 python -m controller.manage provision --apply
 python -m controller.manage deploy --apply
 ```
+
+Deployment tests the staged release on the controller before activation. A
+failed test keeps the previous `/opt/scamper-cloud/current` release in place.
 
 Register each complete target population once from the laptop. Registration
 normalizes the first TSV column to canonical IPv4, rejects duplicates, records
@@ -30,6 +33,7 @@ both measurements without uploading or re-normalizing either population:
 
 ```bash
 python -m controller.manage submit --apply \
+  --provider gcp \
   --run-id gcp-uscentral1-20260801a \
   --regions us-central1 \
   --max-instances 1 \
@@ -84,3 +88,85 @@ The registry lives under
 `/var/lib/scamper-controller/target-registry/sha256/<source-sha256>/`. Deploying
 new controller code does not replace that state. Do not delete it until no
 future run needs the corresponding IDs.
+
+## Monthly multi-cloud schedule
+
+The installed `scamper-monthly.timer` fires on the first day of each month at
+06:00 UTC, with a bounded randomized delay and `Persistent=true` so a missed
+boot-time event runs after recovery. It remains disabled until the configuration
+passes all readiness checks.
+
+The operator-owned `/etc/scamper-controller-monthly.json` must contain:
+
+- registered, immutable traceroute and RR target IDs;
+- the stable result bucket and measurement/contact policy;
+- entries for exactly GCP, AWS, and Azure;
+- provider-native regions and worker sizes; and
+- a positive `max_instances` safety cap for every provider.
+
+Validate and enable it from a workstation:
+
+```bash
+python -m controller.manage schedule-status --apply
+python -m controller.manage schedule-enable --apply
+```
+
+The dispatcher validates every provider before submitting any job. It refuses
+to run with missing targets, worker assets, AWS/Azure credentials, exclusions,
+or an incomplete provider set. Run IDs use `monthly-PROVIDER-YYYYMM`; existing
+job records are skipped, and a controller lock prevents overlapping dispatches.
+
+### AWS controller identity and regional preparation
+
+AWS uses no access key on the controller. The AWS SDK invokes
+`/usr/local/bin/scamper-controller-aws-credentials`, which requests a fresh
+Google identity token from the VM metadata service and exchanges it for a
+one-hour AWS role session. Configure these values in
+`/etc/scamper-controller-secrets.env`:
+
+```bash
+AWS_ROLE_ARN=arn:aws:iam::ACCOUNT_ID:role/ScamperCloudController
+AWS_EXPECTED_ACCOUNT_ID=ACCOUNT_ID
+AWS_GCP_AUDIENCE=scamper-controller-aws
+SCAMPER_AWS_SSH_CIDR=CONTROLLER_STATIC_IPV4/32
+```
+
+An AWS administrator creates the role from
+`controller/aws-role-trust.example.json`. The checked-in `aud` and `sub` are
+the controller service account's non-secret Google claims; regenerate them if
+the controller identity changes by running:
+
+```bash
+sudo -u scamper-controller /usr/local/bin/scamper-controller-aws-credentials claims
+```
+
+Create `ScamperCloudController`, attach
+`controller/aws-controller-policy.json` as an inline policy, and adjust the
+`aws:RequestedRegion` list if the schedule uses more than `us-east-1`. The trust
+relationship must retain all three `accounts.google.com` conditions; omitting
+one lets a different Google workload or audience assume the role.
+
+After the role exists, prepare each explicitly configured region and verify the
+same checks the monthly timer uses:
+
+```bash
+sudo -u scamper-controller /usr/local/bin/scamper-controller-aws \
+  prepare --regions us-east-1
+sudo /usr/local/bin/scamper-controller-monthly check
+```
+
+Preparation imports only the controller public key, reconciles TCP/22 ingress
+to the controller's exact `/32`, and refuses to create a default VPC. Readiness
+also verifies the expected AWS account and assumed role, matching key
+fingerprint, public default subnets, supported AMI and worker type, and available
+zones. Keep the timer disabled until a one-instance, capped-target AWS canary
+uploads a complete manifest and the worker has been terminated.
+
+To register target files already present on the controller, run as root on that
+VM:
+
+```bash
+/usr/local/bin/scamper-controller-monthly register-targets \
+  --trace-targets /path/to/trace-targets.txt \
+  --rr-targets /path/to/rr-targets.tsv
+```

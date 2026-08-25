@@ -106,9 +106,11 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     ssh_commands = [args for args in popen_args if args and args[0] == "ssh"]
     assert len(scp_commands) == 3
     assert len(ssh_commands) == 3
-    assert all("azr-test-targets-5.txt" in " ".join(args) for args in scp_commands)
-    assert all("azr-test-targets-5.txt" in " ".join(args) for args in ssh_commands)
-    assert all(".trace.warts" in " ".join(args) for args in ssh_commands)
+    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in scp_commands)
+    assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in scp_commands)
+    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in ssh_commands)
+    assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in ssh_commands)
+    assert all("SCAMPER_MEASUREMENTS=trace,rr" in " ".join(args) for args in ssh_commands)
     assert all("runs/azr-test/nodes/" in " ".join(args) for args in ssh_commands)
     assert all("region-3" not in " ".join(args) for args in [*scp_commands, *ssh_commands])
 
@@ -157,7 +159,7 @@ def test_build_plan_uses_stable_bucket_and_per_run_prefix() -> None:
 
     assert plan["bucket"] == azr.settings.SCAMPER_RESULTS_BUCKET
     assert plan["object_prefix"] == "runs/azr-test"
-    assert plan["output_name"] == "PREFIX-LOCATION-IP.trace.warts"
+    assert plan["measurements"] == ["trace", "rr"]
 
 
 def test_build_plan_normalizes_custom_object_prefix() -> None:
@@ -180,8 +182,16 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
         prefix="azr-test",
         bucket_name="results",
         object_prefix="runs/azr-test",
-        target_file=str(target_file),
+        target_sets={"trace": {"target_count": 1}, "rr": {"target_count": 1}},
         locations=("eastus",),
+        measurements=("trace", "rr"),
+        trace_rate=100,
+        rr_rate=10,
+        rr_timeout=2.0,
+        probe_payload="notice",
+        measurement_contact="research@example.edu",
+        do_not_probe_file=None,
+        do_not_probe_version=None,
         nodes=[{"node": "azr-eastus", "complete": False}],
         started_at="2026-07-31T00:00:00+00:00",
         complete=False,

@@ -100,6 +100,7 @@ def patch_common_aws_flow(
         return FakeProcess(0)
 
     monkeypatch.setattr(aws, "create_default_security_group", create_default_security_group)
+    monkeypatch.setattr(aws, "ensure_key_pair", lambda _region: "key-123")
     monkeypatch.setattr(aws, "create_instance", create_instance)
     monkeypatch.setattr(aws.subprocess, "Popen", popen)
 
@@ -252,6 +253,7 @@ def test_run_aws_scamper_stops_after_max_instances(
         return FakeInstance(name, terminated)
 
     monkeypatch.setattr(aws, "create_default_security_group", create_default_security_group)
+    monkeypatch.setattr(aws, "ensure_key_pair", lambda _region: "key-123")
     monkeypatch.setattr(aws, "create_instance", create_instance)
     monkeypatch.setattr(aws.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(0))
 
@@ -292,8 +294,10 @@ def test_run_aws_scamper_caps_targets_and_cleans_up(
     ssh_commands = [args for args in popen_args if args and args[0] == "ssh"]
     assert len(scp_commands) == 1
     assert len(ssh_commands) == 1
-    assert "aws-test-targets-5.txt" in " ".join(scp_commands[0])
-    assert "aws-test-targets-5.txt" in " ".join(ssh_commands[0])
+    assert "aws-test-trace-targets-5.txt" in " ".join(scp_commands[0])
+    assert "aws-test-rr-targets-5.txt" in " ".join(scp_commands[0])
+    assert "aws-test-trace-targets-5.txt" in " ".join(ssh_commands[0])
+    assert "aws-test-rr-targets-5.txt" in " ".join(ssh_commands[0])
     assert str(target_file) not in scp_commands[0]
 
 
@@ -388,14 +392,16 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
         prefix="aws-test",
         bucket_name="results",
         object_prefix="runs/aws-test",
-        target_source="source.tsv",
-        target_version="source.tsv@sha256:abc",
-        normalized_target_file=str(target_file),
+        target_sets={"trace": {"target_count": 1}, "rr": {"target_count": 1}},
         regions=("us-east-1",),
         measurements=("trace", "rr"),
         trace_rate=100,
         rr_rate=10,
         rr_timeout=2.0,
+        probe_payload="notice",
+        measurement_contact="research@example.edu",
+        do_not_probe_file=None,
+        do_not_probe_version=None,
         nodes=[{"node": "node-a", "complete": False}],
         started_at="2026-07-31T00:00:00+00:00",
         complete=False,
@@ -417,6 +423,23 @@ def test_driver_takes_its_instance_types_from_settings_not_a_literal() -> None:
     assert "instance_types = ['t3.micro','t2.micro']" not in text
     # The describe filter must follow the configured list, not a second literal.
     assert '"Values":["t2.micro","t3.micro"]' not in text
+    assert "describe_instance_types(InstanceTypes=list(instance_types))" in text
+
+
+def test_aws_controller_uses_isolated_key_and_security_group_names() -> None:
+    assert aws.KEY_NAME == "scamper-controller-ed25519"
+    assert aws.security_group_name("us-east-1") == "scamper-controller-ssh-us-east-1"
+    assert aws.KEY_NAME != "aws-scamper-key-pair"
+    assert aws.security_group_name("us-east-1") != "us-east-1-scamper"
+
+
+def test_imported_ed25519_fingerprint_matches_the_aws_api_contract() -> None:
+    # AWS returns padded Base64 for imported Ed25519 keys, unlike ssh-keygen's
+    # display form, which prepends ``SHA256:`` and removes the padding.
+    assert (
+        aws.ssh_public_key_fingerprint("ssh-ed25519 AQID controller")
+        == "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc+4E="
+    )
 
 
 def test_all_providers_resolve_google_credentials_the_same_way() -> None:

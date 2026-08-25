@@ -14,6 +14,7 @@ from providers.gcs_credentials import (
     google_credentials,
     storage_client as gcs_storage_client,
 )
+from providers.common.targets import PreparedTargets, prepare_target_sets
 import logging
 import subprocess
 import time
@@ -90,6 +91,32 @@ def positive_int(value):
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than 0")
     return parsed
+
+
+def positive_float(value):
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than 0")
+    return parsed
+
+
+def csv_values(value):
+    parsed = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not parsed:
+        raise argparse.ArgumentTypeError("value must contain at least one item")
+    return parsed
+
+
+def probe_payload_text(value):
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise argparse.ArgumentTypeError("probe payload must contain ASCII text") from error
+    if not encoded:
+        raise argparse.ArgumentTypeError("probe payload must not be empty")
+    if len(encoded) > 128:
+        raise argparse.ArgumentTypeError("probe payload must be at most 128 bytes")
+    return value
 
 
 def normalized_object_prefix(value):
@@ -198,8 +225,6 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
     while not success and attempt < max_attempts:
         try:
             attempt += 1
-            from google.cloud import storage
-
             storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
@@ -273,8 +298,16 @@ def write_run_manifest(
     prefix,
     bucket_name,
     object_prefix,
-    target_file,
+    target_sets,
     locations,
+    measurements,
+    trace_rate,
+    rr_rate,
+    rr_timeout,
+    probe_payload,
+    measurement_contact,
+    do_not_probe_file,
+    do_not_probe_version,
     nodes,
     started_at,
     complete,
@@ -293,17 +326,19 @@ def write_run_manifest(
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "complete": complete,
         "failure": failure,
-        "target_source": settings.SCAMPER_IP_DST,
-        "target_file": target_file,
-        "target_sha256": sha256_file(target_file) if target_file else None,
-        "target_count": target_count(target_file) if target_file else 0,
+        "target_sets": target_sets,
+        "do_not_probe_file": do_not_probe_file,
+        "do_not_probe_version": do_not_probe_version,
         "locations": list(locations),
-        "measurements": ["trace"],
+        "measurements": list(measurements),
+        "trace_rate_pps": trace_rate,
+        "rr_rate_pps": rr_rate,
+        "rr_timeout_seconds": rr_timeout,
+        "probe_payload": probe_payload,
+        "measurement_contact": measurement_contact,
         "commands": {
-            "trace": (
-                "scamper -c 'trace -P UDP-Paris -f 6 -g 10 -q 1' "
-                "-p 10000 -f TARGETS -o OUTPUT.trace.warts -O warts"
-            )
+            "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
+            "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
         },
         "nodes": nodes,
         "failed_nodes": [node["node"] for node in nodes if not node["complete"]],
@@ -312,26 +347,90 @@ def write_run_manifest(
     return str(manifest_path)
 
 
-def init_cmd(target_file):
+def init_cmd(target_files):
+    if isinstance(target_files, (str, Path)):
+        target_files = [str(target_files)]
     return [
         *INIT_CMD[:5],
-        target_file,
+        *target_files,
         *INIT_CMD[5:],
     ]
 
 
-def remote_scamper_command(target_file, warts_name, bucket_name, object_name):
+def expected_campaign_artifacts(object_prefix, output_prefix, measurements):
+    artifacts = [f"{object_prefix}/{output_prefix}.status.json"]
+    for measurement in measurements:
+        artifacts.extend(
+            [
+                f"{object_prefix}/{output_prefix}.{measurement}.warts",
+                f"{object_prefix}/{output_prefix}.{measurement}.metadata.json",
+                f"{object_prefix}/{output_prefix}.{measurement}.targets.txt",
+            ]
+        )
+    return artifacts
+
+
+def remote_scamper_command(
+    trace_target_file,
+    rr_target_file,
+    output_prefix,
+    bucket_name,
+    object_prefix,
+    *,
+    location,
+    node,
+    targets: PreparedTargets,
+    trace_rate,
+    rr_rate,
+    rr_timeout,
+    measurements,
+    probe_payload=None,
+    measurement_contact=None,
+    skip_smoke=False,
+):
     script = Path(settings.AZR_SCAMPER_VM_SCRIPT).name
+    environment = {
+        "SCAMPER_PROVIDER": "azure",
+        "SCAMPER_REGION": location,
+        "SCAMPER_NODE": node,
+        "SCAMPER_TRACE_TARGET_SOURCE": targets.trace.source,
+        "SCAMPER_TRACE_TARGET_VERSION": targets.trace.version,
+        "SCAMPER_TRACE_TARGET_COUNT": str(targets.trace.target_count),
+        "SCAMPER_TRACE_TARGET_SHA256": targets.trace.normalized_sha256,
+        "SCAMPER_RR_TARGET_SOURCE": targets.rr.source,
+        "SCAMPER_RR_TARGET_VERSION": targets.rr.version,
+        "SCAMPER_RR_TARGET_COUNT": str(targets.rr.target_count),
+        "SCAMPER_RR_TARGET_SHA256": targets.rr.normalized_sha256,
+        "SCAMPER_TRACE_RATE_PPS": str(trace_rate),
+        "SCAMPER_RR_RATE_PPS": str(rr_rate),
+        "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
+        "SCAMPER_MEASUREMENTS": ",".join(measurements),
+    }
+    if probe_payload:
+        environment["SCAMPER_PROBE_PAYLOAD_TEXT"] = probe_payload
+    if measurement_contact:
+        environment["SCAMPER_MEASUREMENT_CONTACT"] = measurement_contact
+    if targets.do_not_probe_version:
+        environment["SCAMPER_DO_NOT_PROBE_VERSION"] = targets.do_not_probe_version
+    if skip_smoke:
+        environment["SCAMPER_SKIP_SMOKE"] = "1"
+    assignments = " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in environment.items()
+    )
     arguments = " ".join(
         shlex.quote(value)
         for value in (
-            Path(target_file).name,
-            warts_name,
+            Path(trace_target_file).name,
+            Path(rr_target_file).name,
+            output_prefix,
             bucket_name,
-            object_name,
+            object_prefix,
         )
     )
-    return f"chmod +x {shlex.quote(script)}; sudo ./{shlex.quote(script)} {arguments}"
+    return (
+        f"chmod +x {shlex.quote(script)}; {assignments} "
+        f"sudo -E ./{shlex.quote(script)} {arguments}"
+    )
 
 
 def close_instance_logs(logs):
@@ -662,7 +761,7 @@ def launch_location(run_info):
         ip_result = create_ip(rg_name,location, ip_name)
         logging.info("Created %s", ip_name)
 
-        vnet_result = create_vnet(rg_name,location, vnet_name)
+        create_vnet(rg_name,location, vnet_name)
         logging.info("Created %s", vnet_name)
 
         subnet_result = create_subnet(rg_name,vnet_name, subnet_name)
@@ -674,7 +773,7 @@ def launch_location(run_info):
         ni_result = create_network_interface(rg_name,location, ni_name, subnet_result.id, ip_result.id, nsg_result.id)
         logging.info("Created %s", ni_name)
 
-        vm_result = create_vm(rg_name,location,vm_name,ni_result.id)
+        create_vm(rg_name,location,vm_name,ni_result.id)
         logging.info("Created %s", vm_name)
     except Exception:
         logging.exception("Fail to launch in %s", location)
@@ -719,8 +818,20 @@ def run_azr_scamper(
     max_instances=None,
     max_targets=None,
     *,
+    target_source=None,
+    trace_target_source=None,
+    rr_target_source=None,
     bucket_name=None,
     object_prefix=None,
+    regions=None,
+    trace_rate=100,
+    rr_rate=10,
+    rr_timeout=2.0,
+    measurements=("trace", "rr"),
+    probe_payload=None,
+    measurement_contact=None,
+    do_not_probe_file=None,
+    skip_smoke=False,
 ):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
@@ -734,7 +845,7 @@ def run_azr_scamper(
     campaign_started_at = datetime.now(timezone.utc).isoformat()
     campaign_complete = False
     campaign_failure = None
-    target_file = None
+    targets = None
     locations = []
     manifest_nodes = []
     logs = {}
@@ -750,13 +861,29 @@ def run_azr_scamper(
         if max_targets is not None:
             logging.info("Limiting Azure run to at most %d targets", max_targets)
 
-        target_file = build_target_file(log_dir, prefix, max_targets=max_targets)
+        target_source = target_source or settings.SCAMPER_IP_DST
+        targets = prepare_target_sets(
+            log_dir=log_dir,
+            prefix=prefix,
+            fallback_source=target_source,
+            trace_target_source=trace_target_source,
+            rr_target_source=rr_target_source,
+            max_targets=max_targets,
+            do_not_probe_file=do_not_probe_file,
+        )
+        target_files = [targets.trace.normalized_file, targets.rr.normalized_file]
         create_bucket(bucket_name)
         upload_logs = True
+        if targets.do_not_probe_file:
+            send_to_cloud_storage(
+                targets.do_not_probe_file,
+                bucket_name,
+                f"{object_prefix}/do-not-probe.txt",
+            )
         create_rg(prefix)
         resource_group_created = True
 
-        locations = get_locations()
+        locations = list(regions) if regions else get_locations()
         ips = launch_locations(prefix, locations, max_instances=max_instances)
         logging.info("Created following instances:%s", ips)
         record_expense_instances(len(ips))
@@ -766,15 +893,19 @@ def run_azr_scamper(
 
         for location, ip in ips:
             node = f"azr-{location}"
-            output_name = f"{prefix}-{location}-{ip}.trace.warts"
+            output_prefix = f"{prefix}-{location}-{ip}"
             node_object_prefix = f"{object_prefix}/nodes/{location}/{node}"
+            expected_objects = expected_campaign_artifacts(
+                node_object_prefix, output_prefix, measurements
+            )
             manifest_nodes.append(
                 {
                     "node": node,
                     "location": location,
                     "public_ip": ip,
                     "object_prefix": node_object_prefix,
-                    "expected_objects": [f"{node_object_prefix}/{output_name}"],
+                    "expected_objects": expected_objects,
+                    "status_object": f"{node_object_prefix}/{output_prefix}.status.json",
                     "complete": False,
                     "return_code": None,
                 }
@@ -804,7 +935,7 @@ def run_azr_scamper(
         logging.info("Scp necessary files to instances")
         for location, ip in ips:
             logging.info("Scp files to %s", location)
-            processes.append([location, ip, subprocess.Popen(init_cmd(target_file) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
+            processes.append([location, ip, subprocess.Popen(init_cmd(target_files) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
                                                                    stdout=logs[location],
                                                                    stderr=logs[location])])
 
@@ -812,7 +943,7 @@ def run_azr_scamper(
         for location, ip, process in processes:
             while wait_for_process(process, f"scp to {location}", scp_timeout) != 0:
                 logging.info("Retrying scp for %s", location)
-                process = subprocess.Popen(init_cmd(target_file) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
+                process = subprocess.Popen(init_cmd(target_files) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
                                            stdout=logs[location],
                                            stderr=logs[location])
 
@@ -822,13 +953,23 @@ def run_azr_scamper(
         logging.info("Start Scamper")
         for location, ip in ips:
             node_manifest = manifest_nodes_by_location[location]
-            warts_name = Path(node_manifest["expected_objects"][0]).name
-            object_name = node_manifest["expected_objects"][0]
+            output_prefix = f"{prefix}-{location}-{ip}"
             cmd = remote_scamper_command(
-                target_file,
-                warts_name,
+                targets.trace.normalized_file,
+                targets.rr.normalized_file,
+                output_prefix,
                 bucket_name,
-                object_name,
+                node_manifest["object_prefix"],
+                location=location,
+                node=node_manifest["node"],
+                targets=targets,
+                trace_rate=trace_rate,
+                rr_rate=rr_rate,
+                rr_timeout=rr_timeout,
+                measurements=measurements,
+                probe_payload=probe_payload,
+                measurement_contact=measurement_contact,
+                skip_smoke=skip_smoke,
             )
 
             processes.append(
@@ -882,8 +1023,16 @@ def run_azr_scamper(
                     prefix=prefix,
                     bucket_name=bucket_name,
                     object_prefix=object_prefix,
-                    target_file=target_file,
+                    target_sets=targets.as_manifest() if targets else {},
                     locations=locations,
+                    measurements=measurements,
+                    trace_rate=trace_rate,
+                    rr_rate=rr_rate,
+                    rr_timeout=rr_timeout,
+                    probe_payload=probe_payload,
+                    measurement_contact=measurement_contact,
+                    do_not_probe_file=(targets.do_not_probe_file if targets else None),
+                    do_not_probe_version=(targets.do_not_probe_version if targets else None),
                     nodes=manifest_nodes,
                     started_at=campaign_started_at,
                     complete=campaign_complete,
@@ -906,8 +1055,20 @@ def build_plan(
     max_instances=None,
     max_targets=None,
     *,
+    target_source=None,
+    trace_target_source=None,
+    rr_target_source=None,
     bucket_name=None,
     object_prefix=None,
+    regions=None,
+    trace_rate=100,
+    rr_rate=10,
+    rr_timeout=2.0,
+    measurements=("trace", "rr"),
+    probe_payload=None,
+    measurement_contact=None,
+    do_not_probe_file=None,
+    skip_smoke=False,
 ):
     if max_instances is None:
         max_instances = max_instances_from_env()
@@ -920,11 +1081,22 @@ def build_plan(
         "object_prefix": normalized_object_prefix(object_prefix or f"runs/{prefix}"),
         "log_dir": log_dir,
         "resource_group": prefix,
-        "target_file": settings.SCAMPER_IP_DST,
+        "target_sets": {
+            "trace": trace_target_source or target_source or settings.SCAMPER_IP_DST,
+            "rr": rr_target_source or target_source or settings.SCAMPER_IP_DST,
+        },
+        "do_not_probe_file": do_not_probe_file,
         "max_instances": max_instances,
         "max_targets": max_targets,
         "vm_script": settings.AZR_SCAMPER_VM_SCRIPT,
-        "output_name": "PREFIX-LOCATION-IP.trace.warts",
+        "locations": list(regions) if regions else "all-available-locations",
+        "measurements": list(measurements),
+        "trace_rate_pps": trace_rate,
+        "rr_rate_pps": rr_rate,
+        "rr_timeout_seconds": rr_timeout,
+        "probe_payload": probe_payload,
+        "measurement_contact": measurement_contact,
+        "skip_smoke": skip_smoke,
         "smoke_script": settings.SCAMPER_SMOKE_SCRIPT,
         "smoke_test": {"default_target": "8.8.8.8", "min_hops": 2},
         "subscription_id": get_subscription_id(required=False) or "not set",
@@ -933,7 +1105,7 @@ def build_plan(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run the legacy Azure all-location scamper flow."
+        description="Run the supported Azure regional scamper campaign."
     )
     parser.add_argument("--prefix", help="run prefix used for resource group and result names")
     parser.add_argument("--log-dir", help="local log directory")
@@ -947,6 +1119,9 @@ def main(argv=None):
         type=positive_int,
         help="copy only the first N targets into a canary target file",
     )
+    parser.add_argument("--target-source", default=settings.SCAMPER_IP_DST)
+    parser.add_argument("--trace-target-source")
+    parser.add_argument("--rr-target-source")
     parser.add_argument(
         "--bucket-name",
         help=f"GCS bucket for all runs (default: {settings.SCAMPER_RESULTS_BUCKET})",
@@ -956,12 +1131,27 @@ def main(argv=None):
         type=normalized_object_prefix,
         help="object path for this run (default: runs/PREFIX)",
     )
+    parser.add_argument("--regions", type=csv_values)
+    parser.add_argument("--measurements", type=csv_values, default=("trace", "rr"))
+    parser.add_argument("--trace-rate", type=positive_int, default=100)
+    parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
+    parser.add_argument("--probe-payload", type=probe_payload_text)
+    parser.add_argument("--measurement-contact")
+    parser.add_argument("--do-not-probe-file")
+    parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument(
         "--apply",
         action="store_true",
         help="create VMs and run scamper; without this flag only print the plan",
     )
     args = parser.parse_args(argv)
+
+    unsupported_measurements = set(args.measurements) - {"trace", "rr"}
+    if unsupported_measurements:
+        parser.error(
+            "unsupported measurements: " + ", ".join(sorted(unsupported_measurements))
+        )
 
     prefix = args.prefix or f"azr-{int(time.time())}"
     log_dir = args.log_dir or f"{prefix}-logs"
@@ -970,8 +1160,20 @@ def main(argv=None):
         log_dir,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        target_source=args.target_source,
+        trace_target_source=args.trace_target_source,
+        rr_target_source=args.rr_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
+        regions=args.regions,
+        trace_rate=args.trace_rate,
+        rr_rate=args.rr_rate,
+        rr_timeout=args.rr_timeout,
+        measurements=args.measurements,
+        probe_payload=args.probe_payload,
+        measurement_contact=args.measurement_contact,
+        do_not_probe_file=args.do_not_probe_file,
+        skip_smoke=args.skip_smoke,
     )
     if not args.apply:
         print(json.dumps(plan, indent=2))
@@ -985,8 +1187,20 @@ def main(argv=None):
         prefix,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        target_source=args.target_source,
+        trace_target_source=args.trace_target_source,
+        rr_target_source=args.rr_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
+        regions=args.regions,
+        trace_rate=args.trace_rate,
+        rr_rate=args.rr_rate,
+        rr_timeout=args.rr_timeout,
+        measurements=args.measurements,
+        probe_payload=args.probe_payload,
+        measurement_contact=args.measurement_contact,
+        do_not_probe_file=args.do_not_probe_file,
+        skip_smoke=args.skip_smoke,
     )
     return 0
 

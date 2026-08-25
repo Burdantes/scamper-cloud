@@ -1,0 +1,9 @@
+[Unit]
+Description=Dispatch monthly Scamper campaigns across all configured cloud providers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/scamper-controller-monthly run
+TimeoutStartSec=10min

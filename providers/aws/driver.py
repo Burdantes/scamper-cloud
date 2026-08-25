@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
@@ -12,6 +13,7 @@ from providers.gcs_credentials import (
     google_credentials,
     storage_client as gcs_storage_client,
 )
+from providers.common.targets import PreparedTargets, prepare_target_sets
 import logging
 import subprocess
 import time
@@ -21,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 AMI_NAME = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-"
-KEY_NAME = "aws-scamper-key-pair"
+KEY_NAME = "scamper-controller-ed25519"
 
 PROJECT = settings.GCP_PROJECT
 
@@ -43,6 +45,18 @@ def positive_float(value):
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than 0")
     return parsed
+
+
+def probe_payload_text(value):
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise argparse.ArgumentTypeError("probe payload must contain ASCII text") from error
+    if not encoded:
+        raise argparse.ArgumentTypeError("probe payload must not be empty")
+    if len(encoded) > 128:
+        raise argparse.ArgumentTypeError("probe payload must be at most 128 bytes")
+    return value
 
 
 def csv_values(value):
@@ -147,8 +161,6 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
     while not success and attempt < max_attempts:
         try:
             attempt += 1
-            from google.cloud import storage
-
             storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
@@ -179,8 +191,6 @@ def aws_timeout_seconds(name, default):
 
 
 def uploaded_artifact_sizes(bucket_name, artifact_names):
-    from google.cloud import storage
-
     storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
     sizes = {}
@@ -196,8 +206,6 @@ def missing_uploaded_artifacts(bucket_name, artifact_names):
 
 
 def incomplete_uploaded_statuses(bucket_name, artifact_names):
-    from google.cloud import storage
-
     status_names = [name for name in artifact_names if name.endswith(".status.json")]
     storage_client = gcs_storage_client()
     bucket = storage_client.bucket(bucket_name)
@@ -394,14 +402,16 @@ def build_target_file(log_dir, prefix, max_targets=None, target_source=None):
     return str(target_path)
 
 
-def init_cmd(target_file):
+def init_cmd(target_files):
+    if isinstance(target_files, (str, Path)):
+        target_files = [str(target_files)]
     return [
         "scp",
         "-i",
         settings.AWS_SCAMPER_SSH_KEY,
         "-oStrictHostKeyChecking=no",
         settings.WARTS_STORAGE_CREDENTIALS,
-        target_file,
+        *target_files,
         settings.AWS_SCAMPER_VM_SCRIPT,
         settings.SCAMPER_SMOKE_SCRIPT,
         settings.SCAMPER_CAMPAIGN_RUNNER,
@@ -410,38 +420,61 @@ def init_cmd(target_file):
 
 
 def remote_campaign_command(
-    target_file,
+    trace_target_file,
+    rr_target_file,
     output_prefix,
     bucket_name,
     object_prefix,
     *,
     region,
     node,
-    target_source,
-    target_version,
+    targets: PreparedTargets,
     trace_rate,
     rr_rate,
     rr_timeout,
     measurements,
+    probe_payload=None,
+    measurement_contact=None,
+    skip_smoke=False,
 ):
     environment = {
         "SCAMPER_PROVIDER": "aws",
         "SCAMPER_REGION": region,
         "SCAMPER_NODE": node,
-        "SCAMPER_TARGET_SOURCE": target_source,
-        "SCAMPER_TARGET_VERSION": target_version,
+        "SCAMPER_TRACE_TARGET_SOURCE": targets.trace.source,
+        "SCAMPER_TRACE_TARGET_VERSION": targets.trace.version,
+        "SCAMPER_TRACE_TARGET_COUNT": str(targets.trace.target_count),
+        "SCAMPER_TRACE_TARGET_SHA256": targets.trace.normalized_sha256,
+        "SCAMPER_RR_TARGET_SOURCE": targets.rr.source,
+        "SCAMPER_RR_TARGET_VERSION": targets.rr.version,
+        "SCAMPER_RR_TARGET_COUNT": str(targets.rr.target_count),
+        "SCAMPER_RR_TARGET_SHA256": targets.rr.normalized_sha256,
         "SCAMPER_TRACE_RATE_PPS": str(trace_rate),
         "SCAMPER_RR_RATE_PPS": str(rr_rate),
         "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
         "SCAMPER_MEASUREMENTS": ",".join(measurements),
     }
+    if probe_payload:
+        environment["SCAMPER_PROBE_PAYLOAD_TEXT"] = probe_payload
+    if measurement_contact:
+        environment["SCAMPER_MEASUREMENT_CONTACT"] = measurement_contact
+    if targets.do_not_probe_version:
+        environment["SCAMPER_DO_NOT_PROBE_VERSION"] = targets.do_not_probe_version
+    if skip_smoke:
+        environment["SCAMPER_SKIP_SMOKE"] = "1"
     assignments = " ".join(
         f"{name}={shlex.quote(value)}" for name, value in environment.items()
     )
     script = Path(settings.AWS_SCAMPER_VM_SCRIPT).name
     arguments = " ".join(
         shlex.quote(value)
-        for value in (Path(target_file).name, output_prefix, bucket_name, object_prefix)
+        for value in (
+            Path(trace_target_file).name,
+            Path(rr_target_file).name,
+            output_prefix,
+            bucket_name,
+            object_prefix,
+        )
     )
     return f"chmod +x {shlex.quote(script)}; {assignments} ./{shlex.quote(script)} {arguments}"
 
@@ -466,7 +499,7 @@ def create_instance(region, zone, sg_id, name):
         logging.info("No matching AMI found in %s", region)
         return None
     ami_id = sorted(images, key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
-    client.describe_instance_types(Filters=[{"Name":"instance-type", "Values":list(instance_types)}])
+    client.describe_instance_types(InstanceTypes=list(instance_types))
     instance = None
 
     for type in instance_types:
@@ -485,6 +518,10 @@ def create_instance(region, zone, sg_id, name):
                                 'Key': 'Name',
                                 "Value": name
                             },
+                            {
+                                'Key': 'ManagedBy',
+                                'Value': 'scamper-cloud'
+                            },
                         ]
                     },
                 ],
@@ -497,6 +534,56 @@ def create_instance(region, zone, sg_id, name):
     if instance is None:
         logging.info("No instance was created in %s %s",region,zone)
     return instance
+
+
+def ssh_public_key_fingerprint(public_key: str) -> str:
+    """Return AWS's padded Base64 SHA256 fingerprint for an imported Ed25519 key."""
+    fields = public_key.strip().split()
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise ValueError("AWS worker public key must be an OpenSSH Ed25519 key")
+    try:
+        key_blob = base64.b64decode(fields[1], validate=True)
+    except ValueError as error:
+        raise ValueError("AWS worker public key is malformed") from error
+    return base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii")
+
+
+def ensure_key_pair(region):
+    """Import the controller's public key regionally or reject a name collision."""
+    public_key_path = Path(f"{settings.AWS_SCAMPER_SSH_KEY}.pub")
+    public_key = public_key_path.read_text(encoding="ascii").strip()
+    expected = ssh_public_key_fingerprint(public_key)
+    client = ec2_client(region)
+    try:
+        pairs = client.describe_key_pairs(KeyNames=[KEY_NAME])["KeyPairs"]
+    except client_error_type() as error:
+        if error.response.get("Error", {}).get("Code") != "InvalidKeyPair.NotFound":
+            raise
+        pairs = []
+    if pairs:
+        actual = pairs[0].get("KeyFingerprint")
+        if actual != expected:
+            raise RuntimeError(
+                f"AWS key pair {KEY_NAME!r} in {region} does not match the controller key"
+            )
+        return pairs[0].get("KeyPairId")
+    response = client.import_key_pair(
+        KeyName=KEY_NAME,
+        PublicKeyMaterial=public_key.encode("ascii"),
+        TagSpecifications=[
+            {
+                "ResourceType": "key-pair",
+                "Tags": [{"Key": "ManagedBy", "Value": "scamper-cloud"}],
+            }
+        ],
+    )
+    if response.get("KeyFingerprint") != expected:
+        raise RuntimeError(f"AWS returned an unexpected fingerprint for {KEY_NAME!r} in {region}")
+    return response.get("KeyPairId")
+
+
+def security_group_name(region):
+    return f"scamper-controller-ssh-{region}"
 
 
 def get_ssh_ready_ip(instance):
@@ -539,19 +626,27 @@ def terminate_created_instances(instances):
             logging.warning("Could not terminate %s: %s", info.get("name", instance), err)
 
 
-def get_or_create_default_vpc(region):
+def get_default_vpc(region):
     client = ec2_client(region)
     vpcs = client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
     if vpcs:
         return vpcs[0]["VpcId"]
-    logging.info("No default VPC in %s, creating one", region)
-    return client.create_default_vpc()["Vpc"]["VpcId"]
+    raise RuntimeError(
+        f"AWS region {region} has no default VPC; create an approved VPC before enabling it"
+    )
 
 
 def create_default_security_group(region, sg_name):
     client = ec2_client(region)
     client_error = client_error_type()
-    vpc_id = get_or_create_default_vpc(region)
+    vpc_id = get_default_vpc(region)
+    ssh_cidr = os.environ.get("SCAMPER_AWS_SSH_CIDR", "")
+    try:
+        network = ipaddress.ip_network(ssh_cidr, strict=True)
+    except ValueError as error:
+        raise ValueError("SCAMPER_AWS_SSH_CIDR must be a valid controller /32") from error
+    if network.version != 4 or network.prefixlen != 32:
+        raise ValueError("SCAMPER_AWS_SSH_CIDR must be the controller's IPv4 /32")
     sg_id = None
     try:
         sgs = client.describe_security_groups(
@@ -564,11 +659,46 @@ def create_default_security_group(region, sg_name):
             raise client_error({"Error": {"Code": "InvalidGroup.NotFound", "Message": ""}}, "DescribeSecurityGroups")
     except client_error:
         response = client.create_security_group(
-            Description="security group used for scamper",
+            Description="SSH from the scamper controller only",
             GroupName=sg_name,
             VpcId=vpc_id,
+            TagSpecifications=[
+                {
+                    "ResourceType": "security-group",
+                    "Tags": [{"Key": "ManagedBy", "Value": "scamper-cloud"}],
+                }
+            ],
         )
         sg_id = response["GroupId"]
+
+    group = client.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+    stale_permissions = []
+    for permission in group.get("IpPermissions", []):
+        is_exact_rule = (
+            permission.get("IpProtocol") == "tcp"
+            and permission.get("FromPort") == 22
+            and permission.get("ToPort") == 22
+        )
+        stale_ranges = [
+            item
+            for item in permission.get("IpRanges", [])
+            if not is_exact_rule or item.get("CidrIp") != ssh_cidr
+        ]
+        stale_ipv6_ranges = list(permission.get("Ipv6Ranges", []))
+        if stale_ranges or stale_ipv6_ranges:
+            stale_permissions.append(
+                {
+                    "IpProtocol": permission.get("IpProtocol", "tcp"),
+                    "IpRanges": stale_ranges,
+                    "Ipv6Ranges": stale_ipv6_ranges,
+                }
+            )
+            if "FromPort" in permission:
+                stale_permissions[-1]["FromPort"] = permission["FromPort"]
+            if "ToPort" in permission:
+                stale_permissions[-1]["ToPort"] = permission["ToPort"]
+    if stale_permissions:
+        client.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=stale_permissions)
 
     try:
         client.authorize_security_group_ingress(
@@ -580,15 +710,15 @@ def create_default_security_group(region, sg_name):
                     "ToPort": 22,
                     "IpRanges": [
                         {
-                            "CidrIp": os.environ.get(
-                                "SCAMPER_AWS_SSH_CIDR", "0.0.0.0/0"
-                            )
+                            "CidrIp": ssh_cidr,
                         }
                     ],
                 }
             ],
         )
-    except client_error:
+    except client_error as error:
+        if error.response.get("Error", {}).get("Code") != "InvalidPermission.Duplicate":
+            raise
         logging.info("Ingress Rule %s already exists", sg_name)
 
     return sg_id
@@ -605,7 +735,6 @@ def expected_campaign_artifacts(object_prefix, output_prefix, measurements):
         artifacts.extend(
             [
                 f"{object_prefix}/{output_prefix}.{measurement}.warts",
-                f"{object_prefix}/{output_prefix}.{measurement}.jsonl",
                 f"{object_prefix}/{output_prefix}.{measurement}.metadata.json",
                 f"{object_prefix}/{output_prefix}.{measurement}.targets.txt",
             ]
@@ -624,14 +753,16 @@ def write_run_manifest(
     prefix,
     bucket_name,
     object_prefix,
-    target_source,
-    target_version,
-    normalized_target_file,
+    target_sets,
     regions,
     measurements,
     trace_rate,
     rr_rate,
     rr_timeout,
+    probe_payload,
+    measurement_contact,
+    do_not_probe_file,
+    do_not_probe_version,
     nodes,
     started_at,
     complete,
@@ -648,15 +779,13 @@ def write_run_manifest(
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "complete": complete,
         "failure": failure,
-        "target_source": target_source,
-        "target_version": target_version,
-        "normalized_target_file": normalized_target_file,
-        "normalized_target_sha256": (
-            sha256_file(normalized_target_file) if normalized_target_file else None
-        ),
-        "target_count": target_count(normalized_target_file) if normalized_target_file else 0,
+        "target_sets": target_sets,
+        "do_not_probe_file": do_not_probe_file,
+        "do_not_probe_version": do_not_probe_version,
         "regions": list(regions) if regions else "all-enabled-regions",
         "measurements": list(measurements),
+        "probe_payload": probe_payload,
+        "measurement_contact": measurement_contact,
         "commands": {
             "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
             "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
@@ -675,6 +804,8 @@ def run_aws_scamper(
     max_targets=None,
     *,
     target_source=None,
+    trace_target_source=None,
+    rr_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
@@ -682,6 +813,10 @@ def run_aws_scamper(
     rr_rate=10,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
+    probe_payload=None,
+    measurement_contact=None,
+    do_not_probe_file=None,
+    skip_smoke=False,
 ):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(os.path.join(log_dir, f"{prefix}.log"))
@@ -705,15 +840,16 @@ def run_aws_scamper(
         logging.info("Limiting AWS run to at most %d targets", max_targets)
 
     target_source = target_source or settings.SCAMPER_IP_DST
-    local_source = materialize_target_source(target_source, log_dir, prefix)
-    source_sha256 = sha256_file(local_source)
-    target_version = f"{Path(local_source).name}@sha256:{source_sha256}"
-    target_file = build_target_file(
-        log_dir,
-        prefix,
+    targets = prepare_target_sets(
+        log_dir=log_dir,
+        prefix=prefix,
+        fallback_source=target_source,
+        trace_target_source=trace_target_source,
+        rr_target_source=rr_target_source,
         max_targets=max_targets,
-        target_source=local_source,
+        do_not_probe_file=do_not_probe_file,
     )
+    target_files = [targets.trace.normalized_file, targets.rr.normalized_file]
 
     instances = []
     logs = {}
@@ -721,11 +857,18 @@ def run_aws_scamper(
     try:
         create_bucket(bucket_name)
         upload_logs = True
+        if targets.do_not_probe_file:
+            send_to_cloud_storage(
+                targets.do_not_probe_file,
+                bucket_name,
+                f"{object_prefix}/do-not-probe.txt",
+            )
 
         selected_regions = list(regions) if regions else get_regions()
         for region in selected_regions:
-            sg_name = f"{region}-scamper"
+            sg_name = security_group_name(region)
             try:
+                ensure_key_pair(region)
                 sg_id = create_default_security_group(region, sg_name)
                 zones = get_zones(region)
             except Exception as err:
@@ -783,7 +926,7 @@ def run_aws_scamper(
             manifest_nodes_by_name[info["name"]]["public_ip"] = ip
             logs[info['name']] = (open(os.path.join(log_dir, f"{info['name']}-{ip}.log"), "w"))
             logging.info("Scp necessary files to instance %s", info['name'])
-            processes.append([subprocess.Popen(init_cmd(target_file) + [f"{settings.AWS_SCAMPER_USER}@{ip}:~"],
+            processes.append([subprocess.Popen(init_cmd(target_files) + [f"{settings.AWS_SCAMPER_USER}@{ip}:~"],
                                                stdout=logs[info['name']],
                                                stderr=logs[info['name']]),
                               info])
@@ -791,7 +934,7 @@ def run_aws_scamper(
         for process, info in processes:
             while wait_for_scp(process, info) != 0:
                 logging.info("Retrying scp for %s", info['name'])
-                process = subprocess.Popen(init_cmd(target_file) + [f"{settings.AWS_SCAMPER_USER}@{info['ip']}:~"],
+                process = subprocess.Popen(init_cmd(target_files) + [f"{settings.AWS_SCAMPER_USER}@{info['ip']}:~"],
                                            stdout=logs[info['name']],
                                            stderr=logs[info['name']])
 
@@ -813,18 +956,21 @@ def run_aws_scamper(
                 f"{node_object_prefix}/{output_prefix}.status.json"
             )
             cmd = remote_campaign_command(
-                target_file,
+                targets.trace.normalized_file,
+                targets.rr.normalized_file,
                 output_prefix,
                 bucket_name,
                 node_object_prefix,
                 region=info["region"],
                 node=info["name"],
-                target_source=target_source,
-                target_version=target_version,
+                targets=targets,
                 trace_rate=trace_rate,
                 rr_rate=rr_rate,
                 rr_timeout=rr_timeout,
                 measurements=measurements,
+                probe_payload=probe_payload,
+                measurement_contact=measurement_contact,
+                skip_smoke=skip_smoke,
             )
 
             processes.append((subprocess.Popen(["ssh", "-i", settings.AWS_SCAMPER_SSH_KEY, "-oStrictHostKeyChecking=no",
@@ -854,14 +1000,16 @@ def run_aws_scamper(
                     prefix=prefix,
                     bucket_name=bucket_name,
                     object_prefix=object_prefix,
-                    target_source=target_source,
-                    target_version=target_version,
-                    normalized_target_file=target_file,
+                    target_sets=targets.as_manifest(),
                     regions=regions,
                     measurements=measurements,
                     trace_rate=trace_rate,
                     rr_rate=rr_rate,
                     rr_timeout=rr_timeout,
+                    probe_payload=probe_payload,
+                    measurement_contact=measurement_contact,
+                    do_not_probe_file=targets.do_not_probe_file,
+                    do_not_probe_version=targets.do_not_probe_version,
                     nodes=manifest_nodes,
                     started_at=campaign_started_at,
                     complete=campaign_complete,
@@ -883,6 +1031,8 @@ def build_plan(
     max_targets=None,
     *,
     target_source=None,
+    trace_target_source=None,
+    rr_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
@@ -890,6 +1040,10 @@ def build_plan(
     rr_rate=10,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
+    probe_payload=None,
+    measurement_contact=None,
+    do_not_probe_file=None,
+    skip_smoke=False,
 ):
     if max_instances is None:
         max_instances = max_instances_from_env()
@@ -901,7 +1055,11 @@ def build_plan(
         "bucket": bucket_name or settings.SCAMPER_RESULTS_BUCKET,
         "object_prefix": normalized_object_prefix(object_prefix or f"runs/{prefix}"),
         "log_dir": log_dir,
-        "target_source": target_source or settings.SCAMPER_IP_DST,
+        "target_sets": {
+            "trace": trace_target_source or target_source or settings.SCAMPER_IP_DST,
+            "rr": rr_target_source or target_source or settings.SCAMPER_IP_DST,
+        },
+        "do_not_probe_file": do_not_probe_file,
         "vm_script": settings.AWS_SCAMPER_VM_SCRIPT,
         "campaign_runner": settings.SCAMPER_CAMPAIGN_RUNNER,
         "smoke_script": settings.SCAMPER_SMOKE_SCRIPT,
@@ -914,6 +1072,9 @@ def build_plan(
         "trace_rate_pps": trace_rate,
         "rr_rate_pps": rr_rate,
         "rr_timeout_seconds": rr_timeout,
+        "probe_payload": probe_payload,
+        "measurement_contact": measurement_contact,
+        "skip_smoke": skip_smoke,
         "commands": {
             "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
             "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
@@ -926,7 +1087,7 @@ def build_plan(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run the legacy AWS all-region scamper flow."
+        description="Run the supported AWS regional scamper campaign."
     )
     parser.add_argument("--prefix", help="run prefix used for VMs, bucket, and logs")
     parser.add_argument("--log-dir", help="local log directory")
@@ -945,6 +1106,8 @@ def main(argv=None):
         default=settings.SCAMPER_IP_DST,
         help="local path, file:// URL, or HTTPS URL for the complete target source",
     )
+    parser.add_argument("--trace-target-source")
+    parser.add_argument("--rr-target-source")
     parser.add_argument(
         "--bucket-name",
         help=f"GCS bucket for all runs (default: {settings.SCAMPER_RESULTS_BUCKET})",
@@ -968,6 +1131,10 @@ def main(argv=None):
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
+    parser.add_argument("--probe-payload", type=probe_payload_text)
+    parser.add_argument("--measurement-contact")
+    parser.add_argument("--do-not-probe-file")
+    parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument(
         "--list-regions",
         action="store_true",
@@ -998,6 +1165,8 @@ def main(argv=None):
         max_instances=args.max_instances,
         max_targets=args.max_targets,
         target_source=args.target_source,
+        trace_target_source=args.trace_target_source,
+        rr_target_source=args.rr_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
@@ -1005,6 +1174,10 @@ def main(argv=None):
         rr_rate=args.rr_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
+        probe_payload=args.probe_payload,
+        measurement_contact=args.measurement_contact,
+        do_not_probe_file=args.do_not_probe_file,
+        skip_smoke=args.skip_smoke,
     )
     if not args.apply:
         print(json.dumps(plan, indent=2))
@@ -1019,6 +1192,8 @@ def main(argv=None):
         max_instances=args.max_instances,
         max_targets=args.max_targets,
         target_source=args.target_source,
+        trace_target_source=args.trace_target_source,
+        rr_target_source=args.rr_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
@@ -1026,6 +1201,10 @@ def main(argv=None):
         rr_rate=args.rr_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
+        probe_payload=args.probe_payload,
+        measurement_contact=args.measurement_contact,
+        do_not_probe_file=args.do_not_probe_file,
+        skip_smoke=args.skip_smoke,
     )
     return 0
 

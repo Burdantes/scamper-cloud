@@ -1,0 +1,12 @@
+[Unit]
+Description=Run multi-cloud Scamper measurements once per month
+
+[Timer]
+OnCalendar=*-*-01 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=30m
+AccuracySec=1min
+Unit=scamper-monthly.service
+
+[Install]
+WantedBy=timers.target
