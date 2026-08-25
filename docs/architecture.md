@@ -16,9 +16,12 @@ results.
    population from the laptop once. Later runs refer to the source SHA-256 ID.
 3. `experiments/scamper_v4_scanning/` defines IPv4 ICMP traceroute.
 4. `experiments/rr_v4_scanning/` defines one-probe IPv4 Record Route ping.
-5. `target_generation/ipv4_bgp/` creates the versioned one-address-per-routed
+5. `experiments/scamper_v6_scanning/` defines native IPv6 ICMP traceroute.
+6. `target_generation/ipv4_bgp/` creates the versioned one-address-per-routed
    `/24` traceroute population. RR receives its own independently versioned
    responsive population at submission time.
+7. `target_generation/ipv6_hitlist/` imports, validates, filters, and optionally
+   samples the responsive non-aliased TUM IPv6 Hitlist population.
 
 Targets, credentials, live inventories, and results stay local or in configured
 cloud storage and are never committed.
@@ -43,8 +46,9 @@ ordinary experiment changes do not require rebuilding the image.
 ## Provider boundary
 
 `providers/` contains the supported GCP, AWS, and Azure campaign drivers. Every
-driver accepts the same controller contract: distinct traceroute and RR target
-sets, region selection, measurement rates, probe/contact metadata, exclusions,
+driver accepts the same controller contract: distinct IPv4 traceroute, IPv6
+traceroute, and RR target sets, region selection, measurement rates,
+probe/contact metadata, exclusions,
 smoke testing, instance caps, immutable artifacts, and cleanup. Required CI
 passes the exact controller-generated command through every provider parser.
 
@@ -57,6 +61,14 @@ session on demand. AWS regions are explicit and pass account, role, VPC, subnet,
 key-pair, security-group, image, instance-type, and zone checks before monthly
 dispatch. The controller's reserved public IP is the sole SSH ingress source;
 workers are tagged and always terminated in the driver's cleanup path.
+
+IPv6 workers remain dual-stack because the controller manages them over IPv4.
+GCP creates persistent controller-managed external dual-stack subnets and uses
+Premium tier for external IPv6; AWS adds an Amazon-provided IPv6 range and
+`::/0` route to the selected default subnet, then assigns IPv6 only to the
+measurement ENI; Azure creates both address families inside the run's ephemeral
+resource group. These are native provider paths—no tunnel endpoint is inserted
+into the measured route.
 
 ## Boundary with analysis
 

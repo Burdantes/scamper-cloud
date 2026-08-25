@@ -8,6 +8,8 @@ Tests are grouped by when they must run, not by historical implementation.
   safeguards;
 - experiment contracts: exact Scamper command, separate target population,
   independent shuffle, metadata fields, and expected/decoded cardinality;
+- IPv4/IPv6 family rejection, Hitlist filtering and deterministic sampling,
+  native dual-stack provider request contracts, and an IPv6 worker smoke probe;
 - local CLI smoke tests using documentation-only addresses and fake cloud
   commands.
 
@@ -36,7 +38,8 @@ required after IAM trust or regional policy changes.
 
 Run the documented live canary on one disposable VM with a small capped target
 set. Verify both raw outputs, RR `v4rr` parsing, payload/contact metadata,
-STANDARD network tier, uploads, cardinality, failure reporting, and worker
+the recorded IPv4 and IPv6 network tiers, native IPv6 source/address family,
+uploads, cardinality, failure reporting, and worker
 teardown. This is deliberately not a normal CI job because it creates billable
 resources and sends packets.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run traceroute and IPv4 Record Route measurements on one probe node."""
+"""Run IPv4/IPv6 traceroute and IPv4 Record Route on one probe node."""
 
 from __future__ import annotations
 
@@ -23,8 +23,10 @@ from typing import Any
 
 MEASUREMENT_COMMANDS = {
     "trace": "trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}",
+    "trace6": "trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}",
     "rr": "ping -P icmp-echo -R -c 1 -W {timeout}{payload_option}",
 }
+MEASUREMENT_FAMILIES = {"trace": 4, "trace6": 6, "rr": 4}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -80,7 +82,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_and_count_targets(path: Path) -> int:
+def validate_and_count_targets(path: Path, *, expected_family: int = 4) -> int:
     target_count = 0
     with path.open("r", encoding="utf-8") as source:
         for line_number, raw_line in enumerate(source, start=1):
@@ -93,11 +95,14 @@ def validate_and_count_targets(path: Path) -> int:
                 raise ValueError(
                     f"invalid IP target on line {line_number}: {value!r}"
                 ) from error
-            if address.version != 4:
-                raise ValueError(f"non-IPv4 target on line {line_number}: {value!r}")
+            if address.version != expected_family:
+                raise ValueError(
+                    f"non-IPv{expected_family} target on line {line_number}: {value!r}"
+                )
             if value != str(address):
                 raise ValueError(
-                    f"non-canonical IPv4 target on line {line_number}: {value!r}"
+                    f"non-canonical IPv{expected_family} target on line "
+                    f"{line_number}: {value!r}"
                 )
             target_count += 1
     if target_count == 0:
@@ -110,14 +115,17 @@ def verify_target_contract(
     *,
     expected_count: int | None,
     expected_sha256: str | None,
+    expected_family: int = 4,
 ) -> tuple[int, str, str]:
     if (expected_count is None) != (expected_sha256 is None):
         raise ValueError(
             "registered target count and SHA-256 must be provided together"
         )
     if expected_count is None or expected_sha256 is None:
-        target_count = validate_and_count_targets(path)
-        return target_count, sha256_file(path), "strict-ipv4-parse"
+        target_count = validate_and_count_targets(
+            path, expected_family=expected_family
+        )
+        return target_count, sha256_file(path), f"strict-ipv{expected_family}-parse"
 
     actual_sha256 = sha256_file(path)
     if actual_sha256 != expected_sha256:
@@ -175,6 +183,7 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
     destination_count = 0
     rr_requested_records = 0
     rr_responses_with_data = 0
+    destination_families: Counter[str] = Counter()
     first_record: dict[str, Any] | None = None
     sample: dict[str, Any] | None = None
 
@@ -191,8 +200,13 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
             sample = record
         record_type = str(record.get("type", "unknown"))
         record_types[record_type] += 1
-        if record.get("dst"):
+        destination = record.get("dst")
+        if destination:
             destination_count += 1
+            try:
+                destination_families[f"ipv{ipaddress.ip_address(destination).version}"] += 1
+            except ValueError:
+                destination_families["invalid"] += 1
         if record_type == "ping" and "v4rr" in flags_for(record):
             rr_requested_records += 1
         for response in record.get("responses", []) or []:
@@ -204,6 +218,7 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
         "record_count": sum(record_types.values()),
         "destination_count": destination_count,
         "record_types": dict(sorted(record_types.items())),
+        "destination_address_families": dict(sorted(destination_families.items())),
         "record_route_requested_records": rr_requested_records,
         "record_route_responses_with_data": rr_responses_with_data,
         "sample": sample or first_record,
@@ -254,7 +269,7 @@ def measurement_command(
 ) -> list[str]:
     inner = MEASUREMENT_COMMANDS[measurement]
     payload_hex = payload_text.encode("ascii").hex() if payload_text else None
-    payload_flag = "-p" if measurement == "trace" else "-B"
+    payload_flag = "-B" if measurement == "rr" else "-p"
     payload_option = f" {payload_flag} {payload_hex}" if payload_hex else ""
     inner = inner.format(
         timeout=f"{rr_timeout_seconds:g}",
@@ -339,10 +354,21 @@ def run_measurement(
                 "decoded destination count does not match target count: "
                 f"{decoded_destinations} != {target_count}"
             )
+        expected_family = f"ipv{MEASUREMENT_FAMILIES[measurement]}"
+        unexpected_families = set(
+            parsed_summary.get("destination_address_families", {})
+        ) - {expected_family}
+        if unexpected_families:
+            return_code = return_code or 67
+            converter_stderr = (converter_stderr + "; " if converter_stderr else "") + (
+                "decoded destinations contain unexpected address families: "
+                + ", ".join(sorted(unexpected_families))
+            )
 
     metadata = {
         **common_metadata,
         "measurement": measurement,
+        "address_family": MEASUREMENT_FAMILIES[measurement],
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "duration_seconds": (finished_at - started_at).total_seconds(),
@@ -418,10 +444,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--trace-targets", type=Path)
     parser.add_argument("--rr-targets", type=Path)
+    parser.add_argument("--trace6-targets", type=Path)
     parser.add_argument("--trace-target-count", type=positive_int)
     parser.add_argument("--rr-target-count", type=positive_int)
+    parser.add_argument("--trace6-target-count", type=positive_int)
     parser.add_argument("--trace-target-sha256", type=sha256_hex)
     parser.add_argument("--rr-target-sha256", type=sha256_hex)
+    parser.add_argument("--trace6-target-sha256", type=sha256_hex)
     parser.add_argument("--output-prefix", type=Path, required=True)
     parser.add_argument("--provider", required=True)
     parser.add_argument("--region", required=True)
@@ -432,17 +461,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-target-version")
     parser.add_argument("--rr-target-source")
     parser.add_argument("--rr-target-version")
+    parser.add_argument("--trace6-target-source")
+    parser.add_argument("--trace6-target-version")
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--trace6-rate", type=positive_int, default=100)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
     parser.add_argument("--probe-payload", type=probe_payload_text)
     parser.add_argument("--measurement-contact")
     parser.add_argument("--do-not-probe-version")
-    parser.add_argument(
-        "--measurements",
-        choices=("trace,rr", "trace", "rr"),
-        default="trace,rr",
-    )
+    parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument(
         "--checkpoint-command",
         nargs=argparse.REMAINDER,
@@ -457,6 +485,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    measurements = tuple(part.strip() for part in args.measurements.split(","))
+    if not all(measurements) or len(set(measurements)) != len(measurements):
+        parser.error("--measurements must be a non-empty comma-separated unique list")
+    unsupported = set(measurements) - set(MEASUREMENT_COMMANDS)
+    if unsupported:
+        parser.error("unsupported measurements: " + ", ".join(sorted(unsupported)))
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     campaign_started = utc_now()
     common_metadata = {
@@ -472,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
     statuses: dict[str, int] = {}
     metadata: dict[str, Any] = {}
     target_sets: dict[str, dict[str, Any]] = {}
-    for measurement in args.measurements.split(","):
+    for measurement in measurements:
         target_path = getattr(args, f"{measurement}_targets") or args.targets
         target_source = (
             getattr(args, f"{measurement}_target_source") or args.target_source
@@ -498,8 +532,13 @@ def main(argv: list[str] | None = None) -> int:
             target_path,
             expected_count=expected_count,
             expected_sha256=expected_sha256,
+            expected_family=MEASUREMENT_FAMILIES[measurement],
         )
-        rate = args.trace_rate if measurement == "trace" else args.rr_rate
+        rate = {
+            "trace": args.trace_rate,
+            "trace6": args.trace6_rate,
+            "rr": args.rr_rate,
+        }[measurement]
         status, result_metadata = run_measurement(
             measurement,
             target_file=target_path,
@@ -523,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
             "normalized_file": str(target_path),
             "normalized_sha256": normalized_sha256,
             "target_count": target_count,
+            "address_family": MEASUREMENT_FAMILIES[measurement],
         }
         if args.checkpoint_command:
             checkpoint_measurement_artifacts(

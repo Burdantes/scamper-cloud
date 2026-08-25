@@ -66,6 +66,26 @@ def test_register_target_rejects_duplicate_or_invalid_destinations(
         register_local_target(invalid, tmp_path / "invalid-registry")
 
 
+def test_register_ipv6_target_records_family_and_rejects_mixed_input(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "responsive-v6.txt"
+    source.write_text("2606:4700:4700::1111\n2001:4860:4860::8888\n", encoding="utf-8")
+
+    registered = register_local_target(source, tmp_path / "registry", address_family=6)
+
+    assert registered.address_family == 6
+    manifest = json.loads(registered.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["format"] == "canonical-ipv6-one-per-line"
+    assert manifest["address_family"] == 6
+
+    mixed = tmp_path / "mixed.txt"
+    mixed.write_text("2606:4700:4700::1111\n192.0.2.1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="mixed or unexpected address family"):
+        register_local_target(mixed, tmp_path / "mixed-registry")
+
+
 def test_target_id_validation_and_remote_path() -> None:
     digest = "a" * 64
     registered_id = target_id(f"sha256:{digest}")

@@ -2,7 +2,7 @@
 
 The controller is a small, long-lived GCP VM in `us-central1-c`. It provisions
 short-lived GCP, AWS, and Azure measurement workers, sends each worker its
-distinct traceroute and RR inputs, waits for uploaded artifacts, verifies
+distinct IPv4 traceroute, IPv6 traceroute, and RR inputs, waits for uploaded artifacts, verifies
 completion, and deletes the workers. Campaigns run as named `systemd` services,
 so closing the laptop or losing the local network does not stop them.
 
@@ -18,18 +18,20 @@ Deployment tests the staged release on the controller before activation. A
 failed test keeps the previous `/opt/scamper-cloud/current` release in place.
 
 Register each complete target population once from the laptop. Registration
-normalizes the first TSV column to canonical IPv4, rejects duplicates, records
+normalizes the first TSV column to canonical IPv4 or IPv6, rejects duplicates
+and mixed-family files, records
 the source and normalized SHA-256 values and target count, and uploads it into
 the controller's persistent content-addressed registry:
 
 ```bash
 python -m controller.manage register-targets --apply \
   --trace-targets datasets/ipv4-bgp-one-per-24-20260801.txt \
-  --rr-targets /Users/loqmansalamatian/Downloads/rr_responsive_targets_2026-05-11.tsv
+  --rr-targets /path/to/rr-responsive-targets.tsv \
+  --trace6-targets datasets/ipv6-hitlist-responsive-1000.txt
 ```
 
-Keep the two IDs printed by that command. Submit one US-region worker running
-both measurements without uploading or re-normalizing either population:
+Keep the three IDs printed by that command. Submit one US-region worker running
+all three measurements without uploading or re-normalizing any population:
 
 ```bash
 python -m controller.manage submit --apply \
@@ -38,7 +40,10 @@ python -m controller.manage submit --apply \
   --regions us-central1 \
   --max-instances 1 \
   --trace-target-id sha256:TRACE_SOURCE_SHA256 \
+  --trace6-target-id sha256:TRACE6_SOURCE_SHA256 \
   --rr-target-id sha256:RR_SOURCE_SHA256 \
+  --measurements trace,trace6,rr \
+  --max-trace6-targets 10 \
   --trace-rate 1000 \
   --rr-rate 1000
 ```
@@ -82,7 +87,9 @@ The controller uses its attached service account via Application Default
 Credentials; no JSON private key is copied to it. That service account must be
 able to create/delete Compute Engine instances, act as the worker service
 account, create/read/write the configured GCS bucket, and read zones/images.
-Both controller and worker external IPs are explicitly `STANDARD` network tier.
+Controller and worker external IPv4 addresses remain explicitly `STANDARD`
+network tier. GCP external IPv6 is necessarily `PREMIUM`; the run manifest must
+be used when interpreting this path-selection difference.
 
 The registry lives under
 `/var/lib/scamper-controller/target-registry/sha256/<source-sha256>/`. Deploying
@@ -98,11 +105,14 @@ passes all readiness checks.
 
 The operator-owned `/etc/scamper-controller-monthly.json` must contain:
 
-- registered, immutable traceroute and RR target IDs;
+- registered, immutable IPv4 traceroute, IPv6 traceroute, and RR target IDs;
 - the stable result bucket and measurement/contact policy;
 - entries for exactly GCP, AWS, and Azure;
 - provider-native regions and worker sizes; and
 - a positive `max_instances` safety cap for every provider.
+
+Use `max_trace6_targets` independently of the IPv4 `max_targets` cap. The
+checked-in schema-2 example starts at 1,000 IPv6 targets per worker.
 
 Validate and enable it from a workstation:
 
@@ -162,11 +172,19 @@ fingerprint, public default subnets, supported AMI and worker type, and availabl
 zones. Keep the timer disabled until a one-instance, capped-target AWS canary
 uploads a complete manifest and the worker has been terminated.
 
+For `trace6`, the checked-in policy additionally permits associating an
+Amazon-provided IPv6 range with the existing default VPC/subnet, installing the
+public `::/0` route, and adding IPv6 egress to the worker security group. The
+driver never enables automatic IPv6 assignment for unrelated instances; it
+requests one IPv6 address only on each measurement ENI. These regional network
+associations persist after workers terminate.
+
 To register target files already present on the controller, run as root on that
 VM:
 
 ```bash
 /usr/local/bin/scamper-controller-monthly register-targets \
   --trace-targets /path/to/trace-targets.txt \
-  --rr-targets /path/to/rr-targets.tsv
+  --rr-targets /path/to/rr-targets.tsv \
+  --trace6-targets /path/to/ipv6-hitlist-targets.txt
 ```

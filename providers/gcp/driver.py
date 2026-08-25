@@ -278,12 +278,14 @@ def load_do_not_probe_prefixes(path):
                 raise ValueError(
                     f"invalid do-not-probe prefix on line {line_number}: {value!r}"
                 ) from error
-            if network.version != 4:
-                raise ValueError(
-                    f"non-IPv4 do-not-probe prefix on line {line_number}: {value!r}"
-                )
             networks.append(network)
-    return tuple(ipaddress.collapse_addresses(networks))
+    ipv4 = ipaddress.collapse_addresses(
+        network for network in networks if network.version == 4
+    )
+    ipv6 = ipaddress.collapse_addresses(
+        network for network in networks if network.version == 6
+    )
+    return (*ipv4, *ipv6)
 
 
 def address_is_excluded(address, networks, network_starts):
@@ -299,16 +301,20 @@ def build_target_file(
     max_targets=None,
     target_source=None,
     do_not_probe_networks=(),
+    address_family=4,
 ):
+    if address_family not in {4, 6}:
+        raise ValueError("address_family must be 4 or 6")
     source_path = target_source or settings.SCAMPER_IP_DST
     suffix = f"-{max_targets}" if max_targets is not None else ""
     target_path = Path(log_dir) / f"{prefix}-targets{suffix}.txt"
     written = 0
     excluded = 0
     seen = set()
-    network_starts = tuple(
-        int(network.network_address) for network in do_not_probe_networks
+    family_networks = tuple(
+        network for network in do_not_probe_networks if network.version == address_family
     )
+    network_starts = tuple(int(network.network_address) for network in family_networks)
     with open(source_path, "r", encoding="utf-8") as src:
         with target_path.open("w", encoding="utf-8") as dst:
             for line_number, line in enumerate(src, start=1):
@@ -323,9 +329,10 @@ def build_target_file(
                     raise ValueError(
                         f"invalid target on source line {line_number}: {value!r}"
                     ) from error
-                if address.version != 4:
+                if address.version != address_family:
                     raise ValueError(
-                        f"non-IPv4 target on source line {line_number}: {value!r}"
+                        f"non-IPv{address_family} target on source line "
+                        f"{line_number}: {value!r}"
                     )
                 normalized = str(address)
                 if normalized in seen:
@@ -335,7 +342,7 @@ def build_target_file(
                 seen.add(normalized)
                 if address_is_excluded(
                     address,
-                    do_not_probe_networks,
+                    family_networks,
                     network_starts,
                 ):
                     excluded += 1
@@ -343,7 +350,9 @@ def build_target_file(
                 dst.write(normalized + "\n")
                 written += 1
     if written == 0:
-        raise ValueError(f"target source contained no IPv4 destinations: {source_path}")
+        raise ValueError(
+            f"target source contained no IPv{address_family} destinations: {source_path}"
+        )
     logging.info(
         "Created normalized target file %s with %d targets; excluded %d targets",
         target_path,
@@ -353,15 +362,23 @@ def build_target_file(
     return str(target_path)
 
 
-def command_strings(trace_rate, rr_rate, rr_timeout, payload_text=None):
+def command_strings(
+    trace_rate, rr_rate, rr_timeout, payload_text=None, trace6_rate=None
+):
     payload_hex = payload_text.encode("ascii").hex() if payload_text else None
     trace_payload = f" -p {payload_hex}" if payload_hex else ""
     rr_payload = f" -B {payload_hex}" if payload_hex else ""
+    trace6_rate = trace_rate if trace6_rate is None else trace6_rate
     return {
         "trace": (
             "scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP"
             f"{trace_payload}' -p {trace_rate} -f SHUFFLED_TARGETS "
             "-o OUTPUT.trace.warts -O warts"
+        ),
+        "trace6": (
+            "scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP"
+            f"{trace_payload}' -p {trace6_rate} -f SHUFFLED_TARGETS "
+            "-o OUTPUT.trace6.warts -O warts"
         ),
         "rr": (
             "scamper -c 'ping -P icmp-echo -R -c 1 "
@@ -416,6 +433,12 @@ def remote_campaign_command(
     rr_rate,
     rr_timeout,
     measurements,
+    trace6_target_file=None,
+    trace6_target_source=None,
+    trace6_target_version=None,
+    trace6_target_count=None,
+    trace6_target_sha256=None,
+    trace6_rate=100,
     probe_payload,
     measurement_contact,
     do_not_probe_version,
@@ -435,9 +458,19 @@ def remote_campaign_command(
         "SCAMPER_RR_TARGET_SHA256": rr_target_sha256,
         "SCAMPER_TRACE_RATE_PPS": str(trace_rate),
         "SCAMPER_RR_RATE_PPS": str(rr_rate),
+        "SCAMPER_TRACE6_RATE_PPS": str(trace6_rate),
         "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
         "SCAMPER_MEASUREMENTS": ",".join(measurements),
     }
+    if trace6_target_file is not None:
+        environment.update(
+            {
+                "SCAMPER_TRACE6_TARGET_SOURCE": str(trace6_target_source),
+                "SCAMPER_TRACE6_TARGET_VERSION": str(trace6_target_version),
+                "SCAMPER_TRACE6_TARGET_COUNT": str(trace6_target_count),
+                "SCAMPER_TRACE6_TARGET_SHA256": str(trace6_target_sha256),
+            }
+        )
     if skip_smoke:
         environment["SCAMPER_SKIP_SMOKE"] = "1"
     if probe_payload:
@@ -450,16 +483,11 @@ def remote_campaign_command(
         f"{name}={shlex.quote(value)}" for name, value in environment.items()
     )
     script = Path(settings.GCP_SCAMPER_SCRIPT).name
-    arguments = " ".join(
-        shlex.quote(value)
-        for value in (
-            Path(trace_target_file).name,
-            Path(rr_target_file).name,
-            output_prefix,
-            bucket_name,
-            object_prefix,
-        )
-    )
+    argument_values = [Path(trace_target_file).name, Path(rr_target_file).name]
+    if trace6_target_file is not None:
+        argument_values.append(Path(trace6_target_file).name)
+    argument_values.extend((output_prefix, bucket_name, object_prefix))
+    arguments = " ".join(shlex.quote(value) for value in argument_values)
     return f"chmod +x {shlex.quote(script)}; {assignments} ./{shlex.quote(script)} {arguments}"
 
 
@@ -501,6 +529,7 @@ def write_run_manifest(
     started_at,
     complete,
     failure,
+    trace6_rate=None,
 ):
     manifest_path = Path(log_dir) / "manifest.json"
     manifest = {
@@ -532,6 +561,7 @@ def write_run_manifest(
             rr_rate,
             rr_timeout,
             probe_payload,
+            trace6_rate,
         ),
         "nodes": nodes,
         "failed_nodes": [node["node"] for node in nodes if not node["complete"]],
@@ -731,7 +761,101 @@ def create_bucket(name):
         raise
 
 
-def create_instance(project, zone, name):
+def wait_global_operation(project, operation):
+    result = (
+        get_compute()
+        .globalOperations()
+        .wait(project=project, operation=operation)
+        .execute()
+    )
+    if "error" in result:
+        raise RuntimeError(f"GCP global operation {operation} failed: {result['error']}")
+    return result
+
+
+def wait_region_operation(project, region, operation):
+    result = (
+        get_compute()
+        .regionOperations()
+        .wait(project=project, region=region, operation=operation)
+        .execute()
+    )
+    if "error" in result:
+        raise RuntimeError(
+            f"GCP regional operation {operation} in {region} failed: {result['error']}"
+        )
+    return result
+
+
+def ensure_dual_stack_subnetwork(project, region):
+    """Create or reuse the controller-managed native dual-stack measurement subnet."""
+    from googleapiclient.errors import HttpError
+
+    client = get_compute()
+    network_name = "scamper-dual-stack"
+    subnet_name = f"scamper-dual-stack-{region}"
+    try:
+        client.networks().get(project=project, network=network_name).execute()
+    except HttpError as error:
+        if getattr(error.resp, "status", None) != 404:
+            raise
+        operation = client.networks().insert(
+            project=project,
+            body={"name": network_name, "autoCreateSubnetworks": False},
+        ).execute()
+        wait_global_operation(project, operation["name"])
+
+    firewall_name = "scamper-controller-ssh"
+    try:
+        client.firewalls().get(project=project, firewall=firewall_name).execute()
+    except HttpError as error:
+        if getattr(error.resp, "status", None) != 404:
+            raise
+        operation = client.firewalls().insert(
+            project=project,
+            body={
+                "name": firewall_name,
+                "network": f"global/networks/{network_name}",
+                "direction": "INGRESS",
+                "sourceRanges": [
+                    os.environ.get("SCAMPER_GCP_SSH_CIDR", "0.0.0.0/0")
+                ],
+                "targetTags": ["scamper-worker"],
+                "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
+            },
+        ).execute()
+        wait_global_operation(project, operation["name"])
+
+    try:
+        subnet = client.subnetworks().get(
+            project=project, region=region, subnetwork=subnet_name
+        ).execute()
+    except HttpError as error:
+        if getattr(error.resp, "status", None) != 404:
+            raise
+        digest = hashlib.sha256(region.encode("ascii")).digest()
+        cidr = f"10.{digest[0]}.{digest[1]}.0/24"
+        operation = client.subnetworks().insert(
+            project=project,
+            region=region,
+            body={
+                "name": subnet_name,
+                "network": f"global/networks/{network_name}",
+                "ipCidrRange": cidr,
+                "stackType": "IPV4_IPV6",
+                "ipv6AccessType": "EXTERNAL",
+            },
+        ).execute()
+        wait_region_operation(project, region, operation["name"])
+        subnet = client.subnetworks().get(
+            project=project, region=region, subnetwork=subnet_name
+        ).execute()
+    if subnet.get("stackType") != "IPV4_IPV6" or subnet.get("ipv6AccessType") != "EXTERNAL":
+        raise RuntimeError(f"GCP subnet {subnet_name} is not external dual-stack")
+    return subnet["selfLink"]
+
+
+def create_instance(project, zone, name, ipv6_enabled=False):
     logging.info("Creating %s in %s", name, zone)
     client = get_compute()
     image_response = (
@@ -744,8 +868,40 @@ def create_instance(project, zone, name):
 
     source_disk_image = image_response["selfLink"]
     machine_type = "zones/%s/machineTypes/%s" % (zone, settings.GCP_MACHINE_TYPE)
+    network_interface = {
+        "network": "global/networks/default",
+        "accessConfigs": [
+            {
+                "name": "External NAT",
+                "type": "ONE_TO_ONE_NAT",
+                "networkTier": settings.GCP_NETWORK_TIER,
+            }
+        ],
+        "stackType": "IPV4_ONLY",
+    }
+    if ipv6_enabled:
+        region = zone.rsplit("-", 1)[0]
+        network_interface = {
+            "subnetwork": ensure_dual_stack_subnetwork(project, region),
+            "accessConfigs": [
+                {
+                    "name": "External NAT",
+                    "type": "ONE_TO_ONE_NAT",
+                    "networkTier": settings.GCP_NETWORK_TIER,
+                }
+            ],
+            "ipv6AccessConfigs": [
+                {
+                    "name": "External IPv6",
+                    "type": "DIRECT_IPV6",
+                    "networkTier": "PREMIUM",
+                }
+            ],
+            "stackType": "IPV4_IPV6",
+        }
     config = {
         "name": name,
+        "tags": {"items": ["scamper-worker"]},
         "machineType": machine_type,
         "disks": [
             {
@@ -756,19 +912,7 @@ def create_instance(project, zone, name):
                 },
             }
         ],
-        "networkInterfaces": [
-            {
-                "network": "global/networks/default",
-                "accessConfigs": [
-                    {
-                        "name": "External NAT",
-                        "type": "ONE_TO_ONE_NAT",
-                        "networkTier": settings.GCP_NETWORK_TIER,
-                    }
-                ],
-                "stackType": "IPV4_ONLY",
-            }
-        ],
+        "networkInterfaces": [network_interface],
         "serviceAccounts": [
             {"email": settings.GCP_SERVICE_ACCOUNT, "scopes": settings.GCP_SCOPES}
         ],
@@ -821,7 +965,7 @@ def wait_zone_operation(project, zone, operation):
             return result
 
 
-def create_instance_zones(prefix, zones, max_instances=None):
+def create_instance_zones(prefix, zones, max_instances=None, ipv6_enabled=False):
     created_zones = []
     remaining_zones = list(zones)
 
@@ -836,10 +980,11 @@ def create_instance_zones(prefix, zones, max_instances=None):
         while remaining_zones and len(operations) < needed:
             zone = remaining_zones.pop(0)
             try:
-                operation = create_instance(
-                    settings.GCP_PROJECT,
-                    zone,
-                    f"{prefix}-{zone}",
+                arguments = (settings.GCP_PROJECT, zone, f"{prefix}-{zone}")
+                operation = (
+                    create_instance(*arguments, ipv6_enabled=True)
+                    if ipv6_enabled
+                    else create_instance(*arguments)
                 )["name"]
                 operations.append((zone, operation))
             except Exception as err:
@@ -869,7 +1014,9 @@ def create_instance_zones(prefix, zones, max_instances=None):
     return created_zones
 
 
-def create_instance_regions(prefix, zones, regions, max_instances=None):
+def create_instance_regions(
+    prefix, zones, regions, max_instances=None, ipv6_enabled=False
+):
     """Create at most one worker per region, trying alternate zones on failure."""
     selected_regions = list(regions)
     if max_instances is not None:
@@ -893,10 +1040,11 @@ def create_instance_regions(prefix, zones, regions, max_instances=None):
     for region in selected_regions:
         for zone in zones_by_region[region]:
             try:
-                operation = create_instance(
-                    settings.GCP_PROJECT,
-                    zone,
-                    f"{prefix}-{zone}",
+                arguments = (settings.GCP_PROJECT, zone, f"{prefix}-{zone}")
+                operation = (
+                    create_instance(*arguments, ipv6_enabled=True)
+                    if ipv6_enabled
+                    else create_instance(*arguments)
                 )["name"]
                 wait_zone_operation(settings.GCP_PROJECT, zone, operation)
                 created_zones.append(zone)
@@ -1008,15 +1156,18 @@ def run_gcp_scamper(
     prefix,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -1024,6 +1175,8 @@ def run_gcp_scamper(
     do_not_probe_file=None,
     skip_smoke=False,
 ):
+    if "trace6" in measurements and not trace6_target_source:
+        raise ValueError("trace6_target_source is required when trace6 is enabled")
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     fh = logging.FileHandler(os.path.join(log_dir, f"{prefix}.log"))
@@ -1073,9 +1226,13 @@ def run_gcp_scamper(
                 len(do_not_probe_networks),
                 do_not_probe_file,
             )
-        for measurement, source in (
-            ("trace", trace_target_source),
-            ("rr", rr_target_source),
+        requested_targets = (
+            ("trace", trace_target_source, 4, max_targets),
+            ("rr", rr_target_source, 4, max_targets),
+            ("trace6", trace6_target_source, 6, max_trace6_targets),
+        )
+        for measurement, source, address_family, measurement_max_targets in (
+            item for item in requested_targets if item[1] is not None
         ):
             local_source = materialize_target_source(
                 source,
@@ -1090,10 +1247,15 @@ def run_gcp_scamper(
                 )
             else:
                 version = registered.source_version
+                if registered.address_family != address_family:
+                    raise ValueError(
+                        f"{measurement} requires IPv{address_family} targets, but "
+                        f"registry entry is IPv{registered.address_family}"
+                    )
 
             if (
                 registered is not None
-                and max_targets is None
+                and measurement_max_targets is None
                 and not do_not_probe_networks
             ):
                 normalized_file = local_source
@@ -1109,9 +1271,10 @@ def run_gcp_scamper(
                 normalized_file = build_target_file(
                     log_dir,
                     f"{prefix}-{measurement}",
-                    max_targets=max_targets,
+                    max_targets=measurement_max_targets,
                     target_source=local_source,
                     do_not_probe_networks=do_not_probe_networks,
+                    address_family=address_family,
                 )
                 normalized_sha256 = sha256_file(normalized_file)
                 normalized_target_count = target_count(normalized_file)
@@ -1137,16 +1300,27 @@ def run_gcp_scamper(
 
         logging.info("Creating instances")
         if regions:
-            created_zones = create_instance_regions(
-                prefix,
-                zones,
-                regions,
-                max_instances=max_instances,
-            )
+            if "trace6" in measurements:
+                created_zones = create_instance_regions(
+                    prefix,
+                    zones,
+                    regions,
+                    max_instances=max_instances,
+                    ipv6_enabled=True,
+                )
+            else:
+                created_zones = create_instance_regions(
+                    prefix, zones, regions, max_instances=max_instances
+                )
         else:
-            created_zones = create_instance_zones(
-                prefix, zones, max_instances=max_instances
-            )
+            if "trace6" in measurements:
+                created_zones = create_instance_zones(
+                    prefix, zones, max_instances=max_instances, ipv6_enabled=True
+                )
+            else:
+                created_zones = create_instance_zones(
+                    prefix, zones, max_instances=max_instances
+                )
         instance_count = len(created_zones)
         if instance_count == 0:
             raise RuntimeError("no GCP instances were created")
@@ -1180,6 +1354,9 @@ def run_gcp_scamper(
         verified_network_tiers = verify_standard_network_tier(instances)
         for node in manifest_nodes:
             node["network_tier"] = verified_network_tiers[node["node"]]
+            node["ipv6_network_tier"] = (
+                "PREMIUM" if "trace6" in measurements else None
+            )
 
         logging.info("Waiting until all instances are ready for ssh")
         wait_seconds = float(os.environ.get("SCAMPER_GCP_SSH_WAIT_SECONDS", "600"))
@@ -1213,12 +1390,7 @@ def run_gcp_scamper(
                     nat_ip,
                     zone,
                     subprocess.Popen(
-                        init_cmd(
-                            [
-                                target_files["trace"],
-                                target_files["rr"],
-                            ]
-                        )
+                        init_cmd(list(target_files.values()))
                         + [f"{settings.GCP_SCAMPER_USER}@{nat_ip}:~"],
                         stdout=logs[name],
                         stderr=logs[name],
@@ -1231,12 +1403,7 @@ def run_gcp_scamper(
             while wait_for_process(process, f"scp to {name}", scp_timeout) != 0:
                 logging.info("Retrying scp for %s", name)
                 process = subprocess.Popen(
-                    init_cmd(
-                        [
-                            target_files["trace"],
-                            target_files["rr"],
-                        ]
-                    )
+                    init_cmd(list(target_files.values()))
                     + [f"{settings.GCP_SCAMPER_USER}@{nat_ip}:~"],
                     stdout=logs[name],
                     stderr=logs[name],
@@ -1252,6 +1419,16 @@ def run_gcp_scamper(
             node_manifest = manifest_nodes_by_name[name]
             node_object_prefix = node_manifest["object_prefix"]
             node_artifacts = node_manifest["expected_objects"]
+            trace6_options = {}
+            if "trace6" in target_files:
+                trace6_options = {
+                    "trace6_target_file": target_files["trace6"],
+                    "trace6_target_source": trace6_target_source,
+                    "trace6_target_version": target_versions["trace6"],
+                    "trace6_target_count": target_sets["trace6"]["target_count"],
+                    "trace6_target_sha256": target_sets["trace6"]["normalized_sha256"],
+                    "trace6_rate": trace6_rate,
+                }
             cmd = remote_campaign_command(
                 target_files["trace"],
                 target_files["rr"],
@@ -1276,6 +1453,7 @@ def run_gcp_scamper(
                 measurement_contact=measurement_contact,
                 do_not_probe_version=do_not_probe_version,
                 skip_smoke=skip_smoke,
+                **trace6_options,
             )
 
             ssh_key = str(Path(settings.GCP_SCAMPER_SSH_KEY).expanduser())
@@ -1374,6 +1552,7 @@ def run_gcp_scamper(
                     started_at=campaign_started_at,
                     complete=campaign_complete,
                     failure=campaign_failure,
+                    trace6_rate=trace6_rate,
                 )
                 send_to_cloud_storage(
                     manifest_path,
@@ -1394,15 +1573,18 @@ def build_plan(
     log_dir,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -1432,13 +1614,20 @@ def build_plan(
             "rr": {
                 "source": rr_target_source or target_source or settings.SCAMPER_IP_DST,
             },
+            **(
+                {"trace6": {"source": trace6_target_source}}
+                if trace6_target_source is not None
+                else {}
+            ),
         },
         "max_instances": max_instances,
         "max_targets": max_targets,
+        "max_trace6_targets": max_trace6_targets,
         "regions": list(regions) if regions else "all-enabled-regions",
         "measurements": list(measurements),
         "trace_rate_pps": trace_rate,
         "rr_rate_pps": rr_rate,
+        "trace6_rate_pps": trace6_rate,
         "rr_timeout_seconds": rr_timeout,
         "measurement_contact": measurement_contact,
         "probe_payload_text": probe_payload,
@@ -1482,6 +1671,7 @@ def main(argv=None):
         type=positive_int,
         help="copy only the first N targets into a canary target file",
     )
+    parser.add_argument("--max-trace6-targets", type=positive_int)
     parser.add_argument(
         "--target-source",
         default=settings.SCAMPER_IP_DST,
@@ -1495,6 +1685,7 @@ def main(argv=None):
         "--rr-target-source",
         help="local path, file:// URL, or HTTPS URL for RR targets",
     )
+    parser.add_argument("--trace6-target-source")
     parser.add_argument(
         "--bucket-name",
         help=f"GCS bucket for all runs (default: {settings.SCAMPER_RESULTS_BUCKET})",
@@ -1517,6 +1708,7 @@ def main(argv=None):
     )
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--trace6-rate", type=positive_int, default=100)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
     parser.add_argument(
         "--probe-payload",
@@ -1543,11 +1735,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    unsupported_measurements = set(args.measurements) - {"trace", "rr"}
+    unsupported_measurements = set(args.measurements) - {"trace", "trace6", "rr"}
     if unsupported_measurements:
         parser.error(
             "unsupported measurements: " + ", ".join(sorted(unsupported_measurements))
         )
+    if "trace6" in args.measurements and not args.trace6_target_source:
+        parser.error("--trace6-target-source is required when trace6 is enabled")
 
     prefix = args.prefix or f"gcp-{int(time.time())}"
     log_dir = args.log_dir or f"{prefix}-logs"
@@ -1556,14 +1750,17 @@ def main(argv=None):
         log_dir,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,
@@ -1583,14 +1780,17 @@ def main(argv=None):
         prefix,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,

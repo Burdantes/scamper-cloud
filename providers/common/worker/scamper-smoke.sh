@@ -2,6 +2,11 @@
 
 smoke_target_for_provider() {
   local provider="$1"
+  local address_family="${2:-4}"
+  if [[ "$address_family" == "6" ]]; then
+    echo "2606:4700:4700::1111"
+    return
+  fi
   case "$provider" in
     gcp)
       echo "1.1.1.1"
@@ -50,6 +55,7 @@ validate_scamper_smoke_text() {
 run_scamper_smoke_test() {
   local provider="$1"
   local trace_args="$2"
+  local address_family="${3:-4}"
 
   if [[ "${SCAMPER_SMOKE_TEST:-1}" == "0" ]]; then
     echo "SCAMPER_SMOKE_SKIPPED provider=$provider"
@@ -58,7 +64,7 @@ run_scamper_smoke_test() {
 
   local target="${SCAMPER_SMOKE_TARGET:-}"
   if [[ -z "$target" ]]; then
-    target=$(smoke_target_for_provider "$provider")
+    target=$(smoke_target_for_provider "$provider" "$address_family")
   fi
 
   local min_hops="${SCAMPER_SMOKE_MIN_HOPS:-2}"
@@ -67,9 +73,10 @@ run_scamper_smoke_test() {
   mkdir -p "$smoke_dir"
 
   local target_file="$smoke_dir/${provider}-target.txt"
-  local warts_file="$smoke_dir/${provider}-${target}.warts"
-  local text_file="$smoke_dir/${provider}-${target}.txt"
-  local log_file="$smoke_dir/${provider}-${target}.log"
+  local family_label="ipv${address_family}"
+  local warts_file="$smoke_dir/${provider}-${family_label}.warts"
+  local text_file="$smoke_dir/${provider}-${family_label}.txt"
+  local log_file="$smoke_dir/${provider}-${family_label}.log"
 
   printf "%s\n" "$target" > "$target_file"
 

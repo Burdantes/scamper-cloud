@@ -66,6 +66,30 @@ def test_schedule_has_positive_cost_caps_and_distinct_target_ids(tmp_path: Path)
     assert schedule.trace_target_id != schedule.rr_target_id
 
 
+def test_schema_two_accepts_trace6_with_an_independent_cap(tmp_path: Path) -> None:
+    path = write_config(tmp_path / "monthly.json")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value.update(
+        {
+            "schema_version": 2,
+            "trace6_target_id": "sha256:" + "3" * 64,
+            "measurements": ["trace", "trace6", "rr"],
+            "trace6_rate": 250,
+        }
+    )
+    for provider in value["providers"].values():
+        provider["max_trace6_targets"] = 1000
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    schedule = monthly.load_schedule(path)
+    arguments = monthly._submission_args(schedule, schedule.providers[0], "202610")
+
+    assert schedule.trace6_target_id == "sha256:" + "3" * 64
+    assert arguments[arguments.index("--trace6-rate") + 1] == "250"
+    assert arguments[arguments.index("--max-trace6-targets") + 1] == "1000"
+    assert "--trace6-targets" in arguments
+
+
 def test_dispatch_submits_each_provider_once_per_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

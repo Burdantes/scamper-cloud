@@ -1,12 +1,14 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "enabled": false,
   "trace_target_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-  "rr_target_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "rr_target_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "trace6_target_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
   "bucket": "REPLACE_WITH_RESULTS_BUCKET",
-  "measurements": ["trace", "rr"],
+  "measurements": ["trace", "trace6", "rr"],
   "trace_rate": 1000,
   "rr_rate": 1000,
+  "trace6_rate": 1000,
   "rr_timeout": 2.0,
   "probe_payload": "Academic probing; please reach out to ls3748@columbia.edu to opt out.",
   "measurement_contact": "ls3748@columbia.edu",
@@ -16,19 +18,22 @@
       "regions": null,
       "worker_machine_type": "e2-micro",
       "max_instances": 50,
-      "max_targets": null
+      "max_targets": null,
+      "max_trace6_targets": 1000
     },
     "aws": {
       "regions": ["us-east-1"],
       "worker_machine_type": "t3.micro,t2.micro",
       "max_instances": 35,
-      "max_targets": null
+      "max_targets": null,
+      "max_trace6_targets": 1000
     },
     "azure": {
       "regions": null,
       "worker_machine_type": "Standard_B2ts_v2",
       "max_instances": 50,
-      "max_targets": null
+      "max_targets": null,
+      "max_trace6_targets": 1000
     }
   }
 }

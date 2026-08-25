@@ -29,7 +29,7 @@ from providers.preflight import missing_worker_assets
 CONFIG_PATH = Path("/etc/scamper-controller-monthly.json")
 STATE_ROOT = Path("/var/lib/scamper-controller/monthly")
 DEFAULT_DO_NOT_PROBE = Path("/opt/scamper-cloud/current/config/do-not-probe.txt")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ class ProviderSchedule:
     worker_machine_type: str | None
     max_instances: int
     max_targets: int | None
+    max_trace6_targets: int | None
 
 
 @dataclass(frozen=True)
@@ -46,10 +47,12 @@ class MonthlySchedule:
     enabled: bool
     trace_target_id: str
     rr_target_id: str
+    trace6_target_id: str | None
     bucket: str
     measurements: tuple[str, ...]
     trace_rate: int
     rr_rate: int
+    trace6_rate: int
     rr_timeout: float
     probe_payload: str
     measurement_contact: str
@@ -76,8 +79,10 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
         raise ValueError(f"monthly schedule configuration does not exist: {path}") from error
     except json.JSONDecodeError as error:
         raise ValueError(f"invalid monthly schedule JSON in {path}: {error}") from error
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"monthly schedule must use schema_version {SCHEMA_VERSION}")
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, SCHEMA_VERSION}:
+        raise ValueError(
+            f"monthly schedule must use schema_version 1 or {SCHEMA_VERSION}"
+        )
 
     enabled = raw.get("enabled")
     if not isinstance(enabled, bool):
@@ -94,9 +99,25 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
     if not isinstance(measurements_raw, list) or not measurements_raw:
         raise ValueError("measurements must be a non-empty list")
     measurements = tuple(_nonempty_string(value, "measurement") for value in measurements_raw)
-    unsupported = set(measurements) - {"trace", "rr"}
+    if len(set(measurements)) != len(measurements):
+        raise ValueError("measurements must not contain duplicates")
+    unsupported = set(measurements) - {"trace", "trace6", "rr"}
     if unsupported:
         raise ValueError(f"unsupported measurements: {', '.join(sorted(unsupported))}")
+    trace6_id = None
+    if raw.get("trace6_target_id") is not None:
+        try:
+            trace6_id = target_id(
+                _nonempty_string(raw["trace6_target_id"], "trace6_target_id")
+            )
+        except argparse.ArgumentTypeError as error:
+            raise ValueError(str(error)) from error
+    if "trace6" in measurements and trace6_id is None:
+        raise ValueError("trace6_target_id is required when trace6 is enabled")
+    if len({value for value in (trace_id, rr_id, trace6_id) if value}) != (
+        2 + (trace6_id is not None)
+    ):
+        raise ValueError("trace, trace6, and rr target IDs must be distinct")
 
     providers_raw = raw.get("providers")
     if not isinstance(providers_raw, dict):
@@ -133,6 +154,11 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
         max_targets = value.get("max_targets")
         if max_targets is not None:
             max_targets = _positive_int(max_targets, f"providers.{provider}.max_targets")
+        max_trace6_targets = value.get("max_trace6_targets")
+        if max_trace6_targets is not None:
+            max_trace6_targets = _positive_int(
+                max_trace6_targets, f"providers.{provider}.max_trace6_targets"
+            )
         providers.append(
             ProviderSchedule(
                 provider=provider,
@@ -142,6 +168,7 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
                     value.get("max_instances"), f"providers.{provider}.max_instances"
                 ),
                 max_targets=max_targets,
+                max_trace6_targets=max_trace6_targets,
             )
         )
 
@@ -157,10 +184,12 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
         enabled=enabled,
         trace_target_id=trace_id,
         rr_target_id=rr_id,
+        trace6_target_id=trace6_id,
         bucket=_nonempty_string(raw.get("bucket"), "bucket"),
         measurements=measurements,
         trace_rate=_positive_int(raw.get("trace_rate", 1000), "trace_rate"),
         rr_rate=_positive_int(raw.get("rr_rate", 1000), "rr_rate"),
+        trace6_rate=_positive_int(raw.get("trace6_rate", 1000), "trace6_rate"),
         rr_timeout=float(raw.get("rr_timeout", 2.0)),
         probe_payload=probe_payload,
         measurement_contact=_nonempty_string(
@@ -197,20 +226,30 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
         errors.append(f"do-not-probe file does not exist: {schedule.do_not_probe_file}")
 
     targets: dict[str, dict[str, Any]] = {}
-    for role, registered_id in (
+    target_roles = [
         ("trace", schedule.trace_target_id),
         ("rr", schedule.rr_target_id),
-    ):
+    ]
+    if schedule.trace6_target_id is not None:
+        target_roles.append(("trace6", schedule.trace6_target_id))
+    for role, registered_id in target_roles:
         path = remote_target_path(registered_id)
         registered = load_registered_target(path) if path.is_file() else None
         if registered is None:
             errors.append(f"{role} target ID is not registered: {registered_id}")
             continue
+        expected_family = 6 if role == "trace6" else 4
+        if registered.address_family != expected_family:
+            errors.append(
+                f"{role} target ID is IPv{registered.address_family}; "
+                f"expected IPv{expected_family}: {registered_id}"
+            )
         targets[role] = {
             "target_id": registered.target_id,
             "path": str(path),
             "target_count": registered.target_count,
             "normalized_sha256": registered.normalized_sha256,
+            "address_family": registered.address_family,
         }
 
     providers: dict[str, dict[str, Any]] = {}
@@ -226,6 +265,7 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
             "regions": list(provider.regions) if provider.regions else "all",
             "max_instances": provider.max_instances,
             "max_targets": provider.max_targets,
+            "max_trace6_targets": provider.max_trace6_targets,
         }
         errors.extend(f"{provider.provider}: {error}" for error in provider_errors)
 
@@ -269,6 +309,8 @@ def _submission_args(
         str(schedule.trace_rate),
         "--rr-rate",
         str(schedule.rr_rate),
+        "--trace6-rate",
+        str(schedule.trace6_rate),
         "--rr-timeout",
         f"{schedule.rr_timeout:g}",
         "--probe-payload",
@@ -278,12 +320,20 @@ def _submission_args(
         "--do-not-probe-file",
         str(schedule.do_not_probe_file),
     ]
+    if schedule.trace6_target_id is not None:
+        arguments.extend(
+            ["--trace6-targets", str(remote_target_path(schedule.trace6_target_id))]
+        )
     if provider.regions:
         arguments.extend(["--regions", ",".join(provider.regions)])
     if provider.worker_machine_type:
         arguments.extend(["--worker-machine-type", provider.worker_machine_type])
     if provider.max_targets:
         arguments.extend(["--max-targets", str(provider.max_targets)])
+    if provider.max_trace6_targets:
+        arguments.extend(
+            ["--max-trace6-targets", str(provider.max_trace6_targets)]
+        )
     return arguments
 
 
@@ -351,6 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser = subparsers.add_parser("register-targets")
     register_parser.add_argument("--trace-targets", type=Path, required=True)
     register_parser.add_argument("--rr-targets", type=Path, required=True)
+    register_parser.add_argument("--trace6-targets", type=Path)
     return parser
 
 
@@ -359,7 +410,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "register-targets":
         trace = register_controller_target(args.trace_targets)
         rr = register_controller_target(args.rr_targets)
-        print(json.dumps({"trace_target_id": trace.target_id, "rr_target_id": rr.target_id}, indent=2))
+        values = {"trace_target_id": trace.target_id, "rr_target_id": rr.target_id}
+        if args.trace6_targets is not None:
+            trace6 = register_controller_target(args.trace6_targets)
+            if trace6.address_family != 6:
+                raise ValueError("--trace6-targets must contain IPv6 destinations")
+            values["trace6_target_id"] = trace6.target_id
+        print(json.dumps(values, indent=2))
         return 0
     schedule = load_schedule(args.config)
     if args.action == "check":

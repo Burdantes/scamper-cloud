@@ -31,11 +31,22 @@ See [Architecture](docs/architecture.md) for the ownership boundary and
 
 The controller VM is hosted on GCP, but the measurement workers are not limited
 to GCP. All three providers implement the same campaign contract: distinct
-traceroute and Record Route target sets, provider-native regions and VM sizes,
-instance and target caps, smoke tests, artifact verification, and cleanup.
+IPv4 traceroute, IPv6 traceroute, and IPv4 Record Route target sets,
+provider-native regions and VM sizes, instance and target caps, smoke tests,
+artifact verification, and cleanup.
 
 Results from every provider currently go to the same configured GCS bucket.
 AWS and Azure are worker platforms, not alternate artifact-storage backends.
+
+IPv6 workers are dual-stack and remain controller-reachable over IPv4. `trace6`
+uses native provider IPv6, not a tunnel: GCP creates a managed external
+dual-stack VPC/subnet and uses Premium network tier for external IPv6; AWS adds
+IPv6 CIDRs and a public `::/0` route to the selected default VPC subnet and
+assigns IPv6 only to the measurement ENI; Azure creates a dual-stack VNet, NIC,
+and public IP inside the run's disposable resource group. GCP's IPv4 traffic
+remains on the configured tier, so record the IPv6 Premium-tier difference when
+comparing provider paths. The GCP network/subnets and AWS VPC/subnet IPv6
+associations persist for reuse; Azure networking is deleted with the run.
 
 ## Supported experiments
 
@@ -43,11 +54,15 @@ AWS and Azure are worker platforms, not alternate artifact-storage backends.
   traceroute to one address per BGP-announced `/24`-equivalent.
 - [`experiments/RR_v4_scanning`](experiments/RR_v4_scanning): one ICMP Record
   Route probe to each independently versioned RR-responsive target.
+- [`experiments/scamper_v6_scanning`](experiments/scamper_v6_scanning): native
+  IPv6 ICMP traceroute to a separately versioned responsive Hitlist population.
 
 The persistent US controller under [`controller`](controller) owns campaigns
 after submission, so the submitting laptop may disconnect. Generate the
 traceroute population once with
 [`target_generation/ipv4_bgp`](target_generation/ipv4_bgp).
+Import the public responsive, non-aliased TUM IPv6 Hitlist with
+[`target_generation/ipv6_hitlist`](target_generation/ipv6_hitlist).
 
 ## Requirements
 
@@ -108,15 +123,27 @@ not only on a developer workstation.
 The detailed AWS federation and regional preparation procedure is in
 [`controller/README.md`](controller/README.md#aws-controller-identity-and-regional-preparation).
 
-### 3. Register immutable targets once
+### 3. Import and register immutable targets once
+
+Start IPv6 with a deterministic canary population. Omit `--max-targets` only
+after the canary is validated:
+
+```bash
+python -m target_generation.ipv6_hitlist.import_hitlist \
+  --download-responsive \
+  --max-targets 1000 \
+  --output datasets/ipv6-hitlist-responsive-1000.txt
+```
 
 ```bash
 python -m controller.manage register-targets --apply \
   --trace-targets /path/to/ipv4-bgp-one-per-24.txt \
-  --rr-targets /path/to/rr-responsive-targets.tsv
+  --rr-targets /path/to/rr-responsive-targets.tsv \
+  --trace6-targets datasets/ipv6-hitlist-responsive-1000.txt
 ```
 
-Save the two returned `sha256:` target IDs. Later campaigns reuse the registered
+Save the three returned `sha256:` target IDs. The registry records address
+family and rejects mixed-family input. Later campaigns reuse the registered
 content without uploading or normalizing it again.
 
 ### 4. Run a capped one-provider canary
@@ -133,8 +160,11 @@ python -m controller.manage submit --apply \
   --worker-machine-type t3.micro,t2.micro \
   --max-instances 1 \
   --max-targets 10 \
+  --max-trace6-targets 10 \
   --trace-target-id sha256:TRACE_SOURCE_SHA256 \
-  --rr-target-id sha256:RR_SOURCE_SHA256
+  --rr-target-id sha256:RR_SOURCE_SHA256 \
+  --trace6-target-id sha256:TRACE6_SOURCE_SHA256 \
+  --measurements trace,trace6,rr
 ```
 
 Monitor an individual run from any workstation with access to the controller:
@@ -149,10 +179,11 @@ expanding the cap or enabling unattended runs.
 ### 5. Configure and enable the monthly schedule
 
 Start from [`controller/monthly-config.example.json`](controller/monthly-config.example.json).
-The controller-owned `/etc/scamper-controller-monthly.json` must contain the two
+The controller-owned `/etc/scamper-controller-monthly.json` must contain the
 registered target IDs, result bucket, measurement policy, and entries for
 exactly `gcp`, `aws`, and `azure`. Every provider needs a positive
-`max_instances`; use `max_targets` for a bounded rollout.
+`max_instances`; use `max_targets` for IPv4 and `max_trace6_targets` for an
+independently bounded IPv6 rollout.
 
 The dispatcher validates all three providers before submitting any of them. It
 refuses to run when targets, worker assets, credentials, exclusions, regions,

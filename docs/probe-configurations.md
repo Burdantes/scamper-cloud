@@ -7,7 +7,8 @@ non-comparable, so the differences are recorded rather than quietly normalised.
 ## Current canonical definitions
 
 Owned by `experiments/common/run_campaign.py` (`MEASUREMENT_COMMANDS`) and
-mirrored in `experiments/scamper_v4_scanning/experiment.py` and
+mirrored in `experiments/scamper_v4_scanning/experiment.py`,
+`experiments/scamper_v6_scanning/experiment.py`, and
 `experiments/RR_v4_scanning/experiment.py`. The worker scripts must not
 duplicate these; they delegate to the runner so the definition lives in one
 place.
@@ -15,7 +16,14 @@ place.
 | Measurement | Command |
 |---|---|
 | trace | `trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}` |
+| trace6 | `trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}` |
 | rr | `ping -P icmp-echo -R -c 1 -W {timeout}{payload_option}` |
+
+`trace` requires canonical IPv4 destinations and `trace6` requires canonical
+IPv6 destinations. Scamper infers the address family from each destination;
+keeping the probe flags identical makes the two traceroute datasets comparable
+at the experiment layer. Record Route remains IPv4-only because it is an IPv4
+header option.
 
 Used by: the GCP 42-region campaign (`gcp-global42-20260803t2030z`), the AWS
 27-region campaign (`aws-20260806-trace-global28`), and the Azure 44-region

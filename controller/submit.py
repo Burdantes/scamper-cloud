@@ -90,6 +90,8 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         str(args.trace_rate),
         "--rr-rate",
         str(args.rr_rate),
+        "--trace6-rate",
+        str(getattr(args, "trace6_rate", 1000)),
         "--rr-timeout",
         str(args.rr_timeout),
         "--probe-payload",
@@ -99,12 +101,16 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         "--do-not-probe-file",
         str(args.do_not_probe_file),
     ]
+    if getattr(args, "trace6_targets", None) is not None:
+        command.extend(["--trace6-target-source", str(args.trace6_targets)])
     if args.regions:
         command.extend(["--regions", args.regions])
     if args.max_instances is not None:
         command.extend(["--max-instances", str(args.max_instances)])
     if args.max_targets is not None:
         command.extend(["--max-targets", str(args.max_targets)])
+    if getattr(args, "max_trace6_targets", None) is not None:
+        command.extend(["--max-trace6-targets", str(args.max_trace6_targets)])
     if args.skip_smoke:
         command.append("--skip-smoke")
     return command
@@ -177,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True, type=run_id)
     parser.add_argument("--trace-targets", required=True, type=existing_file)
     parser.add_argument("--rr-targets", required=True, type=existing_file)
+    parser.add_argument("--trace6-targets", type=existing_file)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--object-prefix")
     parser.add_argument(
@@ -196,8 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument("--max-instances", type=positive_int)
     parser.add_argument("--max-targets", type=positive_int)
+    parser.add_argument("--max-trace6-targets", type=positive_int)
     parser.add_argument("--trace-rate", type=positive_int, default=1000)
     parser.add_argument("--rr-rate", type=positive_int, default=1000)
+    parser.add_argument("--trace6-rate", type=positive_int, default=1000)
     parser.add_argument("--rr-timeout", type=float, default=2.0)
     parser.add_argument("--probe-payload", default=DEFAULT_PAYLOAD)
     parser.add_argument("--measurement-contact", default="ls3748@columbia.edu")
@@ -218,6 +227,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    measurements = tuple(value.strip() for value in args.measurements.split(","))
+    unsupported = set(measurements) - {"trace", "trace6", "rr"}
+    if not all(measurements) or len(set(measurements)) != len(measurements) or unsupported:
+        parser = build_parser()
+        parser.error(
+            "unsupported measurements: " + ", ".join(sorted(unsupported or {"empty"}))
+        )
+    if "trace6" in measurements and args.trace6_targets is None:
+        build_parser().error("--trace6-targets is required when trace6 is enabled")
     origin = assert_controller_origin(args.allow_foreign_origin)
     if args.worker_machine_type is None:
         args.worker_machine_type = default_worker_machine_type(args.provider)

@@ -312,7 +312,9 @@ def write_run_manifest(
     started_at,
     complete,
     failure,
+    trace6_rate=None,
 ):
+    trace6_rate = trace_rate if trace6_rate is None else trace6_rate
     manifest_path = Path(log_dir) / "manifest.json"
     manifest = {
         "schema_version": 1,
@@ -332,12 +334,14 @@ def write_run_manifest(
         "locations": list(locations),
         "measurements": list(measurements),
         "trace_rate_pps": trace_rate,
+        "trace6_rate_pps": trace6_rate,
         "rr_rate_pps": rr_rate,
         "rr_timeout_seconds": rr_timeout,
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "commands": {
             "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
+            "trace6": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace6_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace6.warts -O warts",
             "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
         },
         "nodes": nodes,
@@ -384,6 +388,8 @@ def remote_scamper_command(
     rr_rate,
     rr_timeout,
     measurements,
+    trace6_target_file=None,
+    trace6_rate=100,
     probe_payload=None,
     measurement_contact=None,
     skip_smoke=False,
@@ -403,9 +409,19 @@ def remote_scamper_command(
         "SCAMPER_RR_TARGET_SHA256": targets.rr.normalized_sha256,
         "SCAMPER_TRACE_RATE_PPS": str(trace_rate),
         "SCAMPER_RR_RATE_PPS": str(rr_rate),
+        "SCAMPER_TRACE6_RATE_PPS": str(trace6_rate),
         "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
         "SCAMPER_MEASUREMENTS": ",".join(measurements),
     }
+    if targets.trace6 is not None:
+        environment.update(
+            {
+                "SCAMPER_TRACE6_TARGET_SOURCE": targets.trace6.source,
+                "SCAMPER_TRACE6_TARGET_VERSION": targets.trace6.version,
+                "SCAMPER_TRACE6_TARGET_COUNT": str(targets.trace6.target_count),
+                "SCAMPER_TRACE6_TARGET_SHA256": targets.trace6.normalized_sha256,
+            }
+        )
     if probe_payload:
         environment["SCAMPER_PROBE_PAYLOAD_TEXT"] = probe_payload
     if measurement_contact:
@@ -417,16 +433,11 @@ def remote_scamper_command(
     assignments = " ".join(
         f"{name}={shlex.quote(value)}" for name, value in environment.items()
     )
-    arguments = " ".join(
-        shlex.quote(value)
-        for value in (
-            Path(trace_target_file).name,
-            Path(rr_target_file).name,
-            output_prefix,
-            bucket_name,
-            object_prefix,
-        )
-    )
+    argument_values = [Path(trace_target_file).name, Path(rr_target_file).name]
+    if trace6_target_file is not None:
+        argument_values.append(Path(trace6_target_file).name)
+    argument_values.extend((output_prefix, bucket_name, object_prefix))
+    arguments = " ".join(shlex.quote(value) for value in argument_values)
     return (
         f"chmod +x {shlex.quote(script)}; {assignments} "
         f"sudo -E ./{shlex.quote(script)} {arguments}"
@@ -547,7 +558,7 @@ def delete_rg(rg_name):
     rg_result = get_resource_client().resource_groups.begin_delete(rg_name)
     return rg_result
 
-def create_ip(rg_name,location,ip_name):
+def create_ip(rg_name, location, ip_name, address_family="IPv4"):
     from azure.mgmt.network.models import PublicIPAddress
     from azure.mgmt.network.models import PublicIPAddressPropertiesFormat
     from azure.mgmt.network.models import PublicIPAddressSku
@@ -560,7 +571,7 @@ def create_ip(rg_name,location,ip_name):
             sku=PublicIPAddressSku(name="Standard"),
             properties=PublicIPAddressPropertiesFormat(
                 public_ip_allocation_method="Static",
-                public_ip_address_version="IPv4",
+                public_ip_address_version=address_family,
             ),
         ),
     )
@@ -568,7 +579,7 @@ def create_ip(rg_name,location,ip_name):
     ip_address_result = poller.result()
     return ip_address_result
 
-def create_vnet(rg_name,location,vnet_name):
+def create_vnet(rg_name, location, vnet_name, ipv6_enabled=False):
     from azure.mgmt.network.models import AddressSpace
     from azure.mgmt.network.models import VirtualNetwork
     from azure.mgmt.network.models import VirtualNetworkPropertiesFormat
@@ -579,14 +590,17 @@ def create_vnet(rg_name,location,vnet_name):
         VirtualNetwork(
             location=location,
             properties=VirtualNetworkPropertiesFormat(
-                address_space=AddressSpace(address_prefixes=["10.0.0.0/24"]),
+                address_space=AddressSpace(
+                    address_prefixes=["10.0.0.0/24"]
+                    + (["fd00:5ca1:1000::/64"] if ipv6_enabled else [])
+                ),
             ),
         ),
     )
     vnet_result = poller.result()
     return vnet_result
 
-def create_subnet(rg_name,vnet_name, subnet_name):
+def create_subnet(rg_name, vnet_name, subnet_name, ipv6_enabled=False):
     from azure.mgmt.network.models import Subnet
     from azure.mgmt.network.models import SubnetPropertiesFormat
 
@@ -595,7 +609,10 @@ def create_subnet(rg_name,vnet_name, subnet_name):
         vnet_name,
         subnet_name,
         Subnet(
-            properties=SubnetPropertiesFormat(address_prefix="10.0.0.0/28"),
+            properties=SubnetPropertiesFormat(
+                address_prefixes=["10.0.0.0/28"]
+                + (["fd00:5ca1:1000::/64"] if ipv6_enabled else [])
+            ),
         ),
     )
     subnet_result = poller.result()
@@ -648,7 +665,9 @@ def create_nsg(rg_name,location,  nsg_name):
     nsg_result = poller.result()
     return nsg_result
 
-def create_network_interface( rg_name,location, ni_name, subnet_id, ip_id, nsg_id):
+def create_network_interface(
+    rg_name, location, ni_name, subnet_id, ip_id, nsg_id, ipv6_ip_id=None
+):
     from azure.mgmt.network.models import NetworkInterface
     from azure.mgmt.network.models import NetworkInterfaceIPConfiguration
     from azure.mgmt.network.models import NetworkInterfaceIPConfigurationPropertiesFormat
@@ -672,7 +691,23 @@ def create_network_interface( rg_name,location, ni_name, subnet_id, ip_id, nsg_i
                             private_ip_address=PRIVATE_IP,
                             private_ip_allocation_method="Static",
                         ),
-                    )
+                    ),
+                    *(
+                        [
+                            NetworkInterfaceIPConfiguration(
+                                name=f"azr-scamper-{location}-ipconfig-v6",
+                                properties=NetworkInterfaceIPConfigurationPropertiesFormat(
+                                    subnet=Subnet(id=subnet_id),
+                                    public_ip_address=PublicIPAddress(id=ipv6_ip_id),
+                                    private_ip_allocation_method="Dynamic",
+                                    private_ip_address_version="IPv6",
+                                    primary=False,
+                                ),
+                            )
+                        ]
+                        if ipv6_ip_id is not None
+                        else []
+                    ),
                 ],
                 network_security_group=NetworkSecurityGroup(id=nsg_id),
             ),
@@ -749,7 +784,8 @@ def create_vm(rg_name,location,  vm_name, ni_id):
     return vm_result
 
 def launch_location(run_info):
-    rg_name,location = run_info
+    rg_name, location, *options = run_info
+    ipv6_enabled = bool(options[0]) if options else False
     vm_name = f"azr-{location}"
     nsg_name = f"{vm_name}-nsg"
     ip_name = f"{vm_name}-ip"
@@ -761,16 +797,33 @@ def launch_location(run_info):
         ip_result = create_ip(rg_name,location, ip_name)
         logging.info("Created %s", ip_name)
 
-        create_vnet(rg_name,location, vnet_name)
+        ipv6_ip_result = None
+        if ipv6_enabled:
+            ipv6_ip_result = create_ip(
+                rg_name, location, f"{ip_name}-v6", address_family="IPv6"
+            )
+            logging.info("Created %s-v6", ip_name)
+
+        create_vnet(rg_name,location, vnet_name, ipv6_enabled=ipv6_enabled)
         logging.info("Created %s", vnet_name)
 
-        subnet_result = create_subnet(rg_name,vnet_name, subnet_name)
+        subnet_result = create_subnet(
+            rg_name, vnet_name, subnet_name, ipv6_enabled=ipv6_enabled
+        )
         logging.info("Created %s", subnet_name)
 
         nsg_result = create_nsg(rg_name,location, nsg_name)
         logging.info("Created %s", nsg_name)
 
-        ni_result = create_network_interface(rg_name,location, ni_name, subnet_result.id, ip_result.id, nsg_result.id)
+        ni_result = create_network_interface(
+            rg_name,
+            location,
+            ni_name,
+            subnet_result.id,
+            ip_result.id,
+            nsg_result.id,
+            ipv6_ip_id=(ipv6_ip_result.id if ipv6_ip_result else None),
+        )
         logging.info("Created %s", ni_name)
 
         create_vm(rg_name,location,vm_name,ni_result.id)
@@ -782,10 +835,13 @@ def launch_location(run_info):
     return (location, ip_result.ip_address)
 
 
-def launch_locations(prefix, locations, max_instances=None):
+def launch_locations(prefix, locations, max_instances=None, ipv6_enabled=False):
     ips = []
     if max_instances is None:
-        run_infos = [(prefix, location) for location in locations]
+        run_infos = [
+            (prefix, location, True) if ipv6_enabled else (prefix, location)
+            for location in locations
+        ]
         if not run_infos:
             return ips
         with Pool(len(run_infos)) as p:
@@ -797,7 +853,10 @@ def launch_locations(prefix, locations, max_instances=None):
         remaining_count = max_instances - len(ips)
         batch_locations = remaining_locations[:remaining_count]
         remaining_locations = remaining_locations[remaining_count:]
-        run_infos = [(prefix, location) for location in batch_locations]
+        run_infos = [
+            (prefix, location, True) if ipv6_enabled else (prefix, location)
+            for location in batch_locations
+        ]
         logging.info("Launching Azure locations:%s", batch_locations)
         with Pool(len(run_infos)) as p:
             launched = p.map(launch_location, run_infos)
@@ -817,15 +876,18 @@ def run_azr_scamper(
     prefix,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -833,6 +895,8 @@ def run_azr_scamper(
     do_not_probe_file=None,
     skip_smoke=False,
 ):
+    if "trace6" in measurements and not trace6_target_source:
+        raise ValueError("trace6_target_source is required when trace6 is enabled")
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     fh = logging.FileHandler(os.path.join(log_dir, f"{prefix}.log"))
@@ -868,10 +932,14 @@ def run_azr_scamper(
             fallback_source=target_source,
             trace_target_source=trace_target_source,
             rr_target_source=rr_target_source,
+            trace6_target_source=trace6_target_source,
             max_targets=max_targets,
+            max_trace6_targets=max_trace6_targets,
             do_not_probe_file=do_not_probe_file,
         )
         target_files = [targets.trace.normalized_file, targets.rr.normalized_file]
+        if targets.trace6 is not None:
+            target_files.append(targets.trace6.normalized_file)
         create_bucket(bucket_name)
         upload_logs = True
         if targets.do_not_probe_file:
@@ -884,7 +952,12 @@ def run_azr_scamper(
         resource_group_created = True
 
         locations = list(regions) if regions else get_locations()
-        ips = launch_locations(prefix, locations, max_instances=max_instances)
+        if "trace6" in measurements:
+            ips = launch_locations(
+                prefix, locations, max_instances=max_instances, ipv6_enabled=True
+            )
+        else:
+            ips = launch_locations(prefix, locations, max_instances=max_instances)
         logging.info("Created following instances:%s", ips)
         record_expense_instances(len(ips))
 
@@ -954,6 +1027,12 @@ def run_azr_scamper(
         for location, ip in ips:
             node_manifest = manifest_nodes_by_location[location]
             output_prefix = f"{prefix}-{location}-{ip}"
+            trace6_options = {}
+            if targets.trace6 is not None:
+                trace6_options = {
+                    "trace6_target_file": targets.trace6.normalized_file,
+                    "trace6_rate": trace6_rate,
+                }
             cmd = remote_scamper_command(
                 targets.trace.normalized_file,
                 targets.rr.normalized_file,
@@ -970,6 +1049,7 @@ def run_azr_scamper(
                 probe_payload=probe_payload,
                 measurement_contact=measurement_contact,
                 skip_smoke=skip_smoke,
+                **trace6_options,
             )
 
             processes.append(
@@ -1037,6 +1117,7 @@ def run_azr_scamper(
                     started_at=campaign_started_at,
                     complete=campaign_complete,
                     failure=campaign_failure,
+                    trace6_rate=trace6_rate,
                 )
                 send_to_cloud_storage(
                     manifest_path,
@@ -1054,15 +1135,18 @@ def build_plan(
     log_dir,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -1084,15 +1168,22 @@ def build_plan(
         "target_sets": {
             "trace": trace_target_source or target_source or settings.SCAMPER_IP_DST,
             "rr": rr_target_source or target_source or settings.SCAMPER_IP_DST,
+            **(
+                {"trace6": trace6_target_source}
+                if trace6_target_source is not None
+                else {}
+            ),
         },
         "do_not_probe_file": do_not_probe_file,
         "max_instances": max_instances,
         "max_targets": max_targets,
+        "max_trace6_targets": max_trace6_targets,
         "vm_script": settings.AZR_SCAMPER_VM_SCRIPT,
         "locations": list(regions) if regions else "all-available-locations",
         "measurements": list(measurements),
         "trace_rate_pps": trace_rate,
         "rr_rate_pps": rr_rate,
+        "trace6_rate_pps": trace6_rate,
         "rr_timeout_seconds": rr_timeout,
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
@@ -1119,9 +1210,11 @@ def main(argv=None):
         type=positive_int,
         help="copy only the first N targets into a canary target file",
     )
+    parser.add_argument("--max-trace6-targets", type=positive_int)
     parser.add_argument("--target-source", default=settings.SCAMPER_IP_DST)
     parser.add_argument("--trace-target-source")
     parser.add_argument("--rr-target-source")
+    parser.add_argument("--trace6-target-source")
     parser.add_argument(
         "--bucket-name",
         help=f"GCS bucket for all runs (default: {settings.SCAMPER_RESULTS_BUCKET})",
@@ -1135,6 +1228,7 @@ def main(argv=None):
     parser.add_argument("--measurements", type=csv_values, default=("trace", "rr"))
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--trace6-rate", type=positive_int, default=100)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
     parser.add_argument("--probe-payload", type=probe_payload_text)
     parser.add_argument("--measurement-contact")
@@ -1147,11 +1241,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    unsupported_measurements = set(args.measurements) - {"trace", "rr"}
+    unsupported_measurements = set(args.measurements) - {"trace", "trace6", "rr"}
     if unsupported_measurements:
         parser.error(
             "unsupported measurements: " + ", ".join(sorted(unsupported_measurements))
         )
+    if "trace6" in args.measurements and not args.trace6_target_source:
+        parser.error("--trace6-target-source is required when trace6 is enabled")
 
     prefix = args.prefix or f"azr-{int(time.time())}"
     log_dir = args.log_dir or f"{prefix}-logs"
@@ -1160,14 +1256,17 @@ def main(argv=None):
         log_dir,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,
@@ -1187,14 +1286,17 @@ def main(argv=None):
         prefix,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,

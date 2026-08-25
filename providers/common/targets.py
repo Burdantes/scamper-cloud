@@ -1,4 +1,4 @@
-"""Provider-neutral preparation of immutable IPv4 campaign target sets."""
+"""Provider-neutral preparation of immutable IPv4 and IPv6 target sets."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class PreparedTarget:
 class PreparedTargets:
     trace: PreparedTarget
     rr: PreparedTarget
+    trace6: PreparedTarget | None
     do_not_probe_file: str | None
     do_not_probe_version: str | None
 
@@ -41,7 +42,12 @@ class PreparedTargets:
                 "normalized_sha256": prepared.normalized_sha256,
                 "target_count": prepared.target_count,
             }
-            for measurement, prepared in (("trace", self.trace), ("rr", self.rr))
+            for measurement, prepared in (
+                ("trace", self.trace),
+                ("rr", self.rr),
+                ("trace6", self.trace6),
+            )
+            if prepared is not None
         }
 
 
@@ -83,8 +89,12 @@ def materialize_target_source(
     return str(path)
 
 
-def load_do_not_probe_prefixes(path: str | Path) -> tuple[ipaddress.IPv4Network, ...]:
-    networks: list[ipaddress.IPv4Network] = []
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def load_do_not_probe_prefixes(path: str | Path) -> tuple[IPNetwork, ...]:
+    networks: list[IPNetwork] = []
     with Path(path).open("r", encoding="utf-8") as source:
         for line_number, line in enumerate(source, start=1):
             value = line.split("#", 1)[0].strip()
@@ -96,17 +106,19 @@ def load_do_not_probe_prefixes(path: str | Path) -> tuple[ipaddress.IPv4Network,
                 raise ValueError(
                     f"invalid do-not-probe entry on line {line_number}: {value!r}"
                 ) from error
-            if network.version != 4:
-                raise ValueError(
-                    f"non-IPv4 do-not-probe entry on line {line_number}: {value!r}"
-                )
             networks.append(network)
-    return tuple(ipaddress.collapse_addresses(networks))
+    ipv4 = ipaddress.collapse_addresses(
+        network for network in networks if network.version == 4
+    )
+    ipv6 = ipaddress.collapse_addresses(
+        network for network in networks if network.version == 6
+    )
+    return (*ipv4, *ipv6)
 
 
 def _address_is_excluded(
-    address: ipaddress.IPv4Address,
-    networks: tuple[ipaddress.IPv4Network, ...],
+    address: IPAddress,
+    networks: tuple[IPNetwork, ...],
     starts: tuple[int, ...],
 ) -> bool:
     if not networks:
@@ -120,13 +132,19 @@ def build_target_file(
     prefix: str,
     *,
     target_source: str | Path,
+    address_family: int = 4,
     max_targets: int | None = None,
-    do_not_probe_networks: tuple[ipaddress.IPv4Network, ...] = (),
+    do_not_probe_networks: tuple[IPNetwork, ...] = (),
 ) -> str:
+    if address_family not in {4, 6}:
+        raise ValueError("address_family must be 4 or 6")
     source_path = Path(target_source)
     suffix = f"-{max_targets}" if max_targets is not None else ""
     target_path = Path(log_dir) / f"{prefix}-targets{suffix}.txt"
-    starts = tuple(int(network.network_address) for network in do_not_probe_networks)
+    family_networks = tuple(
+        network for network in do_not_probe_networks if network.version == address_family
+    )
+    starts = tuple(int(network.network_address) for network in family_networks)
     written = 0
     excluded = 0
     seen: set[int] = set()
@@ -144,9 +162,10 @@ def build_target_file(
                     raise ValueError(
                         f"invalid target on source line {line_number}: {value!r}"
                     ) from error
-                if address.version != 4:
+                if address.version != address_family:
                     raise ValueError(
-                        f"non-IPv4 target on source line {line_number}: {value!r}"
+                        f"non-IPv{address_family} target on source line "
+                        f"{line_number}: {value!r}"
                     )
                 encoded = int(address)
                 if encoded in seen:
@@ -154,13 +173,15 @@ def build_target_file(
                         f"duplicate target on source line {line_number}: {address}"
                     )
                 seen.add(encoded)
-                if _address_is_excluded(address, do_not_probe_networks, starts):
+                if _address_is_excluded(address, family_networks, starts):
                     excluded += 1
                     continue
                 destination.write(f"{address}\n")
                 written += 1
     if written == 0:
-        raise ValueError(f"target source contained no IPv4 destinations: {source_path}")
+        raise ValueError(
+            f"target source contained no IPv{address_family} destinations: {source_path}"
+        )
     logger.info(
         "Created normalized target file %s with %d targets; excluded %d targets",
         target_path,
@@ -177,10 +198,12 @@ def prepare_target_sets(
     fallback_source: str,
     trace_target_source: str | None,
     rr_target_source: str | None,
-    max_targets: int | None,
-    do_not_probe_file: str | None,
+    trace6_target_source: str | None = None,
+    max_targets: int | None = None,
+    max_trace6_targets: int | None = None,
+    do_not_probe_file: str | None = None,
 ) -> PreparedTargets:
-    networks: tuple[ipaddress.IPv4Network, ...] = ()
+    networks: tuple[IPNetwork, ...] = ()
     do_not_probe_version = None
     normalized_do_not_probe_file = None
     if do_not_probe_file:
@@ -192,9 +215,13 @@ def prepare_target_sets(
         )
 
     prepared: dict[str, PreparedTarget] = {}
-    for measurement, source in (
-        ("trace", trace_target_source or fallback_source),
-        ("rr", rr_target_source or fallback_source),
+    requested_sources = (
+        ("trace", trace_target_source or fallback_source, 4, max_targets),
+        ("rr", rr_target_source or fallback_source, 4, max_targets),
+        ("trace6", trace6_target_source, 6, max_trace6_targets),
+    )
+    for measurement, source, address_family, measurement_max_targets in (
+        item for item in requested_sources if item[1] is not None
     ):
         local_source = materialize_target_source(
             source,
@@ -203,12 +230,21 @@ def prepare_target_sets(
             label=measurement,
         )
         registered = load_registered_target(Path(local_source))
+        if registered is not None and registered.address_family != address_family:
+            raise ValueError(
+                f"{measurement} requires IPv{address_family} targets, but registry "
+                f"entry {registered.target_id} is IPv{registered.address_family}"
+            )
         version = (
             registered.source_version
             if registered is not None
             else f"{Path(local_source).name}@sha256:{sha256_file(local_source)}"
         )
-        if registered is not None and max_targets is None and not networks:
+        if (
+            registered is not None
+            and measurement_max_targets is None
+            and not networks
+        ):
             normalized_file = local_source
             normalized_sha256 = registered.normalized_sha256
             count = registered.target_count
@@ -217,7 +253,8 @@ def prepare_target_sets(
                 log_dir,
                 f"{prefix}-{measurement}",
                 target_source=local_source,
-                max_targets=max_targets,
+                address_family=address_family,
+                max_targets=measurement_max_targets,
                 do_not_probe_networks=networks,
             )
             normalized_sha256 = sha256_file(normalized_file)
@@ -233,6 +270,7 @@ def prepare_target_sets(
     return PreparedTargets(
         trace=prepared["trace"],
         rr=prepared["rr"],
+        trace6=prepared.get("trace6"),
         do_not_probe_file=normalized_do_not_probe_file,
         do_not_probe_version=do_not_probe_version,
     )

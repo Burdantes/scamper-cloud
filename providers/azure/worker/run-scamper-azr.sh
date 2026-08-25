@@ -23,12 +23,19 @@
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
-  echo "$0: trace_targets [rr_targets] output_prefix bucket_name object_prefix"
+  echo "$0: trace_targets [rr_targets [trace6_targets]] output_prefix bucket_name object_prefix"
   exit 1
 fi
 
 TRACE_TARGETS="$1"
-if [[ $# -ge 5 ]]; then
+TRACE6_TARGETS=""
+if [[ $# -ge 6 ]]; then
+  RR_TARGETS="$2"
+  TRACE6_TARGETS="$3"
+  RUN_OUTPUT_PREFIX="$4"
+  BUCKET_NAME="$5"
+  OBJECT_PREFIX="$6"
+elif [[ $# -ge 5 ]]; then
   RR_TARGETS="$2"
   RUN_OUTPUT_PREFIX="$3"
   BUCKET_NAME="$4"
@@ -63,6 +70,9 @@ if [[ "${SCAMPER_SKIP_SMOKE:-0}" == "1" ]]; then
   echo "Skipping Scamper smoke test by request"
 else
   run_scamper_smoke_test azr "$TRACE_ARGS"
+  if [[ ",${SCAMPER_MEASUREMENTS:-trace,rr}," == *",trace6,"* ]]; then
+    run_scamper_smoke_test azr "$TRACE_ARGS" 6
+  fi
 fi
 
 mkdir -p "$OUTPUT_DIR"
@@ -81,9 +91,17 @@ campaign_args=(
   --rr-target-version "${SCAMPER_RR_TARGET_VERSION:-unknown}"
   --trace-rate "${SCAMPER_TRACE_RATE_PPS:-100}"
   --rr-rate "${SCAMPER_RR_RATE_PPS:-10}"
+  --trace6-rate "${SCAMPER_TRACE6_RATE_PPS:-100}"
   --rr-timeout "${SCAMPER_RR_TIMEOUT_SECONDS:-2}"
   --measurements "${SCAMPER_MEASUREMENTS:-trace,rr}"
 )
+if [[ -n "$TRACE6_TARGETS" ]]; then
+  campaign_args+=(
+    --trace6-targets "$TRACE6_TARGETS"
+    --trace6-target-source "${SCAMPER_TRACE6_TARGET_SOURCE:-$TRACE6_TARGETS}"
+    --trace6-target-version "${SCAMPER_TRACE6_TARGET_VERSION:-unknown}"
+  )
+fi
 [[ -n "${SCAMPER_PROBE_PAYLOAD_TEXT:-}" ]] && campaign_args+=(--probe-payload "$SCAMPER_PROBE_PAYLOAD_TEXT")
 [[ -n "${SCAMPER_MEASUREMENT_CONTACT:-}" ]] && campaign_args+=(--measurement-contact "$SCAMPER_MEASUREMENT_CONTACT")
 [[ -n "${SCAMPER_DO_NOT_PROBE_VERSION:-}" ]] && campaign_args+=(--do-not-probe-version "$SCAMPER_DO_NOT_PROBE_VERSION")
@@ -91,6 +109,8 @@ campaign_args=(
 [[ -n "${SCAMPER_TRACE_TARGET_SHA256:-}" ]] && campaign_args+=(--trace-target-sha256 "$SCAMPER_TRACE_TARGET_SHA256")
 [[ -n "${SCAMPER_RR_TARGET_COUNT:-}" ]] && campaign_args+=(--rr-target-count "$SCAMPER_RR_TARGET_COUNT")
 [[ -n "${SCAMPER_RR_TARGET_SHA256:-}" ]] && campaign_args+=(--rr-target-sha256 "$SCAMPER_RR_TARGET_SHA256")
+[[ -n "${SCAMPER_TRACE6_TARGET_COUNT:-}" ]] && campaign_args+=(--trace6-target-count "$SCAMPER_TRACE6_TARGET_COUNT")
+[[ -n "${SCAMPER_TRACE6_TARGET_SHA256:-}" ]] && campaign_args+=(--trace6-target-sha256 "$SCAMPER_TRACE6_TARGET_SHA256")
 
 set +e
 sudo -E /usr/bin/env python3 ./run_campaign.py "${campaign_args[@]}"

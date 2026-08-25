@@ -93,6 +93,37 @@ def test_registered_target_contract_rejects_hash_mismatch(tmp_path: Path) -> Non
         )
 
 
+def test_trace6_contract_and_command_are_ipv6_specific(tmp_path: Path) -> None:
+    module = load_runner()
+    targets = tmp_path / "targets-v6.txt"
+    targets.write_text("2606:4700:4700::1111\n", encoding="utf-8")
+
+    count, _, method = module.verify_target_contract(
+        targets,
+        expected_count=None,
+        expected_sha256=None,
+        expected_family=6,
+    )
+    command = module.measurement_command(
+        "trace6",
+        target_file=targets,
+        warts_file=tmp_path / "trace6.warts",
+        rate_pps=25,
+        rr_timeout_seconds=2,
+        payload_text="notice",
+    )
+
+    assert count == 1
+    assert method == "strict-ipv6-parse"
+    assert command[2].startswith("trace ")
+    assert " -p 6e6f74696365" in command[2]
+    (tmp_path / "targets-v4.txt").write_text("192.0.2.1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-IPv6"):
+        module.validate_and_count_targets(
+            tmp_path / "targets-v4.txt", expected_family=6
+        )
+
+
 def test_converter_streams_json_without_retaining_decoded_file(
     tmp_path: Path, monkeypatch
 ) -> None:

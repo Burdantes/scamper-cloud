@@ -433,6 +433,8 @@ def remote_campaign_command(
     rr_rate,
     rr_timeout,
     measurements,
+    trace6_target_file=None,
+    trace6_rate=100,
     probe_payload=None,
     measurement_contact=None,
     skip_smoke=False,
@@ -451,9 +453,19 @@ def remote_campaign_command(
         "SCAMPER_RR_TARGET_SHA256": targets.rr.normalized_sha256,
         "SCAMPER_TRACE_RATE_PPS": str(trace_rate),
         "SCAMPER_RR_RATE_PPS": str(rr_rate),
+        "SCAMPER_TRACE6_RATE_PPS": str(trace6_rate),
         "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
         "SCAMPER_MEASUREMENTS": ",".join(measurements),
     }
+    if targets.trace6 is not None:
+        environment.update(
+            {
+                "SCAMPER_TRACE6_TARGET_SOURCE": targets.trace6.source,
+                "SCAMPER_TRACE6_TARGET_VERSION": targets.trace6.version,
+                "SCAMPER_TRACE6_TARGET_COUNT": str(targets.trace6.target_count),
+                "SCAMPER_TRACE6_TARGET_SHA256": targets.trace6.normalized_sha256,
+            }
+        )
     if probe_payload:
         environment["SCAMPER_PROBE_PAYLOAD_TEXT"] = probe_payload
     if measurement_contact:
@@ -466,16 +478,11 @@ def remote_campaign_command(
         f"{name}={shlex.quote(value)}" for name, value in environment.items()
     )
     script = Path(settings.AWS_SCAMPER_VM_SCRIPT).name
-    arguments = " ".join(
-        shlex.quote(value)
-        for value in (
-            Path(trace_target_file).name,
-            Path(rr_target_file).name,
-            output_prefix,
-            bucket_name,
-            object_prefix,
-        )
-    )
+    argument_values = [Path(trace_target_file).name, Path(rr_target_file).name]
+    if trace6_target_file is not None:
+        argument_values.append(Path(trace6_target_file).name)
+    argument_values.extend((output_prefix, bucket_name, object_prefix))
+    arguments = " ".join(shlex.quote(value) for value in argument_values)
     return f"chmod +x {shlex.quote(script)}; {assignments} ./{shlex.quote(script)} {arguments}"
 
 
@@ -485,7 +492,119 @@ def get_regions():
     return regions
 
 
-def create_instance(region, zone, sg_id, name):
+def _ipv6_cidr_and_state(resource):
+    for association in resource.get("Ipv6CidrBlockAssociationSet", []):
+        state = association.get("Ipv6CidrBlockState", {}).get("State")
+        if state in {"associating", "associated"}:
+            return association.get("Ipv6CidrBlock"), state
+    return None, None
+
+
+def ensure_default_subnet_ipv6(region, zone, sg_id):
+    """Enable native IPv6 only for the default subnet used by a trace6 worker."""
+    client = ec2_client(region)
+    vpc_id = get_default_vpc(region)
+    vpc = client.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+    vpc_cidr, vpc_state = _ipv6_cidr_and_state(vpc)
+    if vpc_cidr is None:
+        client.associate_vpc_cidr_block(
+            VpcId=vpc_id, AmazonProvidedIpv6CidrBlock=True
+        )
+    for _ in range(30):
+        vpc = client.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+        vpc_cidr, vpc_state = _ipv6_cidr_and_state(vpc)
+        if vpc_state == "associated":
+            break
+        time.sleep(2)
+    if vpc_cidr is None or vpc_state != "associated":
+        raise RuntimeError(f"AWS did not associate an IPv6 CIDR with {vpc_id}")
+
+    subnets = client.describe_subnets(
+        Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "availability-zone", "Values": [zone]},
+            {"Name": "default-for-az", "Values": ["true"]},
+        ]
+    )["Subnets"]
+    if len(subnets) != 1:
+        raise RuntimeError(f"expected one default AWS subnet in {zone}")
+    subnet = subnets[0]
+    subnet_cidr, subnet_state = _ipv6_cidr_and_state(subnet)
+    if subnet_cidr is None:
+        all_subnets = client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        )["Subnets"]
+        used = {
+            cidr
+            for candidate in all_subnets
+            if (cidr := _ipv6_cidr_and_state(candidate)[0]) is not None
+        }
+        candidates = list(ipaddress.ip_network(vpc_cidr).subnets(new_prefix=64))
+        start = int.from_bytes(hashlib.sha256(zone.encode("ascii")).digest()[:2], "big")
+        selected = next(
+            (
+                str(candidates[(start + offset) % len(candidates)])
+                for offset in range(len(candidates))
+                if str(candidates[(start + offset) % len(candidates)]) not in used
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"no IPv6 /64 remains in AWS VPC {vpc_id}")
+        client.associate_subnet_cidr_block(
+            SubnetId=subnet["SubnetId"], Ipv6CidrBlock=selected
+        )
+    for _ in range(30):
+        subnet = client.describe_subnets(SubnetIds=[subnet["SubnetId"]])["Subnets"][0]
+        subnet_cidr, subnet_state = _ipv6_cidr_and_state(subnet)
+        if subnet_state == "associated":
+            break
+        time.sleep(2)
+    if subnet_cidr is None or subnet_state != "associated":
+        raise RuntimeError(
+            f"AWS did not associate an IPv6 /64 with subnet {subnet['SubnetId']}"
+        )
+
+    route_tables = client.describe_route_tables(
+        Filters=[{"Name": "association.subnet-id", "Values": [subnet["SubnetId"]]}]
+    )["RouteTables"]
+    if not route_tables:
+        route_tables = client.describe_route_tables(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "association.main", "Values": ["true"]},
+            ]
+        )["RouteTables"]
+    gateways = client.describe_internet_gateways(
+        Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+    )["InternetGateways"]
+    if not route_tables or not gateways:
+        raise RuntimeError(f"AWS default VPC {vpc_id} lacks a route table or gateway")
+    route_table = route_tables[0]
+    if not any(route.get("DestinationIpv6CidrBlock") == "::/0" for route in route_table["Routes"]):
+        client.create_route(
+            RouteTableId=route_table["RouteTableId"],
+            DestinationIpv6CidrBlock="::/0",
+            GatewayId=gateways[0]["InternetGatewayId"],
+        )
+
+    group = client.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+    has_ipv6_egress = any(
+        item.get("CidrIpv6") == "::/0"
+        for permission in group.get("IpPermissionsEgress", [])
+        for item in permission.get("Ipv6Ranges", [])
+    )
+    if not has_ipv6_egress:
+        client.authorize_security_group_egress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {"IpProtocol": "-1", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]}
+            ],
+        )
+    return subnet["SubnetId"]
+
+
+def create_instance(region, zone, sg_id, name, ipv6_enabled=False):
     logging.info("Creating Instance in %s with security group %s", region, sg_id)
     ec2 = ec2_resource(region)
     client = ec2_client(region)
@@ -504,6 +623,19 @@ def create_instance(region, zone, sg_id, name):
 
     for type in instance_types:
         try:
+            network_options = {}
+            if ipv6_enabled:
+                network_options["NetworkInterfaces"] = [
+                    {
+                        "DeviceIndex": 0,
+                        "SubnetId": ensure_default_subnet_ipv6(region, zone, sg_id),
+                        "Groups": [sg_id],
+                        "AssociatePublicIpAddress": True,
+                        "Ipv6AddressCount": 1,
+                    }
+                ]
+            else:
+                network_options["SecurityGroupIds"] = [sg_id]
             instance = ec2.create_instances(
                 ImageId=ami_id,
                 MinCount=1,
@@ -525,8 +657,8 @@ def create_instance(region, zone, sg_id, name):
                         ]
                     },
                 ],
-                SecurityGroupIds=[sg_id],
-                Placement={'AvailabilityZone': zone}
+                Placement={'AvailabilityZone': zone},
+                **network_options,
             )[0]
             break
         except Exception as err:
@@ -767,7 +899,9 @@ def write_run_manifest(
     started_at,
     complete,
     failure,
+    trace6_rate=None,
 ):
+    trace6_rate = trace_rate if trace6_rate is None else trace6_rate
     manifest_path = Path(log_dir) / "manifest.json"
     manifest = {
         "schema_version": 1,
@@ -784,10 +918,15 @@ def write_run_manifest(
         "do_not_probe_version": do_not_probe_version,
         "regions": list(regions) if regions else "all-enabled-regions",
         "measurements": list(measurements),
+        "trace_rate_pps": trace_rate,
+        "trace6_rate_pps": trace6_rate,
+        "rr_rate_pps": rr_rate,
+        "rr_timeout_seconds": rr_timeout,
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "commands": {
             "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
+            "trace6": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace6_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace6.warts -O warts",
             "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
         },
         "nodes": nodes,
@@ -802,15 +941,18 @@ def run_aws_scamper(
     prefix,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -818,6 +960,8 @@ def run_aws_scamper(
     do_not_probe_file=None,
     skip_smoke=False,
 ):
+    if "trace6" in measurements and not trace6_target_source:
+        raise ValueError("trace6_target_source is required when trace6 is enabled")
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(os.path.join(log_dir, f"{prefix}.log"))
     fh.setFormatter(formatter)
@@ -846,10 +990,14 @@ def run_aws_scamper(
         fallback_source=target_source,
         trace_target_source=trace_target_source,
         rr_target_source=rr_target_source,
+        trace6_target_source=trace6_target_source,
         max_targets=max_targets,
+        max_trace6_targets=max_trace6_targets,
         do_not_probe_file=do_not_probe_file,
     )
     target_files = [targets.trace.normalized_file, targets.rr.normalized_file]
+    if targets.trace6 is not None:
+        target_files.append(targets.trace6.normalized_file)
 
     instances = []
     logs = {}
@@ -884,7 +1032,13 @@ def run_aws_scamper(
                     'region': region,
                 }
                 try:
-                    instance = create_instance(region, zone, sg_id, name)
+                    create_arguments = (region, zone, sg_id, name)
+                    if "trace6" in measurements:
+                        instance = create_instance(
+                            *create_arguments, ipv6_enabled=True
+                        )
+                    else:
+                        instance = create_instance(*create_arguments)
                 except Exception as err:
                     logging.exception("No instance was created in %s %s due to %s", region, zone, err)
                     continue
@@ -955,6 +1109,12 @@ def run_aws_scamper(
             node_manifest["status_object"] = (
                 f"{node_object_prefix}/{output_prefix}.status.json"
             )
+            trace6_options = {}
+            if targets.trace6 is not None:
+                trace6_options = {
+                    "trace6_target_file": targets.trace6.normalized_file,
+                    "trace6_rate": trace6_rate,
+                }
             cmd = remote_campaign_command(
                 targets.trace.normalized_file,
                 targets.rr.normalized_file,
@@ -971,6 +1131,7 @@ def run_aws_scamper(
                 probe_payload=probe_payload,
                 measurement_contact=measurement_contact,
                 skip_smoke=skip_smoke,
+                **trace6_options,
             )
 
             processes.append((subprocess.Popen(["ssh", "-i", settings.AWS_SCAMPER_SSH_KEY, "-oStrictHostKeyChecking=no",
@@ -1014,6 +1175,7 @@ def run_aws_scamper(
                     started_at=campaign_started_at,
                     complete=campaign_complete,
                     failure=campaign_failure,
+                    trace6_rate=trace6_rate,
                 )
                 send_to_cloud_storage(
                     manifest_path,
@@ -1029,15 +1191,18 @@ def build_plan(
     log_dir,
     max_instances=None,
     max_targets=None,
+    max_trace6_targets=None,
     *,
     target_source=None,
     trace_target_source=None,
     rr_target_source=None,
+    trace6_target_source=None,
     bucket_name=None,
     object_prefix=None,
     regions=None,
     trace_rate=100,
     rr_rate=10,
+    trace6_rate=100,
     rr_timeout=2.0,
     measurements=("trace", "rr"),
     probe_payload=None,
@@ -1058,6 +1223,11 @@ def build_plan(
         "target_sets": {
             "trace": trace_target_source or target_source or settings.SCAMPER_IP_DST,
             "rr": rr_target_source or target_source or settings.SCAMPER_IP_DST,
+            **(
+                {"trace6": trace6_target_source}
+                if trace6_target_source is not None
+                else {}
+            ),
         },
         "do_not_probe_file": do_not_probe_file,
         "vm_script": settings.AWS_SCAMPER_VM_SCRIPT,
@@ -1067,16 +1237,19 @@ def build_plan(
         "instance_types": instance_types,
         "max_instances": max_instances,
         "max_targets": max_targets,
+        "max_trace6_targets": max_trace6_targets,
         "regions": list(regions) if regions else "all-enabled-regions",
         "measurements": list(measurements),
         "trace_rate_pps": trace_rate,
         "rr_rate_pps": rr_rate,
+        "trace6_rate_pps": trace6_rate,
         "rr_timeout_seconds": rr_timeout,
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "skip_smoke": skip_smoke,
         "commands": {
             "trace": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace.warts -O warts",
+            "trace6": f"scamper -c 'trace -m 20 -g 8 -w 3 -q 2 -P ICMP' -p {trace6_rate} -f SHUFFLED_TARGETS -o OUTPUT.trace6.warts -O warts",
             "rr": f"scamper -c 'ping -P icmp-echo -R -c 1 -W {rr_timeout:g}' -p {rr_rate} -f SHUFFLED_TARGETS -o OUTPUT.rr.warts -O warts",
         },
         "remote_timeout_seconds": aws_timeout_seconds("SCAMPER_AWS_SCAMPER_TIMEOUT_SECONDS", 14400),
@@ -1101,6 +1274,7 @@ def main(argv=None):
         type=positive_int,
         help="copy only the first N targets into a canary target file",
     )
+    parser.add_argument("--max-trace6-targets", type=positive_int)
     parser.add_argument(
         "--target-source",
         default=settings.SCAMPER_IP_DST,
@@ -1108,6 +1282,7 @@ def main(argv=None):
     )
     parser.add_argument("--trace-target-source")
     parser.add_argument("--rr-target-source")
+    parser.add_argument("--trace6-target-source")
     parser.add_argument(
         "--bucket-name",
         help=f"GCS bucket for all runs (default: {settings.SCAMPER_RESULTS_BUCKET})",
@@ -1130,6 +1305,7 @@ def main(argv=None):
     )
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--trace6-rate", type=positive_int, default=100)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
     parser.add_argument("--probe-payload", type=probe_payload_text)
     parser.add_argument("--measurement-contact")
@@ -1147,11 +1323,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    unsupported_measurements = set(args.measurements) - {"trace", "rr"}
+    unsupported_measurements = set(args.measurements) - {"trace", "trace6", "rr"}
     if unsupported_measurements:
         parser.error(
             "unsupported measurements: " + ", ".join(sorted(unsupported_measurements))
         )
+    if "trace6" in args.measurements and not args.trace6_target_source:
+        parser.error("--trace6-target-source is required when trace6 is enabled")
 
     if args.list_regions:
         print(json.dumps({"regions": get_regions()}, indent=2))
@@ -1164,14 +1342,17 @@ def main(argv=None):
         log_dir,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,
@@ -1191,14 +1372,17 @@ def main(argv=None):
         prefix,
         max_instances=args.max_instances,
         max_targets=args.max_targets,
+        max_trace6_targets=args.max_trace6_targets,
         target_source=args.target_source,
         trace_target_source=args.trace_target_source,
         rr_target_source=args.rr_target_source,
+        trace6_target_source=args.trace6_target_source,
         bucket_name=args.bucket_name,
         object_prefix=args.object_prefix,
         regions=args.regions,
         trace_rate=args.trace_rate,
         rr_rate=args.rr_rate,
+        trace6_rate=args.trace6_rate,
         rr_timeout=args.rr_timeout,
         measurements=args.measurements,
         probe_payload=args.probe_payload,

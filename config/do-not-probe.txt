@@ -1,2 +1,2 @@
-# IPv4 addresses and CIDR prefixes whose owners requested exclusion.
+# IPv4 or IPv6 addresses and CIDR prefixes whose owners requested exclusion.
 # Add one address or prefix per line, then use --do-not-probe-file.
