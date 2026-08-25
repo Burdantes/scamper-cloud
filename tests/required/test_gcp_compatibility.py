@@ -250,6 +250,15 @@ def test_verify_standard_network_tier_rejects_premium_configuration(
         gcp.verify_standard_network_tier([])
 
 
+def test_controller_ssh_cidr_is_restricted_to_one_ipv4_address(monkeypatch) -> None:
+    monkeypatch.setenv("SCAMPER_GCP_SSH_CIDR", "203.0.113.9")
+    assert gcp.controller_ssh_cidr() == "203.0.113.9/32"
+
+    monkeypatch.setenv("SCAMPER_GCP_SSH_CIDR", "0.0.0.0/0")
+    with pytest.raises(ValueError, match="controller's IPv4 /32"):
+        gcp.controller_ssh_cidr()
+
+
 def test_build_target_file_extracts_tsv_and_full_validation(tmp_path: Path) -> None:
     source = tmp_path / "targets.tsv"
     source.write_text(

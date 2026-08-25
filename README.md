@@ -47,6 +47,8 @@ and public IP inside the run's disposable resource group. GCP's IPv4 traffic
 remains on the configured tier, so record the IPv6 Premium-tier difference when
 comparing provider paths. The GCP network/subnets and AWS VPC/subnet IPv6
 associations persist for reuse; Azure networking is deleted with the run.
+The GCP managed VPC's SSH rule is limited to the controller's public IPv4 `/32`,
+read from VM metadata or overridden with `SCAMPER_GCP_SSH_CIDR`.
 
 ## Supported experiments
 

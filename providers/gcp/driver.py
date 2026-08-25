@@ -787,6 +787,32 @@ def wait_region_operation(project, region, operation):
     return result
 
 
+def controller_ssh_cidr():
+    value = os.environ.get("SCAMPER_GCP_SSH_CIDR", "").strip()
+    if not value:
+        request = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            "network-interfaces/0/access-configs/0/external-ip",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                value = response.read().decode("ascii").strip()
+        except Exception as error:
+            raise RuntimeError(
+                "could not determine controller IPv4; set SCAMPER_GCP_SSH_CIDR"
+            ) from error
+    if "/" not in value:
+        value = f"{value}/32"
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as error:
+        raise ValueError("SCAMPER_GCP_SSH_CIDR must be a valid IPv4 /32") from error
+    if network.version != 4 or network.prefixlen != 32:
+        raise ValueError("SCAMPER_GCP_SSH_CIDR must be the controller's IPv4 /32")
+    return str(network)
+
+
 def ensure_dual_stack_subnetwork(project, region):
     """Create or reuse the controller-managed native dual-stack measurement subnet."""
     from googleapiclient.errors import HttpError
@@ -817,9 +843,7 @@ def ensure_dual_stack_subnetwork(project, region):
                 "name": firewall_name,
                 "network": f"global/networks/{network_name}",
                 "direction": "INGRESS",
-                "sourceRanges": [
-                    os.environ.get("SCAMPER_GCP_SSH_CIDR", "0.0.0.0/0")
-                ],
+                "sourceRanges": [controller_ssh_cidr()],
                 "targetTags": ["scamper-worker"],
                 "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
             },

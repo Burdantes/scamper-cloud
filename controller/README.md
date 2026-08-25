@@ -90,6 +90,8 @@ account, create/read/write the configured GCS bucket, and read zones/images.
 Controller and worker external IPv4 addresses remain explicitly `STANDARD`
 network tier. GCP external IPv6 is necessarily `PREMIUM`; the run manifest must
 be used when interpreting this path-selection difference.
+The managed dual-stack VPC allows SSH only from the controller public IPv4
+`/32`, derived from VM metadata or explicitly set as `SCAMPER_GCP_SSH_CIDR`.
 
 The registry lives under
 `/var/lib/scamper-controller/target-registry/sha256/<source-sha256>/`. Deploying
