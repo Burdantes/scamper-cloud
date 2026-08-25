@@ -9,8 +9,9 @@ results.
 1. `scamperctl/` is the provider-neutral command-line control plane. It stores
    run inventory, provisions and destroys workers, deploys experiments, and
    collects artifacts.
-2. `controller/` is the persistent GCP-hosted scheduler. A laptop submits a
-   campaign, then may disconnect; the controller owns worker lifecycle. Its
+2. `controller/` is the persistent GCP-hosted, multi-cloud scheduler. A laptop
+   submits a GCP, AWS, or Azure campaign, then may disconnect; the controller
+   owns worker lifecycle. Its
    persistent content-addressed target registry receives each immutable target
    population from the laptop once. Later runs refer to the source SHA-256 ID.
 3. `experiments/scamper_v4_scanning/` defines IPv4 ICMP traceroute.
@@ -39,12 +40,23 @@ OS and Python dependencies live in the custom GCP worker image; experiment
 scripts and per-run configuration are still deployed by the controller so
 ordinary experiment changes do not require rebuilding the image.
 
-## Compatibility layer
+## Provider boundary
 
-`legacy/providers/` contains the older direct provider drivers. The persistent
-controller temporarily uses the GCP driver while its lifecycle operations are
-migrated onto `scamperctl`. AWS and Azure drivers are unsupported compatibility
-code and are not part of required CI.
+`providers/` contains the supported GCP, AWS, and Azure campaign drivers. Every
+driver accepts the same controller contract: distinct traceroute and RR target
+sets, region selection, measurement rates, probe/contact metadata, exclusions,
+smoke testing, instance caps, immutable artifacts, and cleanup. Required CI
+passes the exact controller-generated command through every provider parser.
+
+`legacy/providers/` contains historical implementations only. Production code,
+the controller, and required tests must not import them.
+
+The AWS boundary uses workload federation rather than stored IAM access keys.
+The GCP VM metadata identity is exchanged through STS for a one-hour role
+session on demand. AWS regions are explicit and pass account, role, VPC, subnet,
+key-pair, security-group, image, instance-type, and zone checks before monthly
+dispatch. The controller's reserved public IP is the sole SSH ingress source;
+workers are tagged and always terminated in the driver's cleanup path.
 
 ## Boundary with analysis
 

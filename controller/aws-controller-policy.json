@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiscoverRegionalCapacity",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeKeyPairs",
+        "ec2:DescribeRegions",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageEphemeralWorkers",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateTags",
+        "ec2:ImportKeyPair",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {"aws:RequestedRegion": ["us-east-1"]}
+      }
+    }
+  ]
+}

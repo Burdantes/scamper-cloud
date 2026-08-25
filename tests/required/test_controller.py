@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from pathlib import Path
 
 from controller import manage, submit
@@ -110,6 +111,24 @@ def test_manage_submit_accepts_registered_target_ids() -> None:
     assert args.rr_target_id == f"sha256:{digest}"
 
 
+def test_schedule_status_fails_when_readiness_check_fails(
+    monkeypatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    monkeypatch.setattr(
+        manage,
+        "run",
+        lambda command, apply: captured.append(command),
+    )
+
+    manage.main(["schedule-status", "--apply"])
+
+    remote = captured[0][captured[0].index("--command") + 1]
+    assert "monthly check && sudo systemctl status" in remote
+    assert "monthly check;" not in remote
+
+
 def test_gcp_artifact_contract_keeps_raw_output_without_full_jsonl() -> None:
     artifacts = expected_campaign_artifacts(
         "runs/test/nodes/us-east1/node", "node-192.0.2.1", ("trace", "rr")
@@ -145,6 +164,112 @@ def test_submit_dispatches_the_requested_provider() -> None:
     assert 'driver_module("gcp")' not in source
 
 
+def test_every_provider_accepts_the_exact_controller_command(capsys) -> None:
+    """A module name in a command is insufficient; its parser must accept the rest."""
+    from controller import submit
+    from providers import DRIVER_MODULES
+
+    for provider, module_name in sorted(DRIVER_MODULES.items()):
+        args = argparse.Namespace(
+            provider=provider,
+            run_id=f"contract-{provider}",
+            trace_targets=Path("/trace.targets"),
+            rr_targets=Path("/rr.targets"),
+            bucket="results",
+            object_prefix=None,
+            regions=None,
+            worker_machine_type="size-x",
+            worker_image_project=None,
+            worker_image_family=None,
+            measurements="trace,rr",
+            max_instances=1,
+            max_targets=10,
+            trace_rate=100,
+            rr_rate=10,
+            rr_timeout=2.0,
+            probe_payload="Academic measurement",
+            measurement_contact="research@example.edu",
+            do_not_probe_file=Path("/do-not-probe.txt"),
+            skip_smoke=False,
+        )
+        command = submit.campaign_command(args, Path("/tmp/job"))
+        driver_argv = [argument for argument in command[3:] if argument != "--apply"]
+        module = importlib.import_module(module_name)
+        assert module.main(driver_argv) == 0
+        capsys.readouterr()
+
+
+def test_manage_submit_exposes_provider_and_provider_native_defaults() -> None:
+    from controller import manage
+
+    for provider in ("gcp", "aws", "azure"):
+        args = manage.build_parser().parse_args(
+            [
+                "submit",
+                "--provider",
+                provider,
+                "--run-id",
+                "test-run",
+                "--trace-target-id",
+                "sha256:" + "1" * 64,
+                "--rr-target-id",
+                "sha256:" + "2" * 64,
+            ]
+        )
+        assert args.provider == provider
+        assert args.worker_machine_type is None
+        assert args.regions is None
+
+
+def test_manage_runs_controller_submit_as_module_from_release_root() -> None:
+    args = manage.build_parser().parse_args(
+        [
+            "submit",
+            "--apply",
+            "--provider",
+            "azure",
+            "--run-id",
+            "test-run",
+            "--trace-target-id",
+            "sha256:" + "1" * 64,
+            "--rr-target-id",
+            "sha256:" + "2" * 64,
+        ]
+    )
+
+    remote = manage.controller_submission_command(
+        args,
+        Path("/registry/trace.targets.txt"),
+        Path("/registry/rr.targets.txt"),
+        "/var/lib/scamper-controller/targets/test-run",
+    )
+
+    assert remote.startswith("cd /opt/scamper-cloud/current && sudo ")
+    assert "python -m controller.submit" in remote
+    assert "controller/submit.py" not in remote
+
+
+def test_controller_deploy_tests_staged_release_before_activation() -> None:
+    root = Path(__file__).resolve().parents[2]
+    bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
+
+    test_index = bootstrap.index("-m pytest tests/required")
+    activate_index = bootstrap.index('ln -sfn "${release_dir}" "${install_root}/current"')
+    assert test_index < activate_index
+    assert "requirements-test.txt" in bootstrap
+    assert "bundle SHA-256 mismatch" in bootstrap
+    assert "release.json" in bootstrap
+
+
+def test_deploy_never_enables_a_monthly_schedule_without_prior_operator_approval() -> None:
+    root = Path(__file__).resolve().parents[2]
+    bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
+
+    assert "timer_was_enabled=false" in bootstrap
+    assert '[[ "${timer_was_enabled}" == true ]]' in bootstrap
+    assert "operator action after regional preparation and live provider canaries" in bootstrap
+
+
 def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -> None:
     """Measurements must come from the controller, which owns the job record.
 
@@ -166,7 +291,8 @@ def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -
 
     # On a real controller both roots exist.
     install, state = tmp_path / "opt", tmp_path / "state"
-    install.mkdir(); state.mkdir()
+    install.mkdir()
+    state.mkdir()
     monkeypatch.setattr(submit, "INSTALL_ROOT", install)
     monkeypatch.setattr(submit, "STATE_ROOT", state)
     assert submit.assert_controller_origin() == "controller"
@@ -232,7 +358,7 @@ def test_provider_credentials_are_not_generated_or_committed() -> None:
     assert "/etc/scamper-controller-secrets.env" in runner
     # ...and bootstrap only ever leaves a commented template, locked down.
     assert "chmod 0600 /etc/scamper-controller-secrets.env" in bootstrap
-    for secret in ("AZURE_CLIENT_SECRET=", "AWS_SECRET_ACCESS_KEY="):
+    for secret in ("AZURE_CLIENT_SECRET=",):
         # Present only as a commented placeholder, never assigned a value.
         for line in bootstrap.splitlines():
             if secret in line:
@@ -251,8 +377,12 @@ def test_secrets_file_is_readable_by_the_controller_user() -> None:
     ).read_text(encoding="utf-8")
 
     chown_line = next(
-        (l for l in bootstrap.splitlines()
-         if "chown" in l and "secrets.env" in l), None
+        (
+            line
+            for line in bootstrap.splitlines()
+            if "chown" in line and "secrets.env" in line
+        ),
+        None,
     )
     assert chown_line, "secrets file must be chown'd to the controller user"
     assert "${controller_user}" in chown_line
@@ -272,7 +402,14 @@ def test_bootstrap_points_every_provider_at_the_controllers_own_key() -> None:
     ).read_text(encoding="utf-8")
 
     for variable in ("GCP_SCAMPER_SSH_KEY", "AWS_SCAMPER_SSH_KEY", "AZR_SCAMPER_SSH_KEY"):
-        line = next((l for l in bootstrap.splitlines() if l.startswith(f"{variable}=")), None)
+        line = next(
+            (
+                candidate
+                for candidate in bootstrap.splitlines()
+                if candidate.startswith(f"{variable}=")
+            ),
+            None,
+        )
         assert line, f"{variable} must be written into the controller environment"
         assert "${state_root}/ssh/id_ed25519" in line, line
         assert "credentials/" not in line, f"{variable} must not use a repo-local path"

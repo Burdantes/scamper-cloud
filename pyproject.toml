@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scamperctl"
 version = "0.3.0"
-description = "Provision GCP measurement VMs and deploy containerized experiments"
+description = "Orchestrate reproducible cloud measurements across GCP, AWS, and Azure"
 readme = "README.md"
 requires-python = ">=3.10"
 

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+source /etc/scamper-controller.env
+if [[ -r /etc/scamper-controller-secrets.env ]]; then
+  source /etc/scamper-controller-secrets.env
+fi
+set +a
+cd /opt/scamper-cloud/current
+exec /opt/scamper-cloud/current/.venv/bin/python -m controller.aws_setup "$@"
