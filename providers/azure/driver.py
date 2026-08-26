@@ -38,6 +38,12 @@ INIT_CMD = ["scp", "-i", settings.AZR_SCAMPER_SSH_KEY,
             settings.SCAMPER_UPLOAD_SCRIPT]
 RESOURCE_GROUP_NAME = "azr-scamper"
 PRIVATE_IP = "10.0.0.4"
+# Azure's documented dual-stack VM topology uses a globally scoped IPv6
+# address space for the VNet and a /64 for each IPv6 subnet.  A ULA prefix is
+# accepted by the control plane, but it does not provide Internet IPv6 egress
+# for an instance-level public IPv6 address.
+IPV6_VNET_PREFIX = "2404:f800:8000:122::/63"
+IPV6_SUBNET_PREFIX = "2404:f800:8000:122::/64"
 credential = None
 network_client = None
 resource_client = None
@@ -592,7 +598,7 @@ def create_vnet(rg_name, location, vnet_name, ipv6_enabled=False):
             properties=VirtualNetworkPropertiesFormat(
                 address_space=AddressSpace(
                     address_prefixes=["10.0.0.0/24"]
-                    + (["fd00:5ca1:1000::/64"] if ipv6_enabled else [])
+                    + ([IPV6_VNET_PREFIX] if ipv6_enabled else [])
                 ),
             ),
         ),
@@ -611,14 +617,14 @@ def create_subnet(rg_name, vnet_name, subnet_name, ipv6_enabled=False):
         Subnet(
             properties=SubnetPropertiesFormat(
                 address_prefixes=["10.0.0.0/28"]
-                + (["fd00:5ca1:1000::/64"] if ipv6_enabled else [])
+                + ([IPV6_SUBNET_PREFIX] if ipv6_enabled else [])
             ),
         ),
     )
     subnet_result = poller.result()
     return subnet_result
 
-def create_nsg(rg_name,location,  nsg_name):
+def create_nsg(rg_name, location, nsg_name, ipv6_enabled=False):
     from azure.mgmt.network.models import NetworkSecurityGroup
     from azure.mgmt.network.models import NetworkSecurityGroupPropertiesFormat
     from azure.mgmt.network.models import SecurityRule
@@ -637,6 +643,28 @@ def create_nsg(rg_name,location,  nsg_name):
                 priority=100,
                 direction="Inbound",
             ),
+        ),
+        *(
+            [
+                SecurityRule(
+                    name="AllowIPv6ForGuestICMP",
+                    properties=SecurityRulePropertiesFormat(
+                        source_address_prefix="Internet",
+                        source_port_range="*",
+                        destination_address_prefix=IPV6_SUBNET_PREFIX,
+                        destination_port_range="*",
+                        # Azure NSGs cannot match ICMPv6 with the Icmp
+                        # protocol selector. The worker installs a guest
+                        # firewall before probing.
+                        protocol="*",
+                        access="Allow",
+                        priority=105,
+                        direction="Inbound",
+                    ),
+                )
+            ]
+            if ipv6_enabled
+            else []
         ),
         SecurityRule(
             name="SSH",
@@ -812,7 +840,9 @@ def launch_location(run_info):
         )
         logging.info("Created %s", subnet_name)
 
-        nsg_result = create_nsg(rg_name,location, nsg_name)
+        nsg_result = create_nsg(
+            rg_name, location, nsg_name, ipv6_enabled=ipv6_enabled
+        )
         logging.info("Created %s", nsg_name)
 
         ni_result = create_network_interface(

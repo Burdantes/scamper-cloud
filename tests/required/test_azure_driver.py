@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from providers.azure import driver as azr
 
@@ -43,6 +45,95 @@ class FakeProcess:
 
     def kill(self) -> None:
         self.killed = True
+
+
+class ResultPoller:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def result(self) -> object:
+        return self._result
+
+
+def test_dual_stack_network_uses_internet_routable_ipv6_prefixes(
+    monkeypatch,
+) -> None:
+    requests: dict[str, object] = {}
+
+    class VirtualNetworks:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["vnet"] = parameters
+            return ResultPoller(parameters)
+
+    class Subnets:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            vnet_name: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["subnet"] = parameters
+            return ResultPoller(parameters)
+
+    client = SimpleNamespace(
+        virtual_networks=VirtualNetworks(),
+        subnets=Subnets(),
+    )
+    monkeypatch.setattr(azr, "get_network_client", lambda: client)
+
+    azr.create_vnet("run", "eastus", "vnet", ipv6_enabled=True)
+    azr.create_subnet("run", "vnet", "subnet", ipv6_enabled=True)
+
+    vnet = requests["vnet"]
+    subnet = requests["subnet"]
+    assert vnet.properties.address_space.address_prefixes == [
+        "10.0.0.0/24",
+        azr.IPV6_VNET_PREFIX,
+    ]
+    assert subnet.properties.address_prefixes == [
+        "10.0.0.0/28",
+        azr.IPV6_SUBNET_PREFIX,
+    ]
+    assert ipaddress.ip_network(azr.IPV6_VNET_PREFIX).is_global
+    assert ipaddress.ip_network(azr.IPV6_SUBNET_PREFIX).is_global
+    assert ipaddress.ip_network(azr.IPV6_SUBNET_PREFIX).prefixlen == 64
+
+
+def test_dual_stack_nsg_scopes_any_protocol_workaround_to_ipv6_subnet(
+    monkeypatch,
+) -> None:
+    requests: dict[str, object] = {}
+
+    class NetworkSecurityGroups:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["nsg"] = parameters
+            return ResultPoller(parameters)
+
+    client = SimpleNamespace(network_security_groups=NetworkSecurityGroups())
+    monkeypatch.setattr(azr, "get_network_client", lambda: client)
+
+    azr.create_nsg("run", "eastus", "nsg", ipv6_enabled=True)
+
+    nsg = requests["nsg"]
+    rules = {rule.name: rule.properties for rule in nsg.properties.security_rules}
+    workaround = rules["AllowIPv6ForGuestICMP"]
+    assert workaround.protocol == "*"
+    assert workaround.source_address_prefix == "Internet"
+    assert workaround.destination_address_prefix == azr.IPV6_SUBNET_PREFIX
+    assert workaround.direction == "Inbound"
+    assert workaround.access == "Allow"
+    assert rules["AllowICMP"].protocol == "Icmp"
 
 
 def test_run_azr_scamper_caps_instances_targets_and_cleans_up(

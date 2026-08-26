@@ -38,6 +38,55 @@ def test_smoke_targets_use_gcp_specific_canary() -> None:
     assert result.stdout.splitlines() == ["1.1.1.1", "8.8.8.8", "8.8.8.8"]
 
 
+def test_ipv6_network_diagnostics_report_addresses_routes_and_public_ip(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ip = fake_bin / "ip"
+    fake_ip.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  '-6 address show') echo 'inet6 2001:db8::4/64 scope global' ;;\n"
+        "  '-6 route show table all') echo 'default via fe80::1 dev eth0' ;;\n"
+        "  '-6 route get 2606:4700:4700::1111') "
+        "echo '2606:4700:4700::1111 via fe80::1 src 2001:db8::4' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ip.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text("#!/bin/sh\necho '2001:db8::ffff'\n", encoding="utf-8")
+    fake_curl.chmod(0o755)
+
+    result = run_bash(
+        f"PATH={fake_bin}:$PATH; source {SMOKE_SCRIPT}; "
+        "log_ipv6_network_state 2606:4700:4700::1111"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "inet6 2001:db8::4/64 scope global" in result.stdout
+    assert "default via fe80::1 dev eth0" in result.stdout
+    assert "via fe80::1 src 2001:db8::4" in result.stdout
+    assert "IPv6 public address check:\n2001:db8::ffff" in result.stdout
+
+
+def test_azure_ipv6_guest_firewall_allows_icmp_and_drops_other_input() -> None:
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    function = script.split(
+        "configure_azure_ipv6_measurement_firewall() {", 1
+    )[1].split("\n}", 1)[0]
+
+    assert "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" in function
+    assert "-p ipv6-icmp -j ACCEPT" in function
+    assert "ip6tables -P INPUT DROP" in function
+    assert function.index("-p ipv6-icmp -j ACCEPT") < function.index(
+        "ip6tables -P INPUT DROP"
+    )
+    assert '[[ "$provider" == "azr" ]]' in script
+
+
 def test_validate_scamper_smoke_text_accepts_reasonable_trace(tmp_path: Path) -> None:
     trace_text = tmp_path / "trace.txt"
     trace_text.write_text(
@@ -80,6 +129,34 @@ def test_validate_scamper_smoke_text_rejects_incomplete_trace(tmp_path: Path) ->
 
     assert result.returncode == 1
     assert "expected at least 2" in result.stderr
+
+
+def test_validate_scamper_smoke_text_rejects_unanswered_hops(tmp_path: Path) -> None:
+    trace_text = tmp_path / "trace6.txt"
+    trace_text.write_text(
+        "\n".join(
+            [
+                "traceroute from fd00:5ca1:1000::4 to 2606:4700:4700::1111",
+                " 1  *",
+                " 2  *",
+                " 3  *",
+                " 4  *",
+                " 5  *",
+                " 6  *",
+                " 7  *",
+                " 8  *",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_bash(
+        f"source {SMOKE_SCRIPT}; "
+        f"validate_scamper_smoke_text {trace_text} 2606:4700:4700::1111 2"
+    )
+
+    assert result.returncode == 1
+    assert "traceroute had 0 hops" in result.stderr
 
 
 def test_vm_scripts_are_valid_bash() -> None:
