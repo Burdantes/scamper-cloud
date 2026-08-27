@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,18 +29,21 @@ def write_config(path: Path, *, enabled: bool = True) -> Path:
                 "worker_machine_type": "e2-micro",
                 "max_instances": 1,
                 "max_targets": None,
+                "campaign_timeout_seconds": 172800,
             },
             "aws": {
                 "regions": ["us-east-1"],
                 "worker_machine_type": "t3.micro",
                 "max_instances": 1,
                 "max_targets": None,
+                "campaign_timeout_seconds": 86400,
             },
             "azure": {
                 "regions": ["eastus"],
                 "worker_machine_type": "Standard_B2ts_v2",
                 "max_instances": 1,
                 "max_targets": None,
+                "campaign_timeout_seconds": 86400,
             },
         },
     }
@@ -58,10 +62,16 @@ def test_schedule_requires_every_supported_provider(tmp_path: Path) -> None:
         monthly.load_schedule(path)
 
 
-def test_schedule_has_positive_cost_caps_and_distinct_target_ids(tmp_path: Path) -> None:
+def test_schedule_has_positive_cost_caps_and_distinct_target_ids(
+    tmp_path: Path,
+) -> None:
     schedule = monthly.load_schedule(write_config(tmp_path / "monthly.json"))
 
-    assert {provider.provider for provider in schedule.providers} == {"gcp", "aws", "azure"}
+    assert {provider.provider for provider in schedule.providers} == {
+        "gcp",
+        "aws",
+        "azure",
+    }
     assert all(provider.max_instances == 1 for provider in schedule.providers)
     assert schedule.trace_target_id != schedule.rr_target_id
 
@@ -87,7 +97,106 @@ def test_schema_two_accepts_trace6_with_an_independent_cap(tmp_path: Path) -> No
     assert schedule.trace6_target_id == "sha256:" + "3" * 64
     assert arguments[arguments.index("--trace6-rate") + 1] == "250"
     assert arguments[arguments.index("--max-trace6-targets") + 1] == "1000"
+    assert arguments[arguments.index("--campaign-timeout-seconds") + 1] == str(
+        schedule.providers[0].campaign_timeout_seconds
+    )
     assert "--trace6-targets" in arguments
+
+
+def test_readiness_rejects_workload_that_cannot_fit_provider_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_config(tmp_path / "monthly.json")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value.update(
+        {
+            "schema_version": 2,
+            "trace6_target_id": "sha256:" + "3" * 64,
+            "measurements": ["trace", "trace6", "rr"],
+        }
+    )
+    for provider in value["providers"].values():
+        provider["campaign_timeout_seconds"] = 3600
+        provider["max_trace6_targets"] = 1000
+    path.write_text(json.dumps(value), encoding="utf-8")
+    schedule = monthly.load_schedule(path)
+
+    paths = {
+        schedule.trace_target_id: tmp_path / "trace.targets.txt",
+        schedule.rr_target_id: tmp_path / "rr.targets.txt",
+        schedule.trace6_target_id: tmp_path / "trace6.targets.txt",
+    }
+    for target_path in paths.values():
+        target_path.write_text("registered\n", encoding="utf-8")
+    counts = {
+        "trace.targets.txt": 100_000,
+        "rr.targets.txt": 1_000,
+        "trace6.targets.txt": 1_000,
+    }
+    families = {"trace.targets.txt": 4, "rr.targets.txt": 4, "trace6.targets.txt": 6}
+
+    monkeypatch.setattr(monthly, "remote_target_path", paths.__getitem__)
+    monkeypatch.setattr(
+        monthly,
+        "load_registered_target",
+        lambda target_path: SimpleNamespace(
+            target_id=next(key for key, value in paths.items() if value == target_path),
+            target_count=counts[target_path.name],
+            normalized_sha256="a" * 64,
+            address_family=families[target_path.name],
+        ),
+    )
+    monkeypatch.setattr(monthly, "missing_worker_assets", lambda _provider: [])
+    monkeypatch.setattr(monthly, "_credential_errors", lambda _provider, _regions: [])
+
+    report = monthly.readiness(schedule)
+
+    assert report["ready"] is False
+    assert all(
+        provider["estimated_runtime_seconds"] > provider["campaign_timeout_seconds"]
+        for provider in report["providers"].values()
+    )
+    assert any("estimated workload runtime" in error for error in report["errors"])
+
+
+def test_readiness_applies_target_caps_before_runtime_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_config(tmp_path / "monthly.json")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    for provider in value["providers"].values():
+        provider["campaign_timeout_seconds"] = 3600
+        provider["max_targets"] = 100
+    path.write_text(json.dumps(value), encoding="utf-8")
+    schedule = monthly.load_schedule(path)
+
+    paths = {
+        schedule.trace_target_id: tmp_path / "trace.targets.txt",
+        schedule.rr_target_id: tmp_path / "rr.targets.txt",
+    }
+    for target_path in paths.values():
+        target_path.write_text("registered\n", encoding="utf-8")
+    monkeypatch.setattr(monthly, "remote_target_path", paths.__getitem__)
+    monkeypatch.setattr(
+        monthly,
+        "load_registered_target",
+        lambda target_path: SimpleNamespace(
+            target_id=next(key for key, value in paths.items() if value == target_path),
+            target_count=1_000_000,
+            normalized_sha256="a" * 64,
+            address_family=4,
+        ),
+    )
+    monkeypatch.setattr(monthly, "missing_worker_assets", lambda _provider: [])
+    monkeypatch.setattr(monthly, "_credential_errors", lambda _provider, _regions: [])
+
+    report = monthly.readiness(schedule)
+
+    assert report["ready"] is True
+    assert all(
+        provider["estimated_runtime_seconds"] < provider["campaign_timeout_seconds"]
+        for provider in report["providers"].values()
+    )
 
 
 def test_dispatch_submits_each_provider_once_per_cycle(
@@ -100,7 +209,9 @@ def test_dispatch_submits_each_provider_once_per_cycle(
 
     monkeypatch.setattr(monthly, "STATE_ROOT", state_root)
     monkeypatch.setattr(monthly.submit, "STATE_ROOT", jobs_root)
-    monkeypatch.setattr(monthly, "readiness", lambda _schedule: {"ready": True, "errors": []})
+    monkeypatch.setattr(
+        monthly, "readiness", lambda _schedule: {"ready": True, "errors": []}
+    )
 
     def fake_submit(arguments: list[str]) -> int:
         calls.append(arguments)
@@ -134,7 +245,9 @@ def test_readiness_fails_closed_when_aws_credentials_are_missing(
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "missing-aws"))
     monkeypatch.setattr(monthly, "missing_worker_assets", lambda _provider: [])
-    monkeypatch.setattr(monthly, "remote_target_path", lambda target: tmp_path / f"{target[-1]}.txt")
+    monkeypatch.setattr(
+        monthly, "remote_target_path", lambda target: tmp_path / f"{target[-1]}.txt"
+    )
     monkeypatch.setattr(monthly, "load_registered_target", lambda _path: None)
 
     report = monthly.readiness(schedule)
@@ -155,3 +268,13 @@ def test_systemd_timer_is_persistent_and_monthly() -> None:
     assert "scamper-controller-monthly run" in service
     assert "cd /opt/scamper-cloud/current" in wrapper
     assert "python -m controller.monthly" in wrapper
+
+
+def test_controller_can_register_only_a_new_ipv6_target() -> None:
+    args = monthly.build_parser().parse_args(
+        ["register-targets", "--trace6-targets", "/tmp/trace6.txt"]
+    )
+
+    assert args.trace_targets is None
+    assert args.rr_targets is None
+    assert args.trace6_targets == Path("/tmp/trace6.txt")

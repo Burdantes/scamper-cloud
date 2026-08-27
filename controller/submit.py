@@ -126,6 +126,27 @@ MACHINE_TYPE_ENV = {
     "azure": "AZR_VM_SIZE",
 }
 
+CAMPAIGN_TIMEOUT_ENV = {
+    "gcp": "SCAMPER_GCP_SCAMPER_TIMEOUT_SECONDS",
+    "aws": "SCAMPER_AWS_SCAMPER_TIMEOUT_SECONDS",
+    "azure": "SCAMPER_AZR_SCAMPER_TIMEOUT_SECONDS",
+}
+
+DEFAULT_CAMPAIGN_TIMEOUT_SECONDS = {
+    "gcp": 172800,
+    "aws": 14400,
+    "azure": 14400,
+}
+
+
+def default_campaign_timeout_seconds(provider: str) -> int:
+    try:
+        return DEFAULT_CAMPAIGN_TIMEOUT_SECONDS[provider]
+    except KeyError:  # pragma: no cover - driver_module() rejects these earlier
+        raise SystemExit(
+            f"no campaign timeout is known for provider {provider!r}"
+        ) from None
+
 
 def default_worker_machine_type(provider: str) -> str:
     """The provider's own cheap default, so no GCP-shaped value leaks across."""
@@ -147,6 +168,11 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
             f"no worker size environment variable is known for provider {provider!r}"
         ) from None
     environment = [f"--setenv={machine_type_env}={args.worker_machine_type}"]
+    campaign_timeout_seconds = getattr(args, "campaign_timeout_seconds", None)
+    if campaign_timeout_seconds is not None:
+        environment.append(
+            f"--setenv={CAMPAIGN_TIMEOUT_ENV[provider]}={campaign_timeout_seconds}"
+        )
     worker_image_project = getattr(args, "worker_image_project", None)
     worker_image_family = getattr(args, "worker_image_family", None)
     if worker_image_project:
@@ -204,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-instances", type=positive_int)
     parser.add_argument("--max-targets", type=positive_int)
     parser.add_argument("--max-trace6-targets", type=positive_int)
+    parser.add_argument("--campaign-timeout-seconds", type=positive_int)
     parser.add_argument("--trace-rate", type=positive_int, default=1000)
     parser.add_argument("--rr-rate", type=positive_int, default=1000)
     parser.add_argument("--trace6-rate", type=positive_int, default=1000)
@@ -229,7 +256,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     measurements = tuple(value.strip() for value in args.measurements.split(","))
     unsupported = set(measurements) - {"trace", "trace6", "rr"}
-    if not all(measurements) or len(set(measurements)) != len(measurements) or unsupported:
+    if (
+        not all(measurements)
+        or len(set(measurements)) != len(measurements)
+        or unsupported
+    ):
         parser = build_parser()
         parser.error(
             "unsupported measurements: " + ", ".join(sorted(unsupported or {"empty"}))

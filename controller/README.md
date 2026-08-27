@@ -114,7 +114,12 @@ The operator-owned `/etc/scamper-controller-monthly.json` must contain:
 - a positive `max_instances` safety cap for every provider.
 
 Use `max_trace6_targets` independently of the IPv4 `max_targets` cap. The
-checked-in schema-2 example starts at 1,000 IPv6 targets per worker.
+checked-in schema-2 example starts at 1,000 IPv6 targets per worker. Each
+provider also has a `campaign_timeout_seconds` lease. The controller passes it
+through the durable systemd unit to the provider driver and refuses monthly
+dispatch when the capped target counts and packet rates cannot fit within the
+lease after the built-in workload safety margin. Azure uses the same deadline
+to terminate lingering SSH processes before deleting the run's resource group.
 
 Validate and enable it from a workstation:
 

@@ -144,6 +144,10 @@ python -m controller.manage register-targets --apply \
   --trace6-targets datasets/ipv6-hitlist-responsive-1000.txt
 ```
 
+Any subset can be registered independently when only one population changes;
+for example, pass only `--trace6-targets` to version a refreshed IPv6 Hitlist
+without re-registering the IPv4 inputs.
+
 Save the three returned `sha256:` target IDs. The registry records address
 family and rejects mixed-family input. Later campaigns reuse the registered
 content without uploading or normalizing it again.
@@ -185,7 +189,12 @@ The controller-owned `/etc/scamper-controller-monthly.json` must contain the
 registered target IDs, result bucket, measurement policy, and entries for
 exactly `gcp`, `aws`, and `azure`. Every provider needs a positive
 `max_instances`; use `max_targets` for IPv4 and `max_trace6_targets` for an
-independently bounded IPv6 rollout.
+independently bounded IPv6 rollout. Set `campaign_timeout_seconds` for every
+provider to create a hard remote-campaign deadline. Monthly readiness estimates
+the capped workload from the configured packet rates, a maximum of 40 probes
+per traceroute destination, one probe per RR destination, a 25% safety margin,
+and 15 minutes of fixed setup/upload time. Dispatch fails closed when that
+estimate cannot fit inside the provider deadline.
 
 The dispatcher validates all three providers before submitting any of them. It
 refuses to run when targets, worker assets, credentials, exclusions, regions,

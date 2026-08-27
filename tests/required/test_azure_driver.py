@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from providers.azure import driver as azr
 
 
@@ -27,8 +29,13 @@ class FakePool:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def map(self, function: object, run_infos: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        return [(location, f"203.0.113.{index + 1}") for index, (_prefix, location) in enumerate(run_infos)]
+    def map(
+        self, function: object, run_infos: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        return [
+            (location, f"203.0.113.{index + 1}")
+            for index, (_prefix, location) in enumerate(run_infos)
+        ]
 
 
 class FakeProcess:
@@ -45,6 +52,19 @@ class FakeProcess:
 
     def kill(self) -> None:
         self.killed = True
+
+    def poll(self) -> int:
+        return self.exit_code
+
+
+class TimeoutProcess(FakeProcess):
+    def wait(self, timeout: float | None = None) -> int:
+        if not self.terminated and not self.killed:
+            raise azr.subprocess.TimeoutExpired("ssh", timeout)
+        return 124
+
+    def poll(self) -> None:
+        return None
 
 
 class ResultPoller:
@@ -141,7 +161,9 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     monkeypatch,
 ) -> None:
     target_file = tmp_path / "ipv4-24"
-    target_file.write_text("".join(f"192.0.2.{index}\n" for index in range(20)), encoding="utf-8")
+    target_file.write_text(
+        "".join(f"192.0.2.{index}\n" for index in range(20)), encoding="utf-8"
+    )
     log_dir = tmp_path / "logs"
     waited: list[str] = []
     uploaded: list[tuple[str, str | None]] = []
@@ -150,15 +172,22 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     popen_args: list[list[str]] = []
 
     monkeypatch.setattr(azr.settings, "SCAMPER_IP_DST", str(target_file))
-    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "run-scamper-azr.sh"))
+    monkeypatch.setattr(
+        azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "run-scamper-azr.sh")
+    )
     monkeypatch.setattr(azr.settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "azr-key"))
     monkeypatch.setattr(azr.settings, "AZR_SCAMPER_USER", "azureuser")
     monkeypatch.setattr(azr, "create_bucket", lambda bucket: None)
     monkeypatch.setattr(azr, "create_rg", lambda prefix: None)
     monkeypatch.setattr(azr, "delete_rg", lambda prefix: FakePoller(waited, prefix))
-    monkeypatch.setattr(azr, "get_locations", lambda: [f"region-{index}" for index in range(12)])
+    monkeypatch.setattr(
+        azr, "get_locations", lambda: [f"region-{index}" for index in range(12)]
+    )
     monkeypatch.setattr(azr, "Pool", FakePool)
-    def capture_upload(file_name: str, bucket: str, object_name: str | None = None) -> None:
+
+    def capture_upload(
+        file_name: str, bucket: str, object_name: str | None = None
+    ) -> None:
         uploaded.append((Path(file_name).name, object_name))
         if Path(file_name).name == "manifest.json":
             manifests.append(json.loads(Path(file_name).read_text(encoding="utf-8")))
@@ -197,13 +226,40 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     ssh_commands = [args for args in popen_args if args and args[0] == "ssh"]
     assert len(scp_commands) == 3
     assert len(ssh_commands) == 3
-    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in scp_commands)
+    assert all(
+        "azr-test-trace-targets-5.txt" in " ".join(args) for args in scp_commands
+    )
     assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in scp_commands)
-    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in ssh_commands)
+    assert all(
+        "azr-test-trace-targets-5.txt" in " ".join(args) for args in ssh_commands
+    )
     assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in ssh_commands)
-    assert all("SCAMPER_MEASUREMENTS=trace,rr" in " ".join(args) for args in ssh_commands)
+    assert all(
+        "SCAMPER_MEASUREMENTS=trace,rr" in " ".join(args) for args in ssh_commands
+    )
     assert all("runs/azr-test/nodes/" in " ".join(args) for args in ssh_commands)
-    assert all("region-3" not in " ".join(args) for args in [*scp_commands, *ssh_commands])
+    assert all(
+        "region-3" not in " ".join(args) for args in [*scp_commands, *ssh_commands]
+    )
+
+
+def test_azure_campaign_timeout_terminates_every_pending_process() -> None:
+    first = TimeoutProcess()
+    second = TimeoutProcess()
+    nodes = [
+        {"node": "azr-eastus", "complete": False, "return_code": None},
+        {"node": "azr-westus", "complete": False, "return_code": None},
+    ]
+
+    with pytest.raises(TimeoutError, match="timed out after 60 seconds"):
+        azr.wait_for_campaign_processes(
+            [(first, nodes[0]), (second, nodes[1])], timeout_seconds=60
+        )
+
+    assert first.terminated is True
+    assert second.terminated is True
+    assert nodes[0]["return_code"] == 124
+    assert nodes[1]["return_code"] == 124
 
 
 def test_launch_locations_keeps_trying_until_requested_successes(monkeypatch) -> None:
@@ -293,6 +349,7 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["complete"] is False
     assert manifest["failed_nodes"] == ["azr-eastus"]
     assert manifest["object_prefix"] == "runs/azr-test"
+    assert manifest["campaign_timeout_seconds"] == 14400
 
 
 def test_driver_takes_its_vm_size_from_settings_not_a_literal() -> None:

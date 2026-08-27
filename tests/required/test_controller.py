@@ -64,11 +64,17 @@ def test_campaign_command_has_distinct_inputs_and_both_measurements(
 
 
 def test_systemd_unit_is_durable_and_runs_as_controller(tmp_path: Path) -> None:
-    args = argparse.Namespace(run_id="test-run", worker_machine_type="e2-medium")
+    args = argparse.Namespace(
+        provider="gcp",
+        run_id="test-run",
+        worker_machine_type="e2-medium",
+        campaign_timeout_seconds=7200,
+    )
     command = submit.systemd_command(args, ["python", "gcp.py"])
 
     assert "--unit=scamper-campaign-test-run" in command
     assert "--setenv=GCP_MACHINE_TYPE=e2-medium" in command
+    assert "--setenv=SCAMPER_GCP_SCAMPER_TIMEOUT_SECONDS=7200" in command
     assert "--uid=scamper-controller" in command
     assert "/usr/local/bin/scamper-controller-run" in command
     assert command[-2:] == ["python", "gcp.py"]
@@ -80,6 +86,7 @@ def test_systemd_unit_can_select_prebuilt_worker_image() -> None:
         worker_machine_type="e2-micro",
         worker_image_project="measurement-project",
         worker_image_family="scamper-worker-debian12",
+        campaign_timeout_seconds=None,
     )
 
     command = submit.systemd_command(args, ["python", "gcp.py"])
@@ -109,6 +116,16 @@ def test_manage_submit_accepts_registered_target_ids() -> None:
     assert args.rr_targets is None
     assert args.trace_target_id == f"sha256:{digest}"
     assert args.rr_target_id == f"sha256:{digest}"
+
+
+def test_manage_can_register_an_ipv6_target_without_reregistering_ipv4() -> None:
+    args = manage.build_parser().parse_args(
+        ["register-targets", "--trace6-targets", "/tmp/trace6.txt"]
+    )
+
+    assert args.trace_targets is None
+    assert args.rr_targets is None
+    assert args.trace6_targets == Path("/tmp/trace6.txt")
 
 
 def test_schedule_status_fails_when_readiness_check_fails(
@@ -147,14 +164,27 @@ def test_submit_dispatches_the_requested_provider() -> None:
 
     for provider, module in sorted(DRIVER_MODULES.items()):
         args = argparse.Namespace(
-            provider=provider, run_id="r", log_dir=None,
-            trace_targets=Path("/t"), rr_targets=Path("/r"),
-            bucket="b", object_prefix=None, regions="us-east1",
-            worker_machine_type="e2-micro", worker_image_project=None,
-            worker_image_family=None, measurements="trace,rr",
-            max_instances=None, max_targets=None, trace_rate=1000,
-            rr_rate=1000, rr_timeout=2.0, probe_payload="p",
-            measurement_contact="c", do_not_probe_file=Path("/d"),
+            provider=provider,
+            run_id="r",
+            log_dir=None,
+            trace_targets=Path("/t"),
+            rr_targets=Path("/r"),
+            bucket="b",
+            object_prefix=None,
+            regions="us-east1",
+            worker_machine_type="e2-micro",
+            worker_image_project=None,
+            worker_image_family=None,
+            measurements="trace,rr",
+            max_instances=None,
+            max_targets=None,
+            trace_rate=1000,
+            campaign_timeout_seconds=None,
+            rr_rate=1000,
+            rr_timeout=2.0,
+            probe_payload="p",
+            measurement_contact="c",
+            do_not_probe_file=Path("/d"),
             skip_smoke=False,
         )
         command = submit.campaign_command(args, Path("/tmp/job"))
@@ -184,6 +214,9 @@ def test_every_provider_accepts_the_exact_controller_command(capsys) -> None:
             measurements="trace,rr",
             max_instances=1,
             max_targets=10,
+            max_trace6_targets=None,
+            trace6_rate=1000,
+            campaign_timeout_seconds=7200,
             trace_rate=100,
             rr_rate=10,
             rr_timeout=2.0,
@@ -193,9 +226,11 @@ def test_every_provider_accepts_the_exact_controller_command(capsys) -> None:
             skip_smoke=False,
         )
         command = submit.campaign_command(args, Path("/tmp/job"))
+        systemd = submit.systemd_command(args, command)
         driver_argv = [argument for argument in command[3:] if argument != "--apply"]
         module = importlib.import_module(module_name)
         assert module.main(driver_argv) == 0
+        assert any(value.endswith("_SCAMPER_TIMEOUT_SECONDS=7200") for value in systemd)
         capsys.readouterr()
 
 
@@ -254,20 +289,27 @@ def test_controller_deploy_tests_staged_release_before_activation() -> None:
     bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
 
     test_index = bootstrap.index("-m pytest tests/required")
-    activate_index = bootstrap.index('ln -sfn "${release_dir}" "${install_root}/current"')
+    activate_index = bootstrap.index(
+        'ln -sfn "${release_dir}" "${install_root}/current"'
+    )
     assert test_index < activate_index
     assert "requirements-test.txt" in bootstrap
     assert "bundle SHA-256 mismatch" in bootstrap
     assert "release.json" in bootstrap
 
 
-def test_deploy_never_enables_a_monthly_schedule_without_prior_operator_approval() -> None:
+def test_deploy_never_enables_a_monthly_schedule_without_prior_operator_approval() -> (
+    None
+):
     root = Path(__file__).resolve().parents[2]
     bootstrap = (root / "controller/bootstrap.sh").read_text(encoding="utf-8")
 
     assert "timer_was_enabled=false" in bootstrap
     assert '[[ "${timer_was_enabled}" == true ]]' in bootstrap
-    assert "operator action after regional preparation and live provider canaries" in bootstrap
+    assert (
+        "operator action after regional preparation and live provider canaries"
+        in bootstrap
+    )
 
 
 def test_submit_refuses_to_originate_off_the_controller(tmp_path, monkeypatch) -> None:
@@ -307,11 +349,18 @@ def test_worker_machine_type_reaches_every_provider() -> None:
     """
     from controller import submit
 
-    expected = {"gcp": "GCP_MACHINE_TYPE", "aws": "AWS_INSTANCE_TYPES", "azure": "AZR_VM_SIZE"}
+    expected = {
+        "gcp": "GCP_MACHINE_TYPE",
+        "aws": "AWS_INSTANCE_TYPES",
+        "azure": "AZR_VM_SIZE",
+    }
     for provider, variable in expected.items():
         args = argparse.Namespace(
-            provider=provider, run_id="r", worker_machine_type="size-x",
-            worker_image_project=None, worker_image_family=None,
+            provider=provider,
+            run_id="r",
+            worker_machine_type="size-x",
+            worker_image_project=None,
+            worker_image_family=None,
         )
         joined = " ".join(submit.systemd_command(args, ["cmd"]))
         assert f"--setenv={variable}=size-x" in joined, (
@@ -344,7 +393,12 @@ def test_controller_installs_every_providers_sdk() -> None:
     requirements = (
         Path(__file__).resolve().parents[2] / "controller/requirements.txt"
     ).read_text(encoding="utf-8")
-    for package in ("boto3", "azure-identity", "azure-mgmt-compute", "azure-mgmt-network"):
+    for package in (
+        "boto3",
+        "azure-identity",
+        "azure-mgmt-compute",
+        "azure-mgmt-network",
+    ):
         assert package in requirements, f"controller cannot import {package}"
 
 
@@ -362,7 +416,9 @@ def test_provider_credentials_are_not_generated_or_committed() -> None:
         # Present only as a commented placeholder, never assigned a value.
         for line in bootstrap.splitlines():
             if secret in line:
-                assert line.strip().startswith("#"), f"secret assigned in bootstrap: {line}"
+                assert line.strip().startswith("#"), (
+                    f"secret assigned in bootstrap: {line}"
+                )
 
 
 def test_secrets_file_is_readable_by_the_controller_user() -> None:
@@ -401,7 +457,11 @@ def test_bootstrap_points_every_provider_at_the_controllers_own_key() -> None:
         Path(__file__).resolve().parents[2] / "controller/bootstrap.sh"
     ).read_text(encoding="utf-8")
 
-    for variable in ("GCP_SCAMPER_SSH_KEY", "AWS_SCAMPER_SSH_KEY", "AZR_SCAMPER_SSH_KEY"):
+    for variable in (
+        "GCP_SCAMPER_SSH_KEY",
+        "AWS_SCAMPER_SSH_KEY",
+        "AZR_SCAMPER_SSH_KEY",
+    ):
         line = next(
             (
                 candidate
@@ -428,7 +488,9 @@ def test_preflight_names_every_missing_worker_file(monkeypatch, tmp_path) -> Non
 
     real = tmp_path / "present.txt"
     real.write_text("x", encoding="utf-8")
-    monkeypatch.setattr(settings, "WARTS_STORAGE_CREDENTIALS", str(tmp_path / "gone.json"))
+    monkeypatch.setattr(
+        settings, "WARTS_STORAGE_CREDENTIALS", str(tmp_path / "gone.json")
+    )
     monkeypatch.setattr(settings, "AZR_SCAMPER_VM_SCRIPT", str(real))
     monkeypatch.setattr(settings, "SCAMPER_SMOKE_SCRIPT", str(real))
     monkeypatch.setattr(settings, "SCAMPER_UPLOAD_SCRIPT", str(real))

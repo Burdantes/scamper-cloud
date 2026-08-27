@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -30,6 +31,10 @@ CONFIG_PATH = Path("/etc/scamper-controller-monthly.json")
 STATE_ROOT = Path("/var/lib/scamper-controller/monthly")
 DEFAULT_DO_NOT_PROBE = Path("/opt/scamper-cloud/current/config/do-not-probe.txt")
 SCHEMA_VERSION = 2
+TRACE_PROBES_PER_TARGET = 40
+RR_PROBES_PER_TARGET = 1
+WORKLOAD_SAFETY_FACTOR = 1.25
+WORKLOAD_FIXED_OVERHEAD_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,7 @@ class ProviderSchedule:
     max_instances: int
     max_targets: int | None
     max_trace6_targets: int | None
+    campaign_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -76,10 +82,15 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
-        raise ValueError(f"monthly schedule configuration does not exist: {path}") from error
+        raise ValueError(
+            f"monthly schedule configuration does not exist: {path}"
+        ) from error
     except json.JSONDecodeError as error:
         raise ValueError(f"invalid monthly schedule JSON in {path}: {error}") from error
-    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, SCHEMA_VERSION}:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {
+        1,
+        SCHEMA_VERSION,
+    }:
         raise ValueError(
             f"monthly schedule must use schema_version 1 or {SCHEMA_VERSION}"
         )
@@ -88,7 +99,9 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be true or false")
     try:
-        trace_id = target_id(_nonempty_string(raw.get("trace_target_id"), "trace_target_id"))
+        trace_id = target_id(
+            _nonempty_string(raw.get("trace_target_id"), "trace_target_id")
+        )
         rr_id = target_id(_nonempty_string(raw.get("rr_target_id"), "rr_target_id"))
     except argparse.ArgumentTypeError as error:
         raise ValueError(str(error)) from error
@@ -98,7 +111,9 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
     measurements_raw = raw.get("measurements", ["trace", "rr"])
     if not isinstance(measurements_raw, list) or not measurements_raw:
         raise ValueError("measurements must be a non-empty list")
-    measurements = tuple(_nonempty_string(value, "measurement") for value in measurements_raw)
+    measurements = tuple(
+        _nonempty_string(value, "measurement") for value in measurements_raw
+    )
     if len(set(measurements)) != len(measurements):
         raise ValueError("measurements must not contain duplicates")
     unsupported = set(measurements) - {"trace", "trace6", "rr"}
@@ -125,7 +140,9 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
     if set(providers_raw) != set(DRIVER_MODULES):
         missing = sorted(set(DRIVER_MODULES) - set(providers_raw))
         extra = sorted(set(providers_raw) - set(DRIVER_MODULES))
-        raise ValueError(f"providers must exactly match supported providers; missing={missing}, extra={extra}")
+        raise ValueError(
+            f"providers must exactly match supported providers; missing={missing}, extra={extra}"
+        )
 
     providers: list[ProviderSchedule] = []
     for provider in sorted(providers_raw):
@@ -153,7 +170,9 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
             )
         max_targets = value.get("max_targets")
         if max_targets is not None:
-            max_targets = _positive_int(max_targets, f"providers.{provider}.max_targets")
+            max_targets = _positive_int(
+                max_targets, f"providers.{provider}.max_targets"
+            )
         max_trace6_targets = value.get("max_trace6_targets")
         if max_trace6_targets is not None:
             max_trace6_targets = _positive_int(
@@ -169,6 +188,13 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
                 ),
                 max_targets=max_targets,
                 max_trace6_targets=max_trace6_targets,
+                campaign_timeout_seconds=_positive_int(
+                    value.get(
+                        "campaign_timeout_seconds",
+                        submit.default_campaign_timeout_seconds(provider),
+                    ),
+                    f"providers.{provider}.campaign_timeout_seconds",
+                ),
             )
         )
 
@@ -216,6 +242,40 @@ def _credential_errors(provider: str, regions: tuple[str, ...] = ()) -> list[str
     return []
 
 
+def estimated_runtime_seconds(
+    schedule: MonthlySchedule,
+    provider: ProviderSchedule,
+    target_counts: dict[str, int],
+) -> int | None:
+    if any(measurement not in target_counts for measurement in schedule.measurements):
+        return None
+
+    rates = {
+        "trace": schedule.trace_rate,
+        "trace6": schedule.trace6_rate,
+        "rr": schedule.rr_rate,
+    }
+    probes_per_target = {
+        "trace": TRACE_PROBES_PER_TARGET,
+        "trace6": TRACE_PROBES_PER_TARGET,
+        "rr": RR_PROBES_PER_TARGET,
+    }
+    packet_seconds = 0.0
+    for measurement in schedule.measurements:
+        cap = (
+            provider.max_trace6_targets
+            if measurement == "trace6"
+            else provider.max_targets
+        )
+        count = target_counts[measurement]
+        if cap is not None:
+            count = min(count, cap)
+        packet_seconds += count * probes_per_target[measurement] / rates[measurement]
+    return math.ceil(
+        packet_seconds * WORKLOAD_SAFETY_FACTOR + WORKLOAD_FIXED_OVERHEAD_SECONDS
+    )
+
+
 def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
     errors: list[str] = []
     if not schedule.enabled:
@@ -253,12 +313,25 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
         }
 
     providers: dict[str, dict[str, Any]] = {}
+    target_counts = {
+        role: int(target["target_count"]) for role, target in targets.items()
+    }
     for provider in schedule.providers:
         provider_errors = [
             f"missing worker asset {name}: {path}"
             for name, path in missing_worker_assets(provider.provider)
         ]
         provider_errors.extend(_credential_errors(provider.provider, provider.regions))
+        runtime_seconds = estimated_runtime_seconds(schedule, provider, target_counts)
+        if (
+            runtime_seconds is not None
+            and runtime_seconds > provider.campaign_timeout_seconds
+        ):
+            provider_errors.append(
+                "estimated workload runtime "
+                f"{runtime_seconds}s exceeds campaign timeout "
+                f"{provider.campaign_timeout_seconds}s"
+            )
         providers[provider.provider] = {
             "ready": not provider_errors,
             "errors": provider_errors,
@@ -266,6 +339,13 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
             "max_instances": provider.max_instances,
             "max_targets": provider.max_targets,
             "max_trace6_targets": provider.max_trace6_targets,
+            "estimated_runtime_seconds": runtime_seconds,
+            "campaign_timeout_seconds": provider.campaign_timeout_seconds,
+            "runtime_headroom_seconds": (
+                provider.campaign_timeout_seconds - runtime_seconds
+                if runtime_seconds is not None
+                else None
+            ),
         }
         errors.extend(f"{provider.provider}: {error}" for error in provider_errors)
 
@@ -305,6 +385,8 @@ def _submission_args(
         ",".join(schedule.measurements),
         "--max-instances",
         str(provider.max_instances),
+        "--campaign-timeout-seconds",
+        str(provider.campaign_timeout_seconds),
         "--trace-rate",
         str(schedule.trace_rate),
         "--rr-rate",
@@ -331,16 +413,16 @@ def _submission_args(
     if provider.max_targets:
         arguments.extend(["--max-targets", str(provider.max_targets)])
     if provider.max_trace6_targets:
-        arguments.extend(
-            ["--max-trace6-targets", str(provider.max_trace6_targets)]
-        )
+        arguments.extend(["--max-trace6-targets", str(provider.max_trace6_targets)])
     return arguments
 
 
 def dispatch(schedule: MonthlySchedule, *, cycle: str | None = None) -> dict[str, Any]:
     report = readiness(schedule)
     if not report["ready"]:
-        raise RuntimeError("monthly schedule is not ready:\n" + "\n".join(report["errors"]))
+        raise RuntimeError(
+            "monthly schedule is not ready:\n" + "\n".join(report["errors"])
+        )
 
     selected_cycle = cycle or cycle_id()
     if len(selected_cycle) != 6 or not selected_cycle.isdigit():
@@ -358,10 +440,18 @@ def dispatch(schedule: MonthlySchedule, *, cycle: str | None = None) -> dict[str
             run_id = f"monthly-{provider.provider}-{selected_cycle}"
             job_spec = submit.STATE_ROOT / "jobs" / run_id / "job.json"
             if job_spec.is_file():
-                results.append({"provider": provider.provider, "run_id": run_id, "status": "already-submitted"})
+                results.append(
+                    {
+                        "provider": provider.provider,
+                        "run_id": run_id,
+                        "status": "already-submitted",
+                    }
+                )
                 continue
             submit.main(_submission_args(schedule, provider, selected_cycle))
-            results.append({"provider": provider.provider, "run_id": run_id, "status": "submitted"})
+            results.append(
+                {"provider": provider.provider, "run_id": run_id, "status": "submitted"}
+            )
 
         state = {
             "schema_version": 1,
@@ -376,7 +466,9 @@ def dispatch(schedule: MonthlySchedule, *, cycle: str | None = None) -> dict[str
 
 def register_controller_target(source: Path) -> RegisteredTarget:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="target-registration-", dir=STATE_ROOT) as temp_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="target-registration-", dir=STATE_ROOT
+    ) as temp_dir:
         registration = register_local_target(source, Path(temp_dir))
         destination = remote_target_dir(registration.target_id)
         target_path = remote_target_path(registration.target_id)
@@ -392,15 +484,17 @@ def register_controller_target(source: Path) -> RegisteredTarget:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage monthly multi-cloud campaigns.")
+    parser = argparse.ArgumentParser(
+        description="Manage monthly multi-cloud campaigns."
+    )
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("check")
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--cycle")
     register_parser = subparsers.add_parser("register-targets")
-    register_parser.add_argument("--trace-targets", type=Path, required=True)
-    register_parser.add_argument("--rr-targets", type=Path, required=True)
+    register_parser.add_argument("--trace-targets", type=Path)
+    register_parser.add_argument("--rr-targets", type=Path)
     register_parser.add_argument("--trace6-targets", type=Path)
     return parser
 
@@ -408,14 +502,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.action == "register-targets":
-        trace = register_controller_target(args.trace_targets)
-        rr = register_controller_target(args.rr_targets)
-        values = {"trace_target_id": trace.target_id, "rr_target_id": rr.target_id}
-        if args.trace6_targets is not None:
-            trace6 = register_controller_target(args.trace6_targets)
+        sources = {
+            role: getattr(args, f"{role}_targets")
+            for role in ("trace", "rr", "trace6")
+            if getattr(args, f"{role}_targets") is not None
+        }
+        if not sources:
+            raise ValueError("at least one target source is required")
+        registrations = {
+            role: register_controller_target(source) for role, source in sources.items()
+        }
+        trace6 = registrations.get("trace6")
+        if trace6 is not None:
             if trace6.address_family != 6:
                 raise ValueError("--trace6-targets must contain IPv6 destinations")
-            values["trace6_target_id"] = trace6.target_id
+        values = {
+            f"{role}_target_id": registration.target_id
+            for role, registration in registrations.items()
+        }
         print(json.dumps(values, indent=2))
         return 0
     schedule = load_schedule(args.config)

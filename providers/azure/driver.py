@@ -26,16 +26,20 @@ SERVICE_ACCOUNT = settings.GCP_SERVICE_ACCOUNT
 gcp_credential = None
 
 
-INIT_CMD = ["scp", "-i", settings.AZR_SCAMPER_SSH_KEY,
-            "-oStrictHostKeyChecking=no",
-            settings.WARTS_STORAGE_CREDENTIALS,
-            settings.AZR_SCAMPER_VM_SCRIPT,
-            settings.SCAMPER_SMOKE_SCRIPT,
-            # The worker delegates to the shared runner, so it must be shipped.
-            # Omitting it left the VM failing on "chmod: cannot access
-            # ./run_campaign.py" after a successful smoke test.
-            settings.SCAMPER_CAMPAIGN_RUNNER,
-            settings.SCAMPER_UPLOAD_SCRIPT]
+INIT_CMD = [
+    "scp",
+    "-i",
+    settings.AZR_SCAMPER_SSH_KEY,
+    "-oStrictHostKeyChecking=no",
+    settings.WARTS_STORAGE_CREDENTIALS,
+    settings.AZR_SCAMPER_VM_SCRIPT,
+    settings.SCAMPER_SMOKE_SCRIPT,
+    # The worker delegates to the shared runner, so it must be shipped.
+    # Omitting it left the VM failing on "chmod: cannot access
+    # ./run_campaign.py" after a successful smoke test.
+    settings.SCAMPER_CAMPAIGN_RUNNER,
+    settings.SCAMPER_UPLOAD_SCRIPT,
+]
 RESOURCE_GROUP_NAME = "azr-scamper"
 PRIVATE_IP = "10.0.0.4"
 # Azure's documented dual-stack VM topology uses a globally scoped IPv6
@@ -106,6 +110,12 @@ def positive_float(value):
     return parsed
 
 
+def campaign_timeout_seconds():
+    return positive_float(
+        os.environ.get("SCAMPER_AZR_SCAMPER_TIMEOUT_SECONDS", "14400")
+    )
+
+
 def csv_values(value):
     parsed = tuple(item.strip() for item in value.split(",") if item.strip())
     if not parsed:
@@ -117,7 +127,9 @@ def probe_payload_text(value):
     try:
         encoded = value.encode("ascii")
     except UnicodeEncodeError as error:
-        raise argparse.ArgumentTypeError("probe payload must contain ASCII text") from error
+        raise argparse.ArgumentTypeError(
+            "probe payload must contain ASCII text"
+        ) from error
     if not encoded:
         raise argparse.ArgumentTypeError("probe payload must not be empty")
     if len(encoded) > 128:
@@ -194,8 +206,11 @@ def get_gcp_credentials():
     # Shared with every provider: explicit key if configured, else ADC.
     return google_credentials()
 
+
 time_format = "%Y-%m-%d %H:%M:%S"
-formatter = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(message)s', datefmt=time_format)
+formatter = logging.Formatter(
+    fmt="%(asctime)s - %(levelname)s - %(message)s", datefmt=time_format
+)
 logger = logging.getLogger()
 handler = logging.StreamHandler()
 handler.setFormatter(formatter)
@@ -223,6 +238,7 @@ def read_azure_public_key():
     public_key_path = Path(f"{settings.AZR_SCAMPER_SSH_KEY}.pub").expanduser()
     return public_key_path.read_text(encoding="utf-8").strip()
 
+
 def send_to_cloud_storage(file_name, bucket_name, object_name=None):
     attempt = 0
     blob = None
@@ -234,15 +250,24 @@ def send_to_cloud_storage(file_name, bucket_name, object_name=None):
             storage_client = gcs_storage_client()
             bucket = storage_client.get_bucket(bucket_name)
             blob = bucket.blob(object_name or Path(file_name).name)
-            logging.info("Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob))
+            logging.info(
+                "Uploading results to Cloud Storage (try #{}): {}".format(attempt, blob)
+            )
             blob.upload_from_filename(file_name)
-            logging.info('Successfully uploaded ({} attempts) {}.'.format(attempt, blob))
+            logging.info(
+                "Successfully uploaded ({} attempts) {}.".format(attempt, blob)
+            )
             success = True
         except Exception as err:
-            logging.info("Attempt {} failed to upload {} due to {}:{}".format(
-                attempt, blob, Exception, err))
+            logging.info(
+                "Attempt {} failed to upload {} due to {}:{}".format(
+                    attempt, blob, Exception, err
+                )
+            )
     if not success:
-        raise RuntimeError(f"failed to upload {file_name} after {max_attempts} attempts")
+        raise RuntimeError(
+            f"failed to upload {file_name} after {max_attempts} attempts"
+        )
 
 
 def package_and_upload_logs(log_dir, bucket_name, object_prefix):
@@ -343,6 +368,7 @@ def write_run_manifest(
         "trace6_rate_pps": trace6_rate,
         "rr_rate_pps": rr_rate,
         "rr_timeout_seconds": rr_timeout,
+        "campaign_timeout_seconds": campaign_timeout_seconds(),
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "commands": {
@@ -483,16 +509,50 @@ def wait_for_process(process, label, timeout_seconds):
             process.wait()
         return 124
 
+
+def wait_for_campaign_processes(processes, timeout_seconds=None):
+    timeout_seconds = (
+        campaign_timeout_seconds()
+        if timeout_seconds is None
+        else positive_float(timeout_seconds)
+    )
+    deadline = time.monotonic() + timeout_seconds
+    exits = []
+    for index, (process, node_manifest) in enumerate(processes):
+        remaining_seconds = max(0.0, deadline - time.monotonic())
+        exit_code = wait_for_process(
+            process,
+            f"scamper on {node_manifest['node']}",
+            remaining_seconds,
+        )
+        exits.append(exit_code)
+        node_manifest["return_code"] = exit_code
+        node_manifest["complete"] = exit_code == 0
+        if exit_code == 124:
+            for pending_process, pending_manifest in processes[index + 1 :]:
+                pending_exit = wait_for_process(
+                    pending_process,
+                    f"scamper on {pending_manifest['node']}",
+                    0,
+                )
+                pending_manifest["return_code"] = pending_exit
+                pending_manifest["complete"] = False
+            raise TimeoutError(
+                f"Azure campaign timed out after {timeout_seconds:g} seconds"
+            )
+    return exits
+
+
 def create_bucket(name):
     from googleapiclient import discovery
     from googleapiclient.errors import HttpError
 
-    gcp_storage = discovery.build('storage', 'v1', credentials=get_gcp_credentials())
+    gcp_storage = discovery.build("storage", "v1", credentials=get_gcp_credentials())
     body = {
         "name": name,
         "storageClass": settings.GCP_STORAGE_CLASS,
         "location": settings.GCP_STORAGE_LOCATION,
-        "locationType": "region"
+        "locationType": "region",
     }
     try:
         return gcp_storage.buckets().insert(project=PROJECT, body=body).execute()
@@ -501,6 +561,7 @@ def create_bucket(name):
             logging.info("Bucket %s already exists; reusing it", name)
             return None
         raise
+
 
 def locations_from_env():
     """Restrict the campaign to an explicit location list.
@@ -520,7 +581,7 @@ def locations_from_env():
 
 
 def get_locations():
-    #Currently using the error msg's list of locations that support public IP creation
+    # Currently using the error msg's list of locations that support public IP creation
     # pip = set('westus,eastus,northeurope,westeurope,eastasia,southeastasia,northcentralus,southcentralus,centralus,eastus2,japaneast,japanwest,brazilsouth,australiaeast,australiasoutheast,centralindia,southindia,westindia,canadacentral,canadaeast,westcentralus,westus2,ukwest,uksouth,koreacentral,koreasouth,francecentral,australiacentral,southafricanorth,uaenorth,switzerlandnorth,germanywestcentral,norwayeast,westus3,jioindiawest,swedencentral,qatarcentral,polandcentral,italynorth,israelcentral,mexicocentral'.split(","))
     # perm = set('australiacentral,australiacentral2,australiaeast,australiasoutheast,brazilsouth,brazilsoutheast,canadacentral,canadaeast,centralindia,centralus,centraluseuap,eastasia,eastus,eastus2,eastus2euap,francecentral,francesouth,germanynorth,germanywestcentral,israelcentral,italynorth,japaneast,japanwest,koreacentral,koreasouth,malaysiasouth,mexicocentral,northcentralus,northeurope,norwayeast,norwaywest,polandcentral,qatarcentral,southafricanorth,southafricawest,southcentralus,southeastasia,southindia,spaincentral,swedencentral,swedensouth,switzerlandnorth,switzerlandwest,taiwannorth,taiwannorthwest,uaecentral,uaenorth,uksouth,ukwest,westcentralus,westeurope,westindia,westus,westus2,westus3,asia,asiapacific,australia,brazil,canada,devfabric,europe,global,india,japan,northwestus,uk,france,germany,switzerland,korea,norway,uae,southafrica,unitedstates,unitedstateseuap,westuspartner,singapore,sweden,italy,israel,newzealand,poland,qatar,austriaeast,chilecentral,eastusslv,indonesiacentral,israelnorthwest,malaysiawest,newzealandnorth'.split(","))
     # size = set('westindia')
@@ -531,7 +592,7 @@ def get_locations():
     )
 
     response = client.subscriptions.list_locations(
-        subscription_id = get_subscription_id(),
+        subscription_id=get_subscription_id(),
     )
     available_locations = [item.name for item in response]
     available = set(available_locations)
@@ -554,15 +615,18 @@ def get_locations():
         return requested
     return preferred_locations + fallback_locations
 
+
 def create_rg(rg_name):
     rg_result = get_resource_client().resource_groups.create_or_update(
         rg_name, {"location": "eastus"}
     )
     return rg_result
 
+
 def delete_rg(rg_name):
     rg_result = get_resource_client().resource_groups.begin_delete(rg_name)
     return rg_result
+
 
 def create_ip(rg_name, location, ip_name, address_family="IPv4"):
     from azure.mgmt.network.models import PublicIPAddress
@@ -585,6 +649,7 @@ def create_ip(rg_name, location, ip_name, address_family="IPv4"):
     ip_address_result = poller.result()
     return ip_address_result
 
+
 def create_vnet(rg_name, location, vnet_name, ipv6_enabled=False):
     from azure.mgmt.network.models import AddressSpace
     from azure.mgmt.network.models import VirtualNetwork
@@ -606,6 +671,7 @@ def create_vnet(rg_name, location, vnet_name, ipv6_enabled=False):
     vnet_result = poller.result()
     return vnet_result
 
+
 def create_subnet(rg_name, vnet_name, subnet_name, ipv6_enabled=False):
     from azure.mgmt.network.models import Subnet
     from azure.mgmt.network.models import SubnetPropertiesFormat
@@ -623,6 +689,7 @@ def create_subnet(rg_name, vnet_name, subnet_name, ipv6_enabled=False):
     )
     subnet_result = poller.result()
     return subnet_result
+
 
 def create_nsg(rg_name, location, nsg_name, ipv6_enabled=False):
     from azure.mgmt.network.models import NetworkSecurityGroup
@@ -678,7 +745,7 @@ def create_nsg(rg_name, location, nsg_name, ipv6_enabled=False):
                 priority=110,
                 direction="Inbound",
             ),
-        )
+        ),
     ]
     poller = get_network_client().network_security_groups.begin_create_or_update(
         rg_name,
@@ -688,17 +755,21 @@ def create_nsg(rg_name, location, nsg_name, ipv6_enabled=False):
             properties=NetworkSecurityGroupPropertiesFormat(
                 security_rules=security_rules,
             ),
-        ))
+        ),
+    )
 
     nsg_result = poller.result()
     return nsg_result
+
 
 def create_network_interface(
     rg_name, location, ni_name, subnet_id, ip_id, nsg_id, ipv6_ip_id=None
 ):
     from azure.mgmt.network.models import NetworkInterface
     from azure.mgmt.network.models import NetworkInterfaceIPConfiguration
-    from azure.mgmt.network.models import NetworkInterfaceIPConfigurationPropertiesFormat
+    from azure.mgmt.network.models import (
+        NetworkInterfaceIPConfigurationPropertiesFormat,
+    )
     from azure.mgmt.network.models import NetworkInterfacePropertiesFormat
     from azure.mgmt.network.models import NetworkSecurityGroup
     from azure.mgmt.network.models import PublicIPAddress
@@ -744,7 +815,8 @@ def create_network_interface(
     nic_result = poller.result()
     return nic_result
 
-def create_vm(rg_name,location,  vm_name, ni_id):
+
+def create_vm(rg_name, location, vm_name, ni_id):
     from azure.mgmt.compute import ComputeManagementClient
     from azure.mgmt.compute.models import HardwareProfile
     from azure.mgmt.compute.models import ImageReference
@@ -811,6 +883,7 @@ def create_vm(rg_name,location,  vm_name, ni_id):
     vm_result = poller.result()
     return vm_result
 
+
 def launch_location(run_info):
     rg_name, location, *options = run_info
     ipv6_enabled = bool(options[0]) if options else False
@@ -819,10 +892,9 @@ def launch_location(run_info):
     ip_name = f"{vm_name}-ip"
     ni_name = f"{vm_name}-ni"
     vnet_name = f"{vm_name}-vnet"
-    subnet_name  =f"{vm_name}-subnet"
+    subnet_name = f"{vm_name}-subnet"
     try:
-
-        ip_result = create_ip(rg_name,location, ip_name)
+        ip_result = create_ip(rg_name, location, ip_name)
         logging.info("Created %s", ip_name)
 
         ipv6_ip_result = None
@@ -832,7 +904,7 @@ def launch_location(run_info):
             )
             logging.info("Created %s-v6", ip_name)
 
-        create_vnet(rg_name,location, vnet_name, ipv6_enabled=ipv6_enabled)
+        create_vnet(rg_name, location, vnet_name, ipv6_enabled=ipv6_enabled)
         logging.info("Created %s", vnet_name)
 
         subnet_result = create_subnet(
@@ -840,9 +912,7 @@ def launch_location(run_info):
         )
         logging.info("Created %s", subnet_name)
 
-        nsg_result = create_nsg(
-            rg_name, location, nsg_name, ipv6_enabled=ipv6_enabled
-        )
+        nsg_result = create_nsg(rg_name, location, nsg_name, ipv6_enabled=ipv6_enabled)
         logging.info("Created %s", nsg_name)
 
         ni_result = create_network_interface(
@@ -856,7 +926,7 @@ def launch_location(run_info):
         )
         logging.info("Created %s", ni_name)
 
-        create_vm(rg_name,location,vm_name,ni_result.id)
+        create_vm(rg_name, location, vm_name, ni_result.id)
         logging.info("Created %s", vm_name)
     except Exception:
         logging.exception("Fail to launch in %s", location)
@@ -900,6 +970,7 @@ def launch_locations(prefix, locations, max_instances=None, ipv6_enabled=False):
             len(locations),
         )
     return ips
+
 
 def run_azr_scamper(
     log_dir,
@@ -1013,24 +1084,28 @@ def run_azr_scamper(
                     "return_code": None,
                 }
             )
-        manifest_nodes_by_location = {
-            node["location"]: node for node in manifest_nodes
-        }
+        manifest_nodes_by_location = {node["location"]: node for node in manifest_nodes}
 
         wait_seconds = float(os.environ.get("SCAMPER_AZR_SSH_WAIT_SECONDS", "600"))
         for location, ip in ips:
-            logs[location] = (open(os.path.join(log_dir, f"{prefix}-{location}-{ip}.log"), "w"))
+            logs[location] = open(
+                os.path.join(log_dir, f"{prefix}-{location}-{ip}.log"), "w"
+            )
             deadline = time.monotonic() + wait_seconds
-            nc = subprocess.Popen(["nc", "-z", "-w", "1", ip, "22"],
-                                  stdout=logs[location],
-                                  stderr=logs[location])
+            nc = subprocess.Popen(
+                ["nc", "-z", "-w", "1", ip, "22"],
+                stdout=logs[location],
+                stderr=logs[location],
+            )
             while nc.wait() != 0:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for ssh on {location} {ip}")
                 logging.info("Retrying nc for %s", location)
-                nc = subprocess.Popen(["nc", "-z", "-w", "1", ip, "22"],
-                                      stdout=logs[location],
-                                      stderr=logs[location])
+                nc = subprocess.Popen(
+                    ["nc", "-z", "-w", "1", ip, "22"],
+                    stdout=logs[location],
+                    stderr=logs[location],
+                )
                 time.sleep(1)
             logging.info("Instance %s is ready for ssh", location)
 
@@ -1038,17 +1113,28 @@ def run_azr_scamper(
         logging.info("Scp necessary files to instances")
         for location, ip in ips:
             logging.info("Scp files to %s", location)
-            processes.append([location, ip, subprocess.Popen(init_cmd(target_files) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
-                                                                   stdout=logs[location],
-                                                                   stderr=logs[location])])
+            processes.append(
+                [
+                    location,
+                    ip,
+                    subprocess.Popen(
+                        init_cmd(target_files)
+                        + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
+                        stdout=logs[location],
+                        stderr=logs[location],
+                    ),
+                ]
+            )
 
         scp_timeout = float(os.environ.get("SCAMPER_AZR_SCP_WAIT_SECONDS", "900"))
         for location, ip, process in processes:
             while wait_for_process(process, f"scp to {location}", scp_timeout) != 0:
                 logging.info("Retrying scp for %s", location)
-                process = subprocess.Popen(init_cmd(target_files) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
-                                           stdout=logs[location],
-                                           stderr=logs[location])
+                process = subprocess.Popen(
+                    init_cmd(target_files) + [f"{settings.AZR_SCAMPER_USER}@{ip}:~"],
+                    stdout=logs[location],
+                    stderr=logs[location],
+                )
 
         logging.info("Scp Complete")
 
@@ -1101,12 +1187,7 @@ def run_azr_scamper(
                 )
             )
             logging.info("Instance %s started", location)
-        exits = []
-        for process, node_manifest in processes:
-            exit_code = process.wait()
-            exits.append(exit_code)
-            node_manifest["return_code"] = exit_code
-            node_manifest["complete"] = exit_code == 0
+        exits = wait_for_campaign_processes(processes)
         logging.info("Scamper script exit codes: %s", exits)
         failed_exits = [exit_code for exit_code in exits if exit_code != 0]
         if failed_exits:
@@ -1122,7 +1203,9 @@ def run_azr_scamper(
             try:
                 cleanup_resource_group(prefix)
             except Exception as err:
-                logging.exception("Could not delete Azure resource group %s: %s", prefix, err)
+                logging.exception(
+                    "Could not delete Azure resource group %s: %s", prefix, err
+                )
         fh.flush()
         logger.removeHandler(fh)
         fh.close()
@@ -1142,7 +1225,9 @@ def run_azr_scamper(
                     probe_payload=probe_payload,
                     measurement_contact=measurement_contact,
                     do_not_probe_file=(targets.do_not_probe_file if targets else None),
-                    do_not_probe_version=(targets.do_not_probe_version if targets else None),
+                    do_not_probe_version=(
+                        targets.do_not_probe_version if targets else None
+                    ),
                     nodes=manifest_nodes,
                     started_at=campaign_started_at,
                     complete=campaign_complete,
@@ -1156,9 +1241,12 @@ def run_azr_scamper(
                 )
                 package_and_upload_logs(log_dir, bucket_name, object_prefix)
             except Exception as err:
-                logging.exception("Could not upload Azure flow logs to %s: %s", bucket_name, err)
+                logging.exception(
+                    "Could not upload Azure flow logs to %s: %s", bucket_name, err
+                )
 
     return bucket_name
+
 
 def build_plan(
     prefix,
@@ -1215,6 +1303,7 @@ def build_plan(
         "rr_rate_pps": rr_rate,
         "trace6_rate_pps": trace6_rate,
         "rr_timeout_seconds": rr_timeout,
+        "campaign_timeout_seconds": campaign_timeout_seconds(),
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "skip_smoke": skip_smoke,
@@ -1228,7 +1317,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the supported Azure regional scamper campaign."
     )
-    parser.add_argument("--prefix", help="run prefix used for resource group and result names")
+    parser.add_argument(
+        "--prefix", help="run prefix used for resource group and result names"
+    )
     parser.add_argument("--log-dir", help="local log directory")
     parser.add_argument(
         "--max-instances",

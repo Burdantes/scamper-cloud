@@ -19,21 +19,24 @@
       "worker_machine_type": "e2-micro",
       "max_instances": 50,
       "max_targets": null,
-      "max_trace6_targets": 1000
+      "max_trace6_targets": 1000,
+      "campaign_timeout_seconds": 172800
     },
     "aws": {
       "regions": ["us-east-1"],
       "worker_machine_type": "t3.micro,t2.micro",
       "max_instances": 35,
       "max_targets": null,
-      "max_trace6_targets": 1000
+      "max_trace6_targets": 1000,
+      "campaign_timeout_seconds": 86400
     },
     "azure": {
       "regions": null,
       "worker_machine_type": "Standard_B2ts_v2",
       "max_instances": 50,
       "max_targets": null,
-      "max_trace6_targets": 1000
+      "max_trace6_targets": 1000,
+      "campaign_timeout_seconds": 86400
     }
   }
 }

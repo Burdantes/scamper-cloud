@@ -302,6 +302,10 @@ def controller_submission_command(
         "--measurement-contact",
         args.measurement_contact,
     ]
+    if args.campaign_timeout_seconds is not None:
+        command.extend(
+            ["--campaign-timeout-seconds", str(args.campaign_timeout_seconds)]
+        )
     if trace6_target is not None:
         command.extend(["--trace6-targets", str(trace6_target)])
     if args.regions:
@@ -368,34 +372,19 @@ def submit(args: argparse.Namespace) -> None:
 def register_targets(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="scamper-target-registry-") as temp_dir:
         staging_root = Path(temp_dir)
-        trace = register_target(args, args.trace_targets, staging_root)
-        rr = register_target(args, args.rr_targets, staging_root)
-        trace6 = (
-            register_target(args, args.trace6_targets, staging_root)
-            if args.trace6_targets is not None
-            else None
-        )
+        registrations = {
+            role: register_target(args, source, staging_root)
+            for role in ("trace", "rr", "trace6")
+            if (source := getattr(args, f"{role}_targets")) is not None
+        }
+        trace6 = registrations.get("trace6")
         if trace6 is not None and trace6.address_family != 6:
             raise ValueError("--trace6-targets must contain IPv6 destinations")
-    print(
-        json.dumps(
-            {
-                "trace_target_id": trace.target_id,
-                "rr_target_id": rr.target_id,
-                "trace_target_count": trace.target_count,
-                "rr_target_count": rr.target_count,
-                **(
-                    {
-                        "trace6_target_id": trace6.target_id,
-                        "trace6_target_count": trace6.target_count,
-                    }
-                    if trace6 is not None
-                    else {}
-                ),
-            },
-            indent=2,
-        )
-    )
+    values = {}
+    for role, registration in registrations.items():
+        values[f"{role}_target_id"] = registration.target_id
+        values[f"{role}_target_count"] = registration.target_count
+    print(json.dumps(values, indent=2))
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -423,8 +412,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_parser = subparsers.add_parser("register-targets")
     add_common(register_parser)
-    register_parser.add_argument("--trace-targets", type=Path, required=True)
-    register_parser.add_argument("--rr-targets", type=Path, required=True)
+    register_parser.add_argument("--trace-targets", type=Path)
+    register_parser.add_argument("--rr-targets", type=Path)
     register_parser.add_argument("--trace6-targets", type=Path)
 
     submit_parser = subparsers.add_parser("submit")
@@ -460,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--max-instances", type=int, default=1)
     submit_parser.add_argument("--max-targets", type=int)
     submit_parser.add_argument("--max-trace6-targets", type=int)
+    submit_parser.add_argument("--campaign-timeout-seconds", type=int)
     submit_parser.add_argument("--trace-rate", type=int, default=1000)
     submit_parser.add_argument("--rr-rate", type=int, default=1000)
     submit_parser.add_argument("--trace6-rate", type=int, default=1000)
@@ -488,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "deploy":
         deploy(args)
     elif args.action == "register-targets":
+        if not any((args.trace_targets, args.rr_targets, args.trace6_targets)):
+            raise ValueError("at least one target source is required")
         register_targets(args)
     elif args.action == "submit":
         measurements = tuple(value.strip() for value in args.measurements.split(","))
