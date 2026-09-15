@@ -29,7 +29,7 @@ DEFAULT_BUDGET_SECONDS = 900
 PER_WORKER_TIMEOUT = 25
 
 REMOTE_SCRIPT = r"""
-pid=$(pgrep -f 'scamper -c' | head -1)
+pid=$(pgrep -x scamper | head -1)
 if [ -z "$pid" ]; then echo "NOSCAMPER"; exit 0; fi
 for fd in $(sudo ls /proc/$pid/fd 2>/dev/null); do
   t=$(sudo readlink /proc/$pid/fd/$fd 2>/dev/null)
@@ -69,6 +69,8 @@ def parse_probe(output: str) -> dict[str, Any]:
     """Turn the remote script's output into one worker's progress."""
     if "NOSCAMPER" in output:
         return {"state": "no-scamper"}
+    if not output.strip():
+        return {"state": "unreachable"}
     position = size = None
     measurement = "unknown"
     warts = 0

@@ -32,7 +32,20 @@ def test_parse_probe_reads_the_scamper_target_offset() -> None:
 
 def test_parse_probe_handles_a_worker_with_no_scamper() -> None:
     assert progress_probe.parse_probe("NOSCAMPER\n") == {"state": "no-scamper"}
-    assert progress_probe.parse_probe("")["state"] == "unknown"
+
+
+def test_parse_probe_distinguishes_silence_from_a_running_scamper() -> None:
+    # Empty output means the SSH attempt produced nothing, not that scamper is
+    # running without a target file; conflating the two hid ten dead workers.
+    assert progress_probe.parse_probe("")["state"] == "unreachable"
+    assert progress_probe.parse_probe("WARTS results/x.warts 5\n")["state"] == "unknown"
+
+
+def test_remote_script_does_not_match_its_own_shell() -> None:
+    # pgrep -f 'scamper -c' matched the bash wrapper carrying that same text, so
+    # a worker with no scamper reported "unknown" instead of "no-scamper".
+    assert "pgrep -x scamper" in progress_probe.REMOTE_SCRIPT
+    assert "pgrep -f" not in progress_probe.REMOTE_SCRIPT
 
 
 def test_parse_probe_survives_a_zero_sized_target_file() -> None:

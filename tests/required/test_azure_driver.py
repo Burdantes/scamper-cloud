@@ -301,6 +301,58 @@ def test_launch_locations_keeps_trying_until_requested_successes(monkeypatch) ->
     ]
 
 
+def test_launch_locations_caps_provisioning_concurrency(monkeypatch) -> None:
+    pool_sizes: list[int] = []
+
+    class RecordingPool(FakePool):
+        def __init__(self, size: int) -> None:
+            super().__init__(size)
+            pool_sizes.append(size)
+
+    monkeypatch.setattr(azr, "Pool", RecordingPool)
+    monkeypatch.setattr(azr.settings, "AZR_LAUNCH_CONCURRENCY", 2)
+
+    ips = azr.launch_locations(
+        "azr-test",
+        ["region-0", "region-1", "region-2", "region-3", "region-4"],
+        max_instances=4,
+    )
+
+    assert len(ips) == 4
+    assert pool_sizes == [2]
+
+
+def test_run_azr_scamper_continues_with_partial_location_coverage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target_file = tmp_path / "targets.txt"
+    target_file.write_text("192.0.2.1\n", encoding="utf-8")
+    monkeypatch.setattr(azr.settings, "SCAMPER_IP_DST", str(target_file))
+    monkeypatch.setattr(azr, "create_bucket", lambda _bucket: None)
+    monkeypatch.setattr(azr, "create_rg", lambda _prefix: None)
+    monkeypatch.setattr(
+        azr,
+        "launch_locations",
+        lambda *args, **kwargs: [("eastus", "203.0.113.10")],
+    )
+    cleaned: list[str] = []
+    monkeypatch.setattr(azr, "cleanup_resource_group", cleaned.append)
+    monkeypatch.setattr(azr, "record_expense_instances", lambda _count: None)
+    monkeypatch.setattr(azr, "send_to_cloud_storage", lambda *args: None)
+    monkeypatch.setattr(azr.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(0))
+    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "worker.sh"))
+    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "key"))
+
+    azr.run_azr_scamper(
+        str(tmp_path / "logs"),
+        "azr-test",
+        regions=("eastus", "westus"),
+    )
+
+    assert cleaned == ["azr-test"]
+
+
 def test_build_plan_uses_stable_bucket_and_per_run_prefix() -> None:
     plan = azr.build_plan("azr-test", "logs")
 
@@ -400,3 +452,15 @@ def test_worker_image_can_run_the_shared_campaign_runner() -> None:
     driver = (root / "providers/azure/driver.py").read_text(encoding="utf-8")
     assert "settings.AZR_IMAGE_SKU" in driver, "image must come from settings"
     assert 'offer="0001-com-ubuntu-server-focal"' not in driver
+
+
+def test_azure_workers_are_not_rebooted_by_platform_patching() -> None:
+    """Azure must not reboot a worker mid-campaign.
+
+    AutomaticByPlatform patches and reboots on Azure's schedule, which killed
+    scamper on 10 of 20 workers 55 minutes into the 2026-09-15 campaign.
+    """
+    source = Path(__file__).resolve().parents[2] / "providers/azure/driver.py"
+    text = source.read_text(encoding="utf-8")
+    assert 'patch_mode="ImageDefault"' in text
+    assert 'patch_mode="AutomaticByPlatform"' not in text

@@ -816,6 +816,26 @@ def create_network_interface(
     return nic_result
 
 
+def worker_size(location):
+    overrides = json.loads(os.environ.get("SCAMPER_AZR_VM_SIZES_JSON", "{}"))
+    if not isinstance(overrides, dict):
+        raise ValueError("SCAMPER_AZR_VM_SIZES_JSON must be an object")
+    size = overrides.get(location, settings.AZR_VM_SIZE)
+    if not isinstance(size, str) or not size.strip():
+        raise ValueError(f"invalid Azure VM size for {location}")
+    return size
+
+
+def worker_image_version(location):
+    versions = json.loads(os.environ.get("SCAMPER_AZR_IMAGE_VERSIONS_JSON", "{}"))
+    if not isinstance(versions, dict):
+        raise ValueError("SCAMPER_AZR_IMAGE_VERSIONS_JSON must be an object")
+    version = versions.get(location, settings.AZR_IMAGE_VERSION)
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(f"invalid Azure worker image version for {location}")
+    return version
+
+
 def create_vm(rg_name, location, vm_name, ni_id):
     from azure.mgmt.compute import ComputeManagementClient
     from azure.mgmt.compute.models import HardwareProfile
@@ -847,10 +867,10 @@ def create_vm(rg_name, location, vm_name, ni_id):
                         publisher=settings.AZR_IMAGE_PUBLISHER,
                         offer=settings.AZR_IMAGE_OFFER,
                         sku=settings.AZR_IMAGE_SKU,
-                        version=settings.AZR_IMAGE_VERSION,
+                        version=worker_image_version(location),
                     ),
                 ),
-                hardware_profile=HardwareProfile(vm_size=settings.AZR_VM_SIZE),
+                hardware_profile=HardwareProfile(vm_size=worker_size(location)),
                 os_profile=OSProfile(
                     computer_name=vm_name,
                     admin_username=settings.AZR_SCAMPER_USER,
@@ -865,8 +885,16 @@ def create_vm(rg_name, location, vm_name, ni_id):
                             ],
                         ),
                         provision_vm_agent=True,
+                        # AutomaticByPlatform lets Azure patch AND REBOOT the
+                        # worker on its own schedule. On 2026-09-15 that rebooted
+                        # 10 of 20 workers 55 minutes into a campaign, killing
+                        # scamper on each and leaving the driver waiting days for
+                        # artifacts that could never arrive. ImageDefault keeps
+                        # Ubuntu's unattended-upgrades, which ships with
+                        # Automatic-Reboot "false", so patches still land but the
+                        # measurement survives.
                         patch_settings=LinuxPatchSettings(
-                            patch_mode="AutomaticByPlatform",
+                            patch_mode="ImageDefault",
                             assessment_mode="ImageDefault",
                         ),
                     ),
@@ -944,7 +972,13 @@ def launch_locations(prefix, locations, max_instances=None, ipv6_enabled=False):
         ]
         if not run_infos:
             return ips
-        with Pool(len(run_infos)) as p:
+        pool_size = min(len(run_infos), settings.AZR_LAUNCH_CONCURRENCY)
+        logging.info(
+            "Launching %d Azure locations with concurrency %d",
+            len(run_infos),
+            pool_size,
+        )
+        with Pool(pool_size) as p:
             launched = p.map(launch_location, run_infos)
         return [loc_ip for loc_ip in launched if loc_ip is not None]
 
@@ -957,8 +991,13 @@ def launch_locations(prefix, locations, max_instances=None, ipv6_enabled=False):
             (prefix, location, True) if ipv6_enabled else (prefix, location)
             for location in batch_locations
         ]
-        logging.info("Launching Azure locations:%s", batch_locations)
-        with Pool(len(run_infos)) as p:
+        pool_size = min(len(run_infos), settings.AZR_LAUNCH_CONCURRENCY)
+        logging.info(
+            "Launching Azure locations:%s with concurrency %d",
+            batch_locations,
+            pool_size,
+        )
+        with Pool(pool_size) as p:
             launched = p.map(launch_location, run_infos)
         ips.extend(loc_ip for loc_ip in launched if loc_ip is not None)
 
@@ -1064,6 +1103,21 @@ def run_azr_scamper(
 
         if not ips:
             raise RuntimeError("no Azure instances were created")
+        if regions:
+            requested_locations = list(regions)
+            if max_instances is not None:
+                requested_locations = requested_locations[:max_instances]
+            created_locations = {location for location, _ip in ips}
+            missing_locations = [
+                location
+                for location in requested_locations
+                if location not in created_locations
+            ]
+            if missing_locations:
+                logging.warning(
+                    "Continuing Azure campaign without workers in requested locations: %s",
+                    ", ".join(missing_locations),
+                )
 
         for location, ip in ips:
             node = f"azr-{location}"
