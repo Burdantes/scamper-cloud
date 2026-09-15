@@ -185,6 +185,10 @@ def run_status(run_id: str, root: Path, readiness: dict[str, Any], result: dict[
     monthly = read_json(root / "monthly" / f"{cycle}.json") if cycle else {}
     recorded = recorded_result(monthly, run_id, provider)
     recorded_status = recorded.get("status") or summary.get("status")
+    # A later dispatch of the same cycle rewrites an earlier provider's record as
+    # "already-submitted", which would otherwise erase a recorded failure.
+    if recorded_status == "already-submitted":
+        recorded_status = recorded.get("previous_status") or summary.get("status")
     exit_code = str(service.get("exit_code") or "")
     ran = bool(service.get("since"))
     if service["active"] in {"active", "activating"}:

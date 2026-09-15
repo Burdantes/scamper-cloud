@@ -146,6 +146,26 @@ def test_dashboard_links_the_results_bucket() -> None:
     assert 'id="bucket"' in dashboard.INDEX
 
 
+def test_already_submitted_record_keeps_the_previous_outcome(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-aws-20260915"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "aws", "campaign_command": []})
+    write_json(tmp_path / "monthly/20260915.json", {"results": [
+        {"provider": "aws", "run_id": run_id, "status": "already-submitted", "previous_status": "failed"},
+    ]})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "inactive", "sub": "dead", "since": "", "exit_code": ""})
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "failed"
+
+
+def test_already_submitted_without_a_previous_outcome_is_not_invented(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-gcp-20260915"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "gcp", "campaign_command": []})
+    write_json(tmp_path / "monthly/20260915.json", {"results": [
+        {"provider": "gcp", "run_id": run_id, "status": "already-submitted"},
+    ]})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "inactive", "sub": "dead", "since": "", "exit_code": ""})
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "submitted"
+
+
 def test_dashboard_uses_plain_status_table() -> None:
     assert "Scamper run status" in dashboard.INDEX
     assert "<table>" in dashboard.INDEX
