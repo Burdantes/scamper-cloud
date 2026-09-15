@@ -119,6 +119,33 @@ def test_run_status_scopes_preflight_findings_to_the_matching_cycle(tmp_path: Pa
     assert dashboard.run_status("adhoc-azure-probe", tmp_path, {}, blocked, "20260814")["blocked_count"] == 1
 
 
+def test_run_status_links_where_the_data_is_saved(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-aws-20260915"
+    command = ["driver", "--bucket-name", "nsf-2148275-66720-scamper-measurements",
+               "--object-prefix", "runs/monthly/20260915/aws"]
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "aws", "campaign_command": command})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "inactive", "sub": "dead", "since": "", "exit_code": "0"})
+    results = dashboard.run_status(run_id, tmp_path, {}, {})["results"]
+    assert results["bucket"] == "nsf-2148275-66720-scamper-measurements"
+    assert results["prefix"] == "runs/monthly/20260915/aws"
+    assert results["uri"] == "gs://nsf-2148275-66720-scamper-measurements/runs/monthly/20260915/aws"
+    assert results["console"] == (
+        "https://console.cloud.google.com/storage/browser/"
+        "nsf-2148275-66720-scamper-measurements/runs/monthly/20260915/aws"
+    )
+
+
+def test_results_location_is_empty_without_a_bucket() -> None:
+    assert dashboard.results_location([]) == {}
+    assert dashboard.results_location(["driver", "--regions", "us-east-1"]) == {}
+
+
+def test_dashboard_links_the_results_bucket() -> None:
+    assert "<th>Results</th>" in dashboard.INDEX
+    assert 'rel="noopener"' in dashboard.INDEX
+    assert 'id="bucket"' in dashboard.INDEX
+
+
 def test_dashboard_uses_plain_status_table() -> None:
     assert "Scamper run status" in dashboard.INDEX
     assert "<table>" in dashboard.INDEX
