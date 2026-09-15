@@ -1,0 +1,11 @@
+[Unit]
+Description=Probe scamper campaign progress every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Unit=scamper-progress.service
+
+[Install]
+WantedBy=timers.target

@@ -132,6 +132,8 @@ install -m 0755 "${release_dir}/controller/run-aws-setup" /usr/local/bin/scamper
 install -m 0644 "${release_dir}/controller/scamper-monthly.service" /etc/systemd/system/scamper-monthly.service
 install -m 0644 "${release_dir}/controller/scamper-monthly.timer" /etc/systemd/system/scamper-monthly.timer
 install -m 0644 "${release_dir}/controller/scamper-dashboard.service" /etc/systemd/system/scamper-dashboard.service
+install -m 0644 "${release_dir}/controller/scamper-progress.service" /etc/systemd/system/scamper-progress.service
+install -m 0644 "${release_dir}/controller/scamper-progress.timer" /etc/systemd/system/scamper-progress.timer
 if [[ ! -f /etc/scamper-controller-monthly.json ]]; then
   install -m 0600 "${release_dir}/controller/monthly-config.example.json" /etc/scamper-controller-monthly.json
 fi

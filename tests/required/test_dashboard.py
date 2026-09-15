@@ -221,6 +221,55 @@ def test_run_detail_endpoint_rejects_path_traversal() -> None:
     assert not dashboard.RUN_ID_PATTERN.fullmatch("Run-With-Caps")
 
 
+def test_run_row_carries_measured_progress(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-aws-20260915-retry1"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "aws", "campaign_command": []})
+    write_json(tmp_path / f"jobs/{run_id}/progress.json", {
+        "fraction": 0.0412, "slowest": 0.0406, "fastest": 0.0416, "measurement": "trace",
+        "measuring": 27, "probed_at": "2026-09-15T23:20:00+00:00", "warts_bytes": 5_000_000_000,
+    })
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "active", "sub": "running", "since": "now", "exit_code": "0"})
+    progress = dashboard.run_status(run_id, tmp_path, {}, {})["progress"]
+    assert progress["fraction"] == 0.0412
+    assert progress["measurement"] == "trace"
+    assert progress["measuring"] == 27
+
+
+def test_run_row_has_no_progress_before_the_prober_runs(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-gcp-20260915"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "gcp", "campaign_command": []})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "active", "sub": "running", "since": "now", "exit_code": "0"})
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["progress"] == {}
+    write_json(tmp_path / f"jobs/{run_id}/progress.json", {"fraction": None, "workers": []})
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["progress"] == {}
+
+
+def test_run_detail_merges_measured_progress_per_worker(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-aws-20260915-retry1"
+    logs = tmp_path / "jobs" / run_id / "logs"
+    logs.mkdir(parents=True)
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "aws", "campaign_command": []})
+    (logs / f"{run_id}-af-south-1a-15.240.168.115.log").write_text("SCAMPER_COMMAND[trace]=x\n")
+    (logs / f"{run_id}-us-east-1a-44.1.2.3.log").write_text("SCAMPER_COMMAND[trace]=x\n")
+    write_json(tmp_path / f"jobs/{run_id}/progress.json", {"fraction": 0.04, "workers": [
+        {"address": "15.240.168.115", "state": "measuring", "fraction": 0.0416,
+         "measurement": "trace", "warts_bytes": 185572379},
+        {"address": "44.1.2.3", "state": "unreachable"},
+    ]})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "active", "sub": "running", "since": "now", "exit_code": "0"})
+    detail = dashboard.run_detail(run_id, tmp_path)
+    by_address = {item["address"]: item for item in detail["instances"]}
+    assert by_address["15.240.168.115"]["fraction"] == 0.0416
+    assert by_address["15.240.168.115"]["warts_bytes"] == 185572379
+    assert by_address["44.1.2.3"]["probe_state"] == "unreachable"
+    assert "fraction" not in by_address["44.1.2.3"]
+
+
+def test_dashboard_renders_a_progress_column() -> None:
+    assert "<th>Progress</th>" in dashboard.INDEX
+    assert "progCell" in dashboard.INDEX
+
+
 def test_dashboard_uses_plain_status_table() -> None:
     assert "Scamper run status" in dashboard.INDEX
     assert "<table>" in dashboard.INDEX
