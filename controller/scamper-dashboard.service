@@ -1,0 +1,23 @@
+[Unit]
+Description=Read-only Scamper campaign dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=scamper-controller
+Group=scamper-controller
+WorkingDirectory=/opt/scamper-cloud/current
+ExecStart=/opt/scamper-cloud/current/.venv/bin/python -m controller.dashboard --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
