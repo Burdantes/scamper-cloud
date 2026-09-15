@@ -23,6 +23,17 @@ CREATE_PATTERNS = (
     re.compile(r"Created azr-([a-z0-9-]+)"),
 )
 MONTHLY_RUN_PATTERN = re.compile(r"monthly-(aws|azure|gcp)-(\d{8})")
+RUN_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+# Ordered most-advanced first: the first marker present is the worker's phase.
+INSTANCE_PHASES = (
+    ("failed", re.compile(r"No campaign artifacts were produced")),
+    ("uploading", re.compile(r"upload\.py")),
+    ("measuring", re.compile(r"SCAMPER_COMMAND\[")),
+    ("smoke-passed", re.compile(r"SCAMPER_SMOKE_OK")),
+    ("smoke-testing", re.compile(r"Running scamper smoke test")),
+    ("installing", re.compile(r"apt install|apt-get update")),
+)
+INSTANCE_TAIL_BYTES = 32768
 READY_PATTERN = re.compile(r"Instance ([^ ]+) is ready for ssh")
 STARTED_PATTERN = re.compile(r"Instance ([^ ]+) started")
 # AWS logs "Waiting for N AWS artifacts to upload"; GCP logs "Waiting for N GCP
@@ -234,6 +245,60 @@ def provider_status(provider: str, cycle: str, root: Path, readiness: dict[str, 
     return run_status(f"monthly-{provider}-{cycle}", root, readiness, result)
 
 
+def instance_details(job_dir: Path, run_id: str) -> list[dict[str, Any]]:
+    """Per-worker state parsed from the driver's per-instance log files.
+
+    A campaign is silent for days between "scamper started" and "artifact
+    uploaded", so this is the only per-worker evidence that exists while it
+    runs: which location, which address, whether the smoke test passed, and
+    how far each worker got.
+    """
+    items: list[dict[str, Any]] = []
+    for path in sorted((job_dir / "logs").glob(f"{run_id}-*.log")):
+        remainder = path.name[len(run_id) + 1:-len(".log")]
+        location, _, address = remainder.rpartition("-")
+        try:
+            stat = path.stat()
+            with path.open("rb") as handle:
+                handle.seek(max(0, stat.st_size - INSTANCE_TAIL_BYTES))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        phase = next((name for name, pattern in INSTANCE_PHASES if pattern.search(text)), "starting")
+        smoke = len(re.findall(r"SCAMPER_SMOKE_OK", text))
+        lines = [line for line in text.splitlines() if line.strip()]
+        items.append({
+            "location": location or "unknown",
+            "address": address,
+            "phase": phase,
+            "smoke_ok": smoke,
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "last_line": lines[-1][:200] if lines else "",
+        })
+    return items
+
+
+def run_detail(run_id: str, root: Path = STATE_ROOT) -> dict[str, Any]:
+    job_dir = root / "jobs" / run_id
+    readiness = read_json(root / "september15" / "readiness.json")
+    result = read_json(root / "september15" / "result.json")
+    run = run_status(run_id, root, readiness, result)
+    instances = instance_details(job_dir, run_id)
+    phases: dict[str, int] = {}
+    for item in instances:
+        phases[item["phase"]] = phases.get(item["phase"], 0) + 1
+    log_path = job_dir / "logs" / f"{run_id}.log"
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run": run,
+        "instances": instances,
+        "instance_count": len(instances),
+        "phases": phases,
+        "log": clean_log_lines(log_path, 200),
+    }
+
+
 def dashboard_state(cycle: str | None = None, root: Path = STATE_ROOT,
                     release_root: Path = RELEASE_ROOT) -> dict[str, Any]:
     selected = cycle or newest_cycle(root)
@@ -277,18 +342,26 @@ def dashboard_state(cycle: str | None = None, root: Path = STATE_ROOT,
 INDEX = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Scamper run status</title><style>
-*{box-sizing:border-box}body{margin:0;background:#fff;color:#222;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}.page{max-width:1100px;margin:0 auto;padding:32px 20px 48px}header{border-bottom:1px solid #ddd;padding-bottom:16px;margin-bottom:24px}h1{font-size:24px;margin:0 0 6px}.muted,.meta{color:#666}.meta{font-size:13px}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:11px 10px;border-bottom:1px solid #ddd}th{font-size:12px;color:#555;background:#f7f7f7}tbody tr{cursor:pointer}tbody tr.selected{background:#eef3fb}.run{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}.cloud{font-weight:600}.state{font-weight:600}.running,.complete{color:#176b3a}.failed,.blocked{color:#a32626}.queued,.submitted{color:#745600}.details{min-width:240px}.results a{color:#15499a;word-break:break-all}.results a:visited{color:#15499a}.events{margin-top:30px}.events h2{font-size:16px;margin:0 0 10px}.log{height:260px;overflow:auto;white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:12px;color:#777;font-size:12px}.error{display:none;background:#fff3f3;color:#8a1f1f;padding:10px;margin-bottom:16px;border:1px solid #e5bcbc}@media(max-width:720px){.page{padding:20px 12px}table{display:block;overflow-x:auto}.footer{display:block}.footer span{display:block;margin-top:4px}}
-</style></head><body><main class="page"><header><h1>Scamper run status</h1><div id="summary" class="meta">Loading…</div></header><div id="error" class="error"></div><table><thead><tr><th>Run</th><th>Cloud</th><th>Cycle</th><th>Status</th><th>Regions</th><th>Created</th><th>Ready</th><th>Artifacts left</th><th>Results</th><th>Details</th></tr></thead><tbody id="runs"></tbody></table><section class="events"><h2>Recent events — <span id="event-run">none</span></h2><div class="log" id="log"></div></section><div class="footer"><span id="bucket">Data —</span><span id="release">Release —</span><span id="updated">Updated —</span></div></main><script>
+*{box-sizing:border-box}body{margin:0;background:#fff;color:#222;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}.page{max-width:1100px;margin:0 auto;padding:32px 20px 48px}header{border-bottom:1px solid #ddd;padding-bottom:16px;margin-bottom:24px}h1{font-size:24px;margin:0 0 6px}.muted,.meta{color:#666}.meta{font-size:13px}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:11px 10px;border-bottom:1px solid #ddd}th{font-size:12px;color:#555;background:#f7f7f7}tbody tr{cursor:pointer}tbody tr.selected{background:#eef3fb}.run{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}.cloud{font-weight:600}.state{font-weight:600}.running,.complete{color:#176b3a}.failed,.blocked{color:#a32626}.queued,.submitted{color:#745600}.details{min-width:240px}.results a{color:#15499a;word-break:break-all}.loghead{font-size:13px;margin:18px 0 8px;color:#555}#instances table{margin-top:10px}#instances th,#instances td{padding:6px 8px;font-size:13px}.phase-measuring,.phase-uploading{color:#176b3a;font-weight:600}.phase-failed{color:#a32626;font-weight:600}.phase-starting,.phase-installing,.phase-smoke-testing{color:#745600}.addr{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#555}.results a:visited{color:#15499a}.events{margin-top:30px}.events h2{font-size:16px;margin:0 0 10px}.log{height:260px;overflow:auto;white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:12px;color:#777;font-size:12px}.error{display:none;background:#fff3f3;color:#8a1f1f;padding:10px;margin-bottom:16px;border:1px solid #e5bcbc}@media(max-width:720px){.page{padding:20px 12px}table{display:block;overflow-x:auto}.footer{display:block}.footer span{display:block;margin-top:4px}}
+</style></head><body><main class="page"><header><h1>Scamper run status</h1><div id="summary" class="meta">Loading…</div></header><div id="error" class="error"></div><table><thead><tr><th>Run</th><th>Cloud</th><th>Cycle</th><th>Status</th><th>Regions</th><th>Created</th><th>Ready</th><th>Artifacts left</th><th>Results</th><th>Details</th></tr></thead><tbody id="runs"></tbody></table><section class="events"><h2>Run detail &mdash; <span id="event-run">none</span></h2><div id="detail-summary" class="meta">Select a run.</div><div id="instances"></div><h3 class="loghead">Campaign log</h3><div class="log" id="log"></div></section><div class="footer"><span id="bucket">Data —</span><span id="release">Release —</span><span id="updated">Updated —</span></div></main><script>
 const esc=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=n=>n==null?'—':Number(n).toLocaleString();
-let latest=null,selected=null;
+let latest=null,selected=null,shownDetail=null;
 function detailOf(p){return p.failure_reason||(p.blocked_count?`${p.blocked_count} preflight findings. ${p.blocked_reasons[0]}`:(p.state==='failed'?`Exited with code ${p.exit_code}`:'—'));}
 function resultsCell(p){const r=p.results;if(!r||!r.bucket)return '&mdash;';return `<a href="${esc(r.console)}" target="_blank" rel="noopener" title="${esc(r.uri)}">${esc(r.prefix||r.bucket)}</a>`;}
 function shown(d){const runs=d.runs||[];return runs.find(p=>p.run_id===selected)||runs.find(p=>p.state==='running')||runs.find(p=>p.recent?.length)||runs[0];}
-function draw(d){latest=d;const runs=d.runs||[];const total=Object.values(d.targets||{}).reduce((a,n)=>a+(n||0),0);const scope=d.cycle_filter?`cycle ${d.cycle_filter}`:'all runs';document.querySelector('#summary').textContent=`${num(d.run_count)} runs (${scope}) · newest cycle ${d.cycle} · ${d.overall} · active run: ${d.active_run||'none'} · ${num(total)} targets per cloud · refreshes every 15 seconds`;const current=shown(d);document.querySelector('#runs').innerHTML=runs.map(p=>`<tr data-run="${esc(p.run_id)}" class="${p.run_id===current?.run_id?'selected':''}"><td class="run">${esc(p.run_id)}</td><td class="cloud">${esc(p.provider.toUpperCase())}</td><td>${esc(p.cycle||'—')}</td><td class="state ${esc(p.state)}">${esc(p.state)}</td><td>${num(p.regions)}</td><td>${num(p.milestones?.created)}</td><td>${num(p.milestones?.ready)}</td><td>${num(p.milestones?.artifacts_remaining)}</td><td class="results">${resultsCell(p)}</td><td class="details">${esc(detailOf(p))}</td></tr>`).join('');document.querySelector('#event-run').textContent=current?.run_id||'none';document.querySelector('#log').textContent=(current?.recent||[]).join('\\n')||'No recent events.';document.querySelector('#bucket').textContent=current?.results?.uri?`Data ${current.results.uri}`:(d.bucket?`Data gs://${d.bucket}`:'Data —');document.querySelector('#release').textContent=`Release ${d.release?.release||'unknown'} · ${(d.release?.bundle_sha256||d.release?.sha256||'').slice(0,12)}`;document.querySelector('#updated').textContent=`Updated ${new Date(d.generated_at).toLocaleString()}`;}
-document.querySelector('#runs').addEventListener('click',e=>{const row=e.target.closest('tr[data-run]');if(!row||!latest)return;selected=row.dataset.run;draw(latest);});
+function draw(d){latest=d;const runs=d.runs||[];const total=Object.values(d.targets||{}).reduce((a,n)=>a+(n||0),0);const scope=d.cycle_filter?`cycle ${d.cycle_filter}`:'all runs';document.querySelector('#summary').textContent=`${num(d.run_count)} runs (${scope}) · newest cycle ${d.cycle} · ${d.overall} · active run: ${d.active_run||'none'} · ${num(total)} targets per cloud · refreshes every 15 seconds`;const current=shown(d);document.querySelector('#runs').innerHTML=runs.map(p=>`<tr data-run="${esc(p.run_id)}" class="${p.run_id===current?.run_id?'selected':''}"><td class="run">${esc(p.run_id)}</td><td class="cloud">${esc(p.provider.toUpperCase())}</td><td>${esc(p.cycle||'—')}</td><td class="state ${esc(p.state)}">${esc(p.state)}</td><td>${num(p.regions)}</td><td>${num(p.milestones?.created)}</td><td>${num(p.milestones?.ready)}</td><td>${num(p.milestones?.artifacts_remaining)}</td><td class="results">${resultsCell(p)}</td><td class="details">${esc(detailOf(p))}</td></tr>`).join('');document.querySelector('#event-run').textContent=current?.run_id||'none';if(current&&current.run_id!==shownDetail){shownDetail=current.run_id;loadDetail(current.run_id);}document.querySelector('#bucket').textContent=current?.results?.uri?`Data ${current.results.uri}`:(d.bucket?`Data gs://${d.bucket}`:'Data —');document.querySelector('#release').textContent=`Release ${d.release?.release||'unknown'} · ${(d.release?.bundle_sha256||d.release?.sha256||'').slice(0,12)}`;document.querySelector('#updated').textContent=`Updated ${new Date(d.generated_at).toLocaleString()}`;}
+const ago=iso=>{if(!iso)return '—';const s=(Date.now()-new Date(iso).getTime())/1000;if(s<90)return Math.round(s)+'s ago';if(s<5400)return Math.round(s/60)+'m ago';if(s<172800)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago';};
+const kb=n=>n==null?'—':(n>=1048576?(n/1048576).toFixed(1)+' MB':Math.round(n/1024)+' KB');
+async function loadDetail(runId){try{const r=await fetch('/api/run?run_id='+encodeURIComponent(runId),{cache:'no-store'});if(!r.ok)throw Error('status '+r.status);const d=await r.json();if(shownDetail!==runId)return;renderDetail(d);}catch(e){document.querySelector('#detail-summary').textContent='Could not load run detail: '+e.message;}}
+function renderDetail(d){const phases=Object.entries(d.phases||{}).map(([k,v])=>`${v} ${k}`).join(' · ')||'no workers yet';
+document.querySelector('#detail-summary').textContent=`${d.instance_count} workers · ${phases} · submitted ${ago(d.run?.submitted_at)}`;
+const rows=(d.instances||[]).map(i=>`<tr><td>${esc(i.location)}</td><td class="addr">${esc(i.address)}</td><td class="phase-${esc(i.phase)}">${esc(i.phase)}</td><td>${i.smoke_ok?esc(i.smoke_ok):'—'}</td><td>${kb(i.size)}</td><td>${esc(ago(i.modified))}</td><td class="details">${esc(i.last_line)}</td></tr>`).join('');
+document.querySelector('#instances').innerHTML=rows?`<table><thead><tr><th>Location</th><th>Address</th><th>Phase</th><th>Smoke</th><th>Log</th><th>Last write</th><th>Last line</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="muted">No per-worker logs yet.</p>';
+document.querySelector('#log').textContent=(d.log||[]).join('\\n')||'No recent events.';}
+document.querySelector('#runs').addEventListener('click',e=>{const row=e.target.closest('tr[data-run]');if(!row||!latest)return;selected=row.dataset.run;shownDetail=null;draw(latest);});
 async function refresh(){try{const cycle=new URLSearchParams(location.search).get('cycle')||'';const r=await fetch('/api/status?cycle='+encodeURIComponent(cycle),{cache:'no-store'});if(!r.ok)throw Error('status '+r.status);draw(await r.json());document.querySelector('#error').style.display='none'}catch(e){const n=document.querySelector('#error');n.textContent='Dashboard refresh failed: '+e.message;n.style.display='block'}}
-refresh();setInterval(refresh,15000);
+refresh();setInterval(refresh,15000);setInterval(()=>{if(shownDetail)loadDetail(shownDetail);},30000);
 </script></body></html>"""
 
 
@@ -307,6 +380,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.respond(b'{"error":"invalid cycle"}', "application/json", HTTPStatus.BAD_REQUEST)
                 return
             payload = json.dumps(dashboard_state(cycle), separators=(",", ":")).encode()
+            self.respond(payload, "application/json")
+            return
+        if parsed.path == "/api/run":
+            run_id = parse_qs(parsed.query).get("run_id", [""])[0]
+            if not RUN_ID_PATTERN.fullmatch(run_id):
+                self.respond(b'{"error":"invalid run id"}', "application/json", HTTPStatus.BAD_REQUEST)
+                return
+            payload = json.dumps(run_detail(run_id), separators=(",", ":")).encode()
             self.respond(payload, "application/json")
             return
         self.respond(b"not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)

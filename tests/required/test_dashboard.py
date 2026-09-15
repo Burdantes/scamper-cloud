@@ -166,6 +166,61 @@ def test_already_submitted_without_a_previous_outcome_is_not_invented(tmp_path: 
     assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "submitted"
 
 
+def test_instance_details_report_each_worker_phase(tmp_path: Path) -> None:
+    run_id = "monthly-aws-20260915-retry1"
+    logs = tmp_path / "jobs" / run_id / "logs"
+    logs.mkdir(parents=True)
+    (logs / f"{run_id}-af-south-1a-15.240.168.115.log").write_text(
+        "apt-get update\nRunning scamper smoke test for aws against 8.8.8.8\n"
+        "SCAMPER_SMOKE_OK target=8.8.8.8 hops=5\nSCAMPER_SMOKE_OK target=2606:4700:4700::1111 hops=5\n"
+        "SCAMPER_COMMAND[trace]=scamper -c 'trace'\n"
+    )
+    (logs / f"{run_id}-us-east-1a-44.1.2.3.log").write_text("apt-get update\napt install -y scamper\n")
+    (logs / f"{run_id}-eu-west-3a-52.9.9.9.log").write_text("No campaign artifacts were produced\n")
+    (logs / f"{run_id}.log").write_text("Creating Instance in af-south-1\n")
+    items = dashboard.instance_details(tmp_path / "jobs" / run_id, run_id)
+    by_location = {item["location"]: item for item in items}
+    assert by_location["af-south-1a"]["phase"] == "measuring"
+    assert by_location["af-south-1a"]["smoke_ok"] == 2
+    assert by_location["af-south-1a"]["address"] == "15.240.168.115"
+    assert by_location["us-east-1a"]["phase"] == "installing"
+    assert by_location["eu-west-3a"]["phase"] == "failed"
+    # The campaign's own log must not be mistaken for a worker.
+    assert run_id not in by_location
+
+
+def test_instance_details_handle_gcp_zone_names(tmp_path: Path) -> None:
+    run_id = "monthly-gcp-20260915"
+    logs = tmp_path / "jobs" / run_id / "logs"
+    logs.mkdir(parents=True)
+    (logs / f"{run_id}-africa-south1-a-34.1.218.192.log").write_text("SCAMPER_COMMAND[trace]=x\n")
+    items = dashboard.instance_details(tmp_path / "jobs" / run_id, run_id)
+    assert items[0]["location"] == "africa-south1-a"
+    assert items[0]["address"] == "34.1.218.192"
+
+
+def test_run_detail_summarises_phases(tmp_path: Path, monkeypatch) -> None:
+    run_id = "monthly-azure-20260915-part1"
+    logs = tmp_path / "jobs" / run_id / "logs"
+    logs.mkdir(parents=True)
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"provider": "azure", "campaign_command": []})
+    (logs / f"{run_id}-eastus-20.1.1.1.log").write_text("SCAMPER_COMMAND[trace]=x\n")
+    (logs / f"{run_id}-uksouth-20.2.2.2.log").write_text("SCAMPER_COMMAND[trace]=x\n")
+    (logs / f"{run_id}-japaneast-20.3.3.3.log").write_text("apt-get update\n")
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "active", "sub": "running", "since": "now", "exit_code": "0"})
+    detail = dashboard.run_detail(run_id, tmp_path)
+    assert detail["instance_count"] == 3
+    assert detail["phases"] == {"measuring": 2, "installing": 1}
+    assert detail["run"]["state"] == "running"
+
+
+def test_run_detail_endpoint_rejects_path_traversal() -> None:
+    assert dashboard.RUN_ID_PATTERN.fullmatch("monthly-aws-20260915-retry1")
+    assert not dashboard.RUN_ID_PATTERN.fullmatch("../../etc/passwd")
+    assert not dashboard.RUN_ID_PATTERN.fullmatch("run/../../x")
+    assert not dashboard.RUN_ID_PATTERN.fullmatch("Run-With-Caps")
+
+
 def test_dashboard_uses_plain_status_table() -> None:
     assert "Scamper run status" in dashboard.INDEX
     assert "<table>" in dashboard.INDEX
