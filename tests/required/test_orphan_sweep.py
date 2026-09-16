@@ -45,8 +45,9 @@ def test_active_states_are_recognised(monkeypatch) -> None:
 def test_sweep_reports_without_deleting_by_default(tmp_path: Path, monkeypatch) -> None:
     write_job(tmp_path, "monthly-azure-20260915-part1")
     monkeypatch.setattr(orphan_sweep, "azure_orphans", lambda known: [
-        {"provider": "azure", "run_id": "monthly-azure-20260915-part1",
-         "resource_group": "monthly-azure-20260915-part1", "location": "eastus", "resources": 120},
+        {"provider": "azure", "run_id": "monthly-azure-20260915-part1", "deletable": True,
+         "resource_group": "monthly-azure-20260915-part1", "location": "eastus",
+         "resources": 120, "vms": 20, "disks": 20, "public_ips": 20, "idle_billable": False},
     ])
     deleted = []
     monkeypatch.setattr(orphan_sweep, "delete_azure_group", lambda name: deleted.append(name))
@@ -59,8 +60,9 @@ def test_sweep_reports_without_deleting_by_default(tmp_path: Path, monkeypatch) 
 def test_sweep_deletes_only_with_apply(tmp_path: Path, monkeypatch) -> None:
     write_job(tmp_path, "run")
     monkeypatch.setattr(orphan_sweep, "azure_orphans", lambda known: [
-        {"provider": "azure", "run_id": "run", "resource_group": "run",
-         "location": "eastus", "resources": 6},
+        {"provider": "azure", "run_id": "run", "resource_group": "run", "deletable": True,
+         "location": "eastus", "resources": 6, "vms": 1, "disks": 1, "public_ips": 1,
+         "idle_billable": False},
     ])
     deleted = []
     monkeypatch.setattr(orphan_sweep, "delete_azure_group", lambda name: deleted.append(name))
@@ -82,8 +84,9 @@ def test_a_provider_error_is_recorded_not_raised(tmp_path: Path, monkeypatch) ->
 def test_report_exit_code_surfaces_orphans(tmp_path: Path, monkeypatch) -> None:
     write_job(tmp_path, "run")
     monkeypatch.setattr(orphan_sweep, "azure_orphans", lambda known: [
-        {"provider": "azure", "run_id": "run", "resource_group": "run",
-         "location": "eastus", "resources": 6},
+        {"provider": "azure", "run_id": "run", "resource_group": "run", "deletable": True,
+         "location": "eastus", "resources": 6, "vms": 1, "disks": 1, "public_ips": 1,
+         "idle_billable": False},
     ])
     assert orphan_sweep.main(["--state-root", str(tmp_path)]) == 1
     saved = json.loads((tmp_path / "orphans.json").read_text())
@@ -114,3 +117,36 @@ def test_sweep_units_are_installed_by_bootstrap() -> None:
     assert "scamper-orphan-sweep.timer" in bootstrap
     # Reporting, never deleting, on the timer's automatic path.
     assert "--apply" not in service
+
+
+def test_a_group_with_no_job_record_is_reported_but_never_deleted(tmp_path: Path, monkeypatch) -> None:
+    """The March 2026 bill came from azr-1773102831, which matched no job record.
+
+    Detection has to cover it; deletion must not, because the controller cannot
+    prove it created the group.
+    """
+    monkeypatch.setattr(orphan_sweep, "azure_orphans", lambda known: [
+        {"provider": "azure", "run_id": None, "resource_group": "azr-1773102831",
+         "location": "eastus", "resources": 118, "vms": 0, "disks": 59, "public_ips": 59,
+         "deletable": False, "idle_billable": True},
+    ])
+    deleted = []
+    monkeypatch.setattr(orphan_sweep, "delete_azure_group", lambda name: deleted.append(name))
+    report = orphan_sweep.sweep(tmp_path, apply=True)
+    assert report["orphan_count"] == 1
+    assert report["idle_billable_count"] == 1
+    assert report["billable_resources"] == 118
+    assert deleted == []
+    assert any("delete it by hand" in error for error in report["errors"])
+
+
+def test_billable_types_cover_what_actually_bills_without_a_vm() -> None:
+    # Disks and public IPs kept billing after the VMs went away: $142 Storage
+    # plus $96 Virtual Network against $6 of compute.
+    assert "Microsoft.Compute/disks" in orphan_sweep.BILLABLE_TYPES
+    assert "Microsoft.Network/publicIPAddresses" in orphan_sweep.BILLABLE_TYPES
+    assert "Microsoft.Compute/virtualMachines" in orphan_sweep.BILLABLE_TYPES
+    # Free resources must not raise an alert on their own.
+    assert "Microsoft.Network/virtualNetworks" not in orphan_sweep.BILLABLE_TYPES
+    assert "Microsoft.Network/networkSecurityGroups" not in orphan_sweep.BILLABLE_TYPES
+    assert "NetworkWatcherRG" in orphan_sweep.IGNORED_GROUPS

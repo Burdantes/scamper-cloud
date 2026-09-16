@@ -50,7 +50,24 @@ def campaign_is_active(run_id: str) -> bool:
     return result.stdout.strip() in {"active", "activating", "reloading", "deactivating"}
 
 
+BILLABLE_TYPES = {
+    "Microsoft.Compute/virtualMachines": "vms",
+    "Microsoft.Compute/disks": "disks",
+    "Microsoft.Network/publicIPAddresses": "public_ips",
+}
+# Groups Azure or another project owns, which this sweep must never report on.
+IGNORED_GROUPS = {"NetworkWatcherRG", "DefaultResourceGroup", "cloud-shell-storage"}
+
+
 def azure_orphans(known: set[str]) -> list[dict[str, Any]]:
+    """Resource groups holding billable resources that no live campaign owns.
+
+    Disks and public IP addresses keep billing after their VM is gone, which is
+    how March 2026 cost $240 from one group: $142 of Storage and $96 of Virtual
+    Network against $6 of compute. Detection therefore covers any group holding
+    billable resources, not only groups named after a known run - the group that
+    caused that bill, azr-1773102831, matched no job record at all.
+    """
     from azure.identity import ClientSecretCredential
     from azure.mgmt.resource.resources import ResourceManagementClient
 
@@ -61,18 +78,40 @@ def azure_orphans(known: set[str]) -> list[dict[str, Any]]:
         os.environ["AZURE_CLIENT_SECRET"],
     )
     client = ResourceManagementClient(credential, subscription)
-    counts: dict[str, int] = {}
+    tally: dict[str, dict[str, int]] = {}
     for resource in client.resources.list():
         group = resource.id.split("/")[4]
-        counts[group] = counts.get(group, 0) + 1
+        counts = tally.setdefault(group, {"vms": 0, "disks": 0, "public_ips": 0, "total": 0})
+        counts["total"] += 1
+        key = BILLABLE_TYPES.get(resource.type)
+        if key:
+            counts[key] += 1
+
     found = []
     for group in client.resource_groups.list():
         name = group.name
-        if name not in known or campaign_is_active(name):
+        counts = tally.get(name)
+        if not counts or any(name.startswith(prefix) for prefix in IGNORED_GROUPS):
+            continue
+        billable = counts["vms"] + counts["disks"] + counts["public_ips"]
+        if not billable:
+            continue
+        owned = name in known
+        if owned and campaign_is_active(name):
             continue
         found.append({
-            "provider": "azure", "run_id": name, "resource_group": name,
-            "location": group.location, "resources": counts.get(name, 0),
+            "provider": "azure",
+            "run_id": name if owned else None,
+            "resource_group": name,
+            "location": group.location,
+            "resources": counts["total"],
+            "vms": counts["vms"],
+            "disks": counts["disks"],
+            "public_ips": counts["public_ips"],
+            # Only a group this controller created is ever safe to delete.
+            "deletable": owned,
+            # Disks and IPs with no VM are the expensive, silent case.
+            "idle_billable": counts["vms"] == 0,
         })
     return found
 
@@ -107,6 +146,12 @@ def sweep(root: Path = STATE_ROOT, apply: bool = False) -> dict[str, Any]:
     deleted = []
     if apply:
         for orphan in orphans:
+            if not orphan.get("deletable"):
+                errors.append(
+                    f"{orphan['resource_group']}: not created by this controller, "
+                    "delete it by hand after checking what it is"
+                )
+                continue
             try:
                 delete_azure_group(orphan["resource_group"])
                 deleted.append(orphan["run_id"])
@@ -118,6 +163,10 @@ def sweep(root: Path = STATE_ROOT, apply: bool = False) -> dict[str, Any]:
         "applied": apply,
         "orphans": orphans,
         "orphan_count": len(orphans),
+        "idle_billable_count": sum(1 for item in orphans if item.get("idle_billable")),
+        "billable_resources": sum(
+            item["vms"] + item["disks"] + item["public_ips"] for item in orphans
+        ),
         "deleted": deleted,
         "errors": errors,
     }
