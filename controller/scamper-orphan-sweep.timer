@@ -1,0 +1,11 @@
+[Unit]
+Description=Sweep for unowned cloud workers every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Unit=scamper-orphan-sweep.service
+
+[Install]
+WantedBy=timers.target

@@ -94,10 +94,18 @@ def bundle_repository(destination: Path) -> None:
         "skill-observations",
         "warts",
     }
+    excluded_subtrees = {
+        Path("target_generation/ipv6_bgp/downloads"),
+    }
     with tarfile.open(destination, "w:gz") as archive:
         for path in REPO_ROOT.rglob("*"):
             relative = path.relative_to(REPO_ROOT)
             if relative.parts[0] in excluded_top_level:
+                continue
+            if any(
+                relative == subtree or subtree in relative.parents
+                for subtree in excluded_subtrees
+            ):
                 continue
             if "__pycache__" in relative.parts or path.suffix == ".pyc":
                 continue

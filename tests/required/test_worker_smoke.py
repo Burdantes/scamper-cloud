@@ -87,6 +87,16 @@ def test_azure_ipv6_guest_firewall_allows_icmp_and_drops_other_input() -> None:
     assert '[[ "$provider" == "azr" ]]' in script
 
 
+def test_azure_worker_waits_for_cloud_init_and_retries_package_locks() -> None:
+    script = (REPO_ROOT / "providers/azure/worker/run-scamper-azr.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "cloud-init status --wait" in script
+    assert "retry_package_command apt-get update" in script
+    assert "retry_package_command apt install -y scamper python3-pip" in script
+
+
 def test_validate_scamper_smoke_text_accepts_reasonable_trace(tmp_path: Path) -> None:
     trace_text = tmp_path / "trace.txt"
     trace_text.write_text(

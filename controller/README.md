@@ -114,7 +114,8 @@ The operator-owned `/etc/scamper-controller-monthly.json` must contain:
 - a positive `max_instances` safety cap for every provider.
 
 Use `max_trace6_targets` independently of the IPv4 `max_targets` cap. The
-checked-in schema-2 example starts at 1,000 IPv6 targets per worker. Each
+checked-in schema-2 example is a full production footprint with both target
+caps disabled. Each
 provider also has a `campaign_timeout_seconds` lease. The controller passes it
 through the durable systemd unit to the provider driver and refuses monthly
 dispatch when the capped target counts and packet rates cannot fit within the
@@ -128,10 +129,24 @@ python -m controller.manage schedule-status --apply
 python -m controller.manage schedule-enable --apply
 ```
 
-The dispatcher validates every provider before submitting any job. It refuses
-to run with missing targets, worker assets, AWS/Azure credentials, exclusions,
-or an incomplete provider set. Run IDs use `monthly-PROVIDER-YYYYMM`; existing
-job records are skipped, and a controller lock prevents overlapping dispatches.
+The dispatcher validates every provider before submitting any job. It then
+submits providers serially and waits for each durable campaign service to reach
+a terminal result before starting the next one. A provider failure is recorded
+and does not suppress later providers. This prevents provider control processes
+from competing for controller memory. It refuses to run with missing targets,
+worker assets, AWS/Azure credentials, exclusions, or an incomplete provider
+set. Scheduled run IDs use `monthly-PROVIDER-YYYYMM`; existing job records are
+skipped, and a controller lock prevents overlapping dispatches. A deliberate
+same-month rerun can use `scamper-controller-monthly run --cycle YYYYMMDD` to
+place its jobs, state, and bucket objects in a distinct date-qualified
+namespace.
+
+Production schedules should list every intended provider region explicitly,
+set `max_instances` to that exact list length, and leave both target caps null.
+Each driver creates one worker per provider region, using availability zones
+only as launch fallbacks. Explicit region lists are a completeness contract: if
+any requested region cannot launch a worker, that provider fails and cleans up
+instead of publishing a partial run as complete.
 
 ### AWS controller identity and regional preparation
 
@@ -158,8 +173,9 @@ sudo -u scamper-controller /usr/local/bin/scamper-controller-aws-credentials cla
 ```
 
 Create `ScamperCloudController`, attach
-`controller/aws-controller-policy.json` as an inline policy, and adjust the
-`aws:RequestedRegion` list if the schedule uses more than `us-east-1`. The trust
+`controller/aws-controller-policy.json` as an inline policy. Keep its
+`aws:RequestedRegion` allowlist synchronized with the explicit regions in the
+monthly schedule. The trust
 relationship must retain all three `accounts.google.com` conditions; omitting
 one lets a different Google workload or audience assume the role.
 
@@ -168,7 +184,7 @@ same checks the monthly timer uses:
 
 ```bash
 sudo -u scamper-controller /usr/local/bin/scamper-controller-aws \
-  prepare --regions us-east-1
+  prepare --regions us-east-1,us-east-2,us-west-1,us-west-2
 sudo /usr/local/bin/scamper-controller-monthly check
 ```
 
@@ -193,5 +209,77 @@ VM:
 /usr/local/bin/scamper-controller-monthly register-targets \
   --trace-targets /path/to/trace-targets.txt \
   --rr-targets /path/to/rr-targets.tsv \
-  --trace6-targets /path/to/ipv6-hitlist-targets.txt
+  --trace6-targets /path/to/ipv6-all-route-selectable-prefixes.txt
 ```
+
+## Launch validation and explicit worker selection
+
+Monthly GCP entries support `worker_image_project`, `worker_image_family`, and
+`worker_image` (an exact image name). The default public family is Debian 12.
+The scheduler resolves the family immediately before dispatching GCP and passes
+its exact image name to the worker driver. A laptop-only image environment
+variable does not configure the remote timer. Public-image bootstrap installs
+Python dependencies in a venv, including on externally managed Debian systems.
+
+Azure entries may add `worker_machine_types_by_region`, for example
+`{"westindia": "Standard_B2s"}`. Overrides must name configured regions. The
+regional check and VM creation use the same size selection. This does not grant
+access to restricted Azure locations or make unavailable public-IP resources
+available.
+
+`scamper-controller-monthly check` now performs read-only launch validation in
+bounded subprocesses (ten minutes maximum per provider). GCP validates its image
+and regional machine types; Azure checks provider/resource locations, VM SKU
+restrictions, and image availability; AWS checks its configured sizes against
+available zones with public default subnets. The AWS role needs the additional
+read-only `ec2:DescribeInstanceTypeOfferings` action in the bundled policy.
+The AWS driver skips zones without the required default public subnet.
+Readiness cannot guarantee transient launch capacity or replace a live canary.
+
+Each provider is revalidated just before its own launch because the previous
+provider can run for days. Explicit job settings are reapplied after the wrapper
+loads environment defaults. Region lists must be unique and `max_instances`
+must equal their count. The scheduler preserves coverage rather than silently
+omitting a failed region. Provider results are checkpointed as they finish; a
+failed or unverified existing job produces a nonzero aggregate exit status.
+
+Deployment remains on the persistent controller VM, with the staged release's
+required tests passing before changing the active symlink. Keep the timer
+paused while regional readiness or canary validation is unresolved.
+
+Azure image lookup resolves `latest` via the version list before requesting
+image details. The resolved version is passed to each regional worker; optional
+`worker_image_versions_by_region` entries can pin versions in monthly JSON.
+Azure SKU paging is scoped to one region and one requested size; launch-check
+subprocesses are limited to 1 GiB of address space on Linux.
+
+## Read-only dashboard
+
+The controller includes a small status dashboard that binds only to loopback on
+port 8787. It reads campaign state, job specifications, provider logs, and the
+active release metadata as the unprivileged `scamper-controller` account. Start
+it with `sudo systemctl enable --now scamper-dashboard.service` and reach it
+through an SSH tunnel:
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 CONTROLLER
+```
+
+Then open `http://127.0.0.1:8787`. The page lists every run that has a job
+record under `/var/lib/scamper-controller/jobs`, whatever its run ID, newest
+cycle first, and it does not assume the `monthly-PROVIDER-YYYYMMDD` naming; the
+provider and cycle of an ad-hoc run come from its `job.json`. The three clouds
+of the in-flight monthly cycle stay listed as `queued` before their jobs are
+submitted. Click a row to read that run's recent events; append
+`?cycle=YYYYMMDD` to narrow the table to one cycle. The Results column links
+each run to the Cloud Storage prefix its artifacts are uploaded to, taken from
+the run's own `--bucket-name` and `--object-prefix`, and the footer shows the
+`gs://` URI of the selected run. The page refreshes every 15
+seconds. It does not expose campaign commands, credentials, or a public
+listening port.
+
+`worker_machine_types_by_region` also accepts GCP region-to-machine overrides.
+N4 workers use Hyperdisk Balanced with NVMe and a gVNIC interface. Validate a
+new machine family with a capped live canary before applying its regional
+override to production. Azure SKU region and restriction comparisons are
+case-insensitive, including SDK models exposing JSON fields through mappings.

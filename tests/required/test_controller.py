@@ -2,10 +2,32 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import tarfile
 from pathlib import Path
 
 from controller import manage, submit
 from providers.gcp.driver import expected_campaign_artifacts
+
+
+def test_controller_bundle_excludes_large_ipv6_download_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    source = repository / "controller" / "manage.py"
+    cache = repository / "target_generation" / "ipv6_bgp" / "downloads" / "rib.bz2"
+    source.parent.mkdir(parents=True)
+    cache.parent.mkdir(parents=True)
+    source.write_text("source\n", encoding="utf-8")
+    cache.write_text("cache\n", encoding="utf-8")
+    monkeypatch.setattr(manage, "REPO_ROOT", repository)
+    bundle = tmp_path / "bundle.tar.gz"
+
+    manage.bundle_repository(bundle)
+
+    with tarfile.open(bundle, "r:gz") as archive:
+        names = archive.getnames()
+    assert "controller/manage.py" in names
+    assert "target_generation/ipv6_bgp/downloads/rib.bz2" not in names
 
 
 def test_controller_provision_is_us_and_standard() -> None:
@@ -77,7 +99,35 @@ def test_systemd_unit_is_durable_and_runs_as_controller(tmp_path: Path) -> None:
     assert "--setenv=SCAMPER_GCP_SCAMPER_TIMEOUT_SECONDS=7200" in command
     assert "--uid=scamper-controller" in command
     assert "/usr/local/bin/scamper-controller-run" in command
+    assert "--wait" not in command
     assert command[-2:] == ["python", "gcp.py"]
+
+
+def test_systemd_unit_can_wait_for_terminal_campaign_status() -> None:
+    args = argparse.Namespace(
+        provider="gcp",
+        run_id="test-run",
+        worker_machine_type="e2-medium",
+        campaign_timeout_seconds=7200,
+        wait_for_completion=True,
+    )
+
+    command = submit.systemd_command(args, ["python", "gcp.py"])
+
+    assert "--wait" in command
+
+
+def test_azure_systemd_unit_caps_location_launch_concurrency() -> None:
+    args = argparse.Namespace(
+        provider="azure",
+        run_id="test-run",
+        worker_machine_type="Standard_B2ts_v2",
+        campaign_timeout_seconds=7200,
+    )
+
+    command = submit.systemd_command(args, ["python", "azure.py"])
+
+    assert "--setenv=SCAMPER_AZR_LAUNCH_CONCURRENCY=4" in command
 
 
 def test_systemd_unit_can_select_prebuilt_worker_image() -> None:

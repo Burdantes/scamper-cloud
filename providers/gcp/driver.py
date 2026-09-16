@@ -24,6 +24,11 @@ credentials = None
 compute = None
 
 
+def worker_machine_type(zone):
+    overrides = json.loads(os.environ.get("SCAMPER_GCP_MACHINE_TYPES_JSON", "{}"))
+    return overrides.get(zone.rsplit("-", 1)[0], settings.GCP_MACHINE_TYPE)
+
+
 def positive_int(value):
     parsed = int(value)
     if parsed <= 0:
@@ -882,16 +887,16 @@ def ensure_dual_stack_subnetwork(project, region):
 def create_instance(project, zone, name, ipv6_enabled=False):
     logging.info("Creating %s in %s", name, zone)
     client = get_compute()
-    image_response = (
-        client.images()
-        .getFromFamily(
-            project=settings.GCP_IMAGE_PROJECT, family=settings.GCP_IMAGE_FAMILY
-        )
-        .execute()
+    images = client.images()
+    image_request = (
+        images.get(project=settings.GCP_IMAGE_PROJECT, image=settings.GCP_IMAGE)
+        if settings.GCP_IMAGE
+        else images.getFromFamily(project=settings.GCP_IMAGE_PROJECT, family=settings.GCP_IMAGE_FAMILY)
     )
+    image_response = image_request.execute()
 
     source_disk_image = image_response["selfLink"]
-    machine_type = "zones/%s/machineTypes/%s" % (zone, settings.GCP_MACHINE_TYPE)
+    machine_type = "zones/%s/machineTypes/%s" % (zone, worker_machine_type(zone))
     network_interface = {
         "network": "global/networks/default",
         "accessConfigs": [
@@ -941,6 +946,10 @@ def create_instance(project, zone, name, ipv6_enabled=False):
             {"email": settings.GCP_SERVICE_ACCOUNT, "scopes": settings.GCP_SCOPES}
         ],
     }
+    if worker_machine_type(zone).startswith("n4-"):
+        config["disks"][0]["interface"] = "NVME"
+        config["disks"][0]["initializeParams"]["diskType"] = f"zones/{zone}/diskTypes/hyperdisk-balanced"
+        config["networkInterfaces"][0]["nicType"] = "GVNIC"
     public_key_path = Path(f"{Path(settings.GCP_SCAMPER_SSH_KEY).expanduser()}.pub")
     if public_key_path.is_file():
         public_key = public_key_path.read_text(encoding="utf-8").strip()
@@ -1056,8 +1065,9 @@ def create_instance_regions(
         region for region, candidates in zones_by_region.items() if not candidates
     ]
     if missing:
-        raise ValueError(
-            "no GCP zones found in requested regions: " + ", ".join(missing)
+        logging.warning(
+            "Continuing GCP campaign without eligible zones in requested regions: %s",
+            ", ".join(missing),
         )
 
     created_zones = []
@@ -1353,6 +1363,19 @@ def run_gcp_scamper(
         instances = collect_instances(prefix, created_zones, instance_count)
         logging.info("Instances list: %s", instances)
         record_expense_instances(len(instances))
+        if regions:
+            requested_regions = list(regions)
+            if max_instances is not None:
+                requested_regions = requested_regions[:max_instances]
+            created_regions = {zone.rsplit("-", 1)[0] for zone in created_zones}
+            missing_regions = [
+                region for region in requested_regions if region not in created_regions
+            ]
+            if missing_regions:
+                logging.warning(
+                    "Continuing GCP campaign without workers in requested regions: %s",
+                    ", ".join(missing_regions),
+                )
 
         for name, nat_ip, zone in instances:
             output_prefix = f"{name}-{nat_ip}"
@@ -1825,5 +1848,25 @@ def main(argv=None):
     return 0
 
 
+def install_termination_handlers() -> None:
+    """Turn SIGTERM/SIGINT into SystemExit so cleanup in finally: still runs.
+
+    Without this, `systemctl stop` on a campaign kills the driver outright and
+    its resource teardown never executes, leaving workers running and billing
+    with nothing left to delete them.
+    """
+    import signal
+
+    def terminate(signum, _frame):
+        raise SystemExit(f"terminated by signal {signum}")
+
+    for received in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(received, terminate)
+        except (OSError, ValueError):  # pragma: no cover - not the main thread
+            pass
+
+
 if __name__ == "__main__":
+    install_termination_handlers()
     raise SystemExit(main())

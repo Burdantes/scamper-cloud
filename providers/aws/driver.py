@@ -99,7 +99,9 @@ def get_gcp_credentials():
 def ec2_client(region):
     import boto3
 
-    return boto3.client("ec2", region_name=region)
+    from botocore.config import Config
+    return boto3.client("ec2", region_name=region, config=Config(
+        connect_timeout=15, read_timeout=30, retries={"max_attempts": 2, "mode": "standard"}))
 
 
 def ec2_resource(region):
@@ -618,7 +620,6 @@ def create_instance(region, zone, sg_id, name, ipv6_enabled=False):
         logging.info("No matching AMI found in %s", region)
         return None
     ami_id = sorted(images, key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
-    client.describe_instance_types(InstanceTypes=list(instance_types))
     instance = None
 
     for type in instance_types:
@@ -858,7 +859,12 @@ def create_default_security_group(region, sg_name):
 
 def get_zones(region):
     client = ec2_client(region)
-    return [zone["ZoneName"] for zone in client.describe_availability_zones()["AvailabilityZones"]]
+    zones = client.describe_availability_zones(Filters=[{"Name": "state", "Values": ["available"]}])["AvailabilityZones"]
+    vpc = get_default_vpc(region)
+    subnets = client.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc]},
+                                               {"Name": "default-for-az", "Values": ["true"]}])["Subnets"]
+    eligible = {s["AvailabilityZone"] for s in subnets if s.get("MapPublicIpOnLaunch")}
+    return [zone["ZoneName"] for zone in zones if zone["ZoneName"] in eligible]
 
 
 def expected_campaign_artifacts(object_prefix, output_prefix, measurements):
@@ -1013,6 +1019,8 @@ def run_aws_scamper(
             )
 
         selected_regions = list(regions) if regions else get_regions()
+        if max_instances is not None:
+            selected_regions = selected_regions[:max_instances]
         for region in selected_regions:
             sg_name = security_group_name(region)
             try:
@@ -1045,15 +1053,24 @@ def run_aws_scamper(
                 if instance is not None:
                     instances.append([instance, info])
                     record_expense_instances(len(instances))
-                if max_instances is not None and len(instances) >= max_instances:
-                    logging.info("Reached AWS instance cap of %d", max_instances)
+                    # Availability zones are fallbacks within a region.  A
+                    # campaign vantage is regional, so stop after the first
+                    # successful worker in this region.
                     break
-            if max_instances is not None and len(instances) >= max_instances:
-                break
         record_expense_instances(len(instances))
 
         if not instances:
             raise RuntimeError("no AWS instances were created")
+        if regions:
+            created_regions = {info["region"] for _instance, info in instances}
+            missing_regions = [
+                region for region in selected_regions if region not in created_regions
+            ]
+            if missing_regions:
+                logging.warning(
+                    "Continuing AWS campaign without workers in requested regions: %s",
+                    ", ".join(missing_regions),
+                )
 
         for _instance, info in instances:
             node_object_prefix = (
@@ -1393,5 +1410,25 @@ def main(argv=None):
     return 0
 
 
+def install_termination_handlers() -> None:
+    """Turn SIGTERM/SIGINT into SystemExit so cleanup in finally: still runs.
+
+    Without this, `systemctl stop` on a campaign kills the driver outright and
+    its resource teardown never executes, leaving workers running and billing
+    with nothing left to delete them.
+    """
+    import signal
+
+    def terminate(signum, _frame):
+        raise SystemExit(f"terminated by signal {signum}")
+
+    for received in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(received, terminate)
+        except (OSError, ValueError):  # pragma: no cover - not the main thread
+            pass
+
+
 if __name__ == "__main__":
+    install_termination_handlers()
     raise SystemExit(main())

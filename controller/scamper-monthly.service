@@ -6,4 +6,6 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/scamper-controller-monthly run
-TimeoutStartSec=10min
+# The dispatcher waits for each bounded provider campaign in sequence. Each
+# provider enforces its configured campaign_timeout_seconds lease.
+TimeoutStartSec=infinity

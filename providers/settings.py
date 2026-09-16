@@ -23,7 +23,8 @@ GCP_SERVICE_ACCOUNT = os.environ.get(
     "GCP_SERVICE_ACCOUNT", "345441712870-compute@developer.gserviceaccount.com"
 )
 GCP_IMAGE_PROJECT = os.environ.get("GCP_IMAGE_PROJECT", "debian-cloud")
-GCP_IMAGE_FAMILY = os.environ.get("GCP_IMAGE_FAMILY", "debian-11")
+GCP_IMAGE_FAMILY = os.environ.get("GCP_IMAGE_FAMILY", "debian-12")
+GCP_IMAGE = os.environ.get("GCP_IMAGE", "")
 GCP_MACHINE_TYPE = os.environ.get("GCP_MACHINE_TYPE", "e2-micro")
 GCP_NETWORK_TIER = os.environ.get("GCP_NETWORK_TIER", "STANDARD")
 GCP_STORAGE_CLASS = "Standard"
@@ -52,7 +53,7 @@ AWS_INSTANCE_TYPES = [
     value.strip()
     for value in os.environ.get(
         "AWS_INSTANCE_TYPES",
-        f"{_default('providers.aws.client', 'DEFAULT_INSTANCE_TYPE', 't3.micro')},t2.micro",
+        f"{_default('providers.aws.client', 'DEFAULT_INSTANCE_TYPE', 't3.micro')},m5.large",
     ).split(",")
     if value.strip()
 ]
@@ -60,6 +61,9 @@ AZR_VM_SIZE = os.environ.get(
     "AZR_VM_SIZE",
     _default("providers.azure.client", "DEFAULT_INSTANCE_TYPE", "Standard_B2ts_v2"),
 )
+AZR_LAUNCH_CONCURRENCY = int(os.environ.get("SCAMPER_AZR_LAUNCH_CONCURRENCY", "4"))
+if AZR_LAUNCH_CONCURRENCY < 1:
+    raise ValueError("SCAMPER_AZR_LAUNCH_CONCURRENCY must be a positive integer")
 AZR_OS_DISK_SKU = os.environ.get(
     "AZR_OS_DISK_SKU",
     _default("providers.azure.client", "DEFAULT_OS_DISK_SKU", "StandardSSD_LRS"),

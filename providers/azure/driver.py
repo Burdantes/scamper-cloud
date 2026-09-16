@@ -1482,5 +1482,25 @@ def main(argv=None):
     return 0
 
 
+def install_termination_handlers() -> None:
+    """Turn SIGTERM/SIGINT into SystemExit so cleanup in finally: still runs.
+
+    Without this, `systemctl stop` on a campaign kills the driver outright and
+    its resource teardown never executes, leaving workers running and billing
+    with nothing left to delete them.
+    """
+    import signal
+
+    def terminate(signum, _frame):
+        raise SystemExit(f"terminated by signal {signum}")
+
+    for received in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(received, terminate)
+        except (OSError, ValueError):  # pragma: no cover - not the main thread
+            pass
+
+
 if __name__ == "__main__":
+    install_termination_handlers()
     raise SystemExit(main())

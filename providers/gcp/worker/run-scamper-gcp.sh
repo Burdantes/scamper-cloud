@@ -48,9 +48,10 @@ if ! command -v scamper >/dev/null 2>&1 \
   fi
   echo "Worker dependencies missing; installing compatibility fallback"
   sudo apt-get update
-  sudo apt-get install -y scamper python3-pip
-  sudo pip install google-cloud-storage
-  WORKER_PYTHON="$(command -v python3)"
+  sudo apt-get install -y scamper python3-venv
+  sudo python3 -m venv /opt/scamper-worker/venv
+  sudo /opt/scamper-worker/venv/bin/pip install google-cloud-storage
+  WORKER_PYTHON="$PREBUILT_PYTHON"
 else
   echo "Using preinstalled worker dependencies with $WORKER_PYTHON"
 fi

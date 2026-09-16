@@ -8,14 +8,16 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import tempfile
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from controller import submit
-from controller.aws_setup import aws_readiness_errors
+from controller.aws_setup import _environment_errors
 from controller.target_registry import (
     RegisteredTarget,
     load_registered_target,
@@ -46,6 +48,11 @@ class ProviderSchedule:
     max_targets: int | None
     max_trace6_targets: int | None
     campaign_timeout_seconds: int
+    worker_image_project: str | None = None
+    worker_image_family: str | None = None
+    worker_image: str | None = None
+    worker_machine_types_by_region: dict[str, str] = field(default_factory=dict)
+    worker_image_versions_by_region: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -178,8 +185,35 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
             max_trace6_targets = _positive_int(
                 max_trace6_targets, f"providers.{provider}.max_trace6_targets"
             )
+        if len(set(regions)) != len(regions):
+            raise ValueError(f"providers.{provider}.regions must not contain duplicates")
+        if not regions or value.get("max_instances") != len(regions):
+            raise ValueError(f"providers.{provider}.max_instances must equal the explicit region count")
+        image_fields = {}
+        for key in ("worker_image_project", "worker_image_family", "worker_image"):
+            if value.get(key) is not None:
+                if provider != "gcp":
+                    raise ValueError(f"{key} is only supported for GCP")
+                image_fields[key] = _nonempty_string(value[key], key)
+        overrides = value.get("worker_machine_types_by_region", {})
+        if not isinstance(overrides, dict) or (overrides and provider not in {"azure", "gcp"}):
+            raise ValueError("worker_machine_types_by_region requires an Azure or GCP region-to-size object")
+        for region, size in overrides.items():
+            if region not in regions:
+                raise ValueError(f"VM size override names unrequested region: {region}")
+            _nonempty_string(size, f"worker size for {region}")
+        image_versions = value.get("worker_image_versions_by_region", {})
+        if not isinstance(image_versions, dict) or (image_versions and provider != "azure"):
+            raise ValueError("worker_image_versions_by_region requires an Azure region-to-version object")
+        for region, version in image_versions.items():
+            if region not in regions:
+                raise ValueError(f"image version override names unrequested region: {region}")
+            _nonempty_string(version, f"image version for {region}")
         providers.append(
             ProviderSchedule(
+                **image_fields,
+                worker_machine_types_by_region=overrides,
+                worker_image_versions_by_region=image_versions,
                 provider=provider,
                 regions=regions,
                 worker_machine_type=machine_type,
@@ -228,7 +262,7 @@ def load_schedule(path: Path = CONFIG_PATH) -> MonthlySchedule:
 
 def _credential_errors(provider: str, regions: tuple[str, ...] = ()) -> list[str]:
     if provider == "aws":
-        return aws_readiness_errors(regions)
+        return _environment_errors(os.environ)
     if provider == "azure":
         required = (
             "AZURE_TENANT_ID",
@@ -276,6 +310,56 @@ def estimated_runtime_seconds(
     )
 
 
+def _launch_readiness(provider: ProviderSchedule) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "controller.launch_check"],
+            input=json.dumps(asdict(provider)), text=True, capture_output=True,
+            timeout=600, check=False,
+        )
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict) or not isinstance(report.get("errors"), list):
+            raise ValueError("invalid launch check result")
+        if result.returncode and not report["errors"]:
+            raise ValueError("launch checker exited unsuccessfully without an error")
+        return report
+    except (subprocess.TimeoutExpired, ValueError, OSError) as error:
+        return {"ready": False, "errors": [f"launch validation failed: {error}"]}
+
+
+def _launch_failures_and_warnings(
+    launch: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    errors = list(launch.get("errors", []))
+    if errors and launch.get("eligible_regions"):
+        return [], errors
+    return errors, []
+
+
+def _eligible_provider(
+    provider: ProviderSchedule, launch: dict[str, Any]
+) -> ProviderSchedule:
+    eligible = launch.get("eligible_regions")
+    if eligible is None:
+        return provider
+    eligible_regions = tuple(region for region in provider.regions if region in eligible)
+    return replace(
+        provider,
+        regions=eligible_regions,
+        max_instances=len(eligible_regions),
+        worker_machine_types_by_region={
+            region: size
+            for region, size in provider.worker_machine_types_by_region.items()
+            if region in eligible_regions
+        },
+        worker_image_versions_by_region={
+            region: version
+            for region, version in provider.worker_image_versions_by_region.items()
+            if region in eligible_regions
+        },
+    )
+
+
 def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
     errors: list[str] = []
     if not schedule.enabled:
@@ -317,11 +401,18 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
         role: int(target["target_count"]) for role, target in targets.items()
     }
     for provider in schedule.providers:
+        provider_warnings: list[str] = []
         provider_errors = [
             f"missing worker asset {name}: {path}"
             for name, path in missing_worker_assets(provider.provider)
         ]
         provider_errors.extend(_credential_errors(provider.provider, provider.regions))
+        launch = {"ready": False, "errors": []}
+        if not provider_errors:
+            launch = _launch_readiness(provider)
+            launch_errors, launch_warnings = _launch_failures_and_warnings(launch)
+            provider_errors.extend(launch_errors)
+            provider_warnings.extend(launch_warnings)
         runtime_seconds = estimated_runtime_seconds(schedule, provider, target_counts)
         if (
             runtime_seconds is not None
@@ -335,6 +426,8 @@ def readiness(schedule: MonthlySchedule) -> dict[str, Any]:
         providers[provider.provider] = {
             "ready": not provider_errors,
             "errors": provider_errors,
+            "warnings": provider_warnings,
+            "launch": launch,
             "regions": list(provider.regions) if provider.regions else "all",
             "max_instances": provider.max_instances,
             "max_targets": provider.max_targets,
@@ -362,6 +455,13 @@ def cycle_id(now: datetime | None = None) -> str:
     return current.astimezone(timezone.utc).strftime("%Y%m")
 
 
+def cycle_label(value: str) -> str:
+    """Validate a monthly or date-qualified campaign namespace."""
+    if len(value) not in {6, 8} or not value.isdigit():
+        raise ValueError("cycle must have the form YYYYMM or YYYYMMDD")
+    return value
+
+
 def _submission_args(
     schedule: MonthlySchedule,
     provider: ProviderSchedule,
@@ -387,6 +487,7 @@ def _submission_args(
         str(provider.max_instances),
         "--campaign-timeout-seconds",
         str(provider.campaign_timeout_seconds),
+        "--wait-for-completion",
         "--trace-rate",
         str(schedule.trace_rate),
         "--rr-rate",
@@ -410,6 +511,13 @@ def _submission_args(
         arguments.extend(["--regions", ",".join(provider.regions)])
     if provider.worker_machine_type:
         arguments.extend(["--worker-machine-type", provider.worker_machine_type])
+    for field_name in ("worker_image_project", "worker_image_family", "worker_image"):
+        if getattr(provider, field_name):
+            arguments.extend(["--" + field_name.replace("_", "-"), getattr(provider, field_name)])
+    if provider.worker_machine_types_by_region:
+        arguments.extend(["--worker-machine-types-json", json.dumps(provider.worker_machine_types_by_region)])
+    if provider.worker_image_versions_by_region:
+        arguments.extend(["--worker-image-versions-json", json.dumps(provider.worker_image_versions_by_region)])
     if provider.max_targets:
         arguments.extend(["--max-targets", str(provider.max_targets)])
     if provider.max_trace6_targets:
@@ -424,9 +532,7 @@ def dispatch(schedule: MonthlySchedule, *, cycle: str | None = None) -> dict[str
             "monthly schedule is not ready:\n" + "\n".join(report["errors"])
         )
 
-    selected_cycle = cycle or cycle_id()
-    if len(selected_cycle) != 6 or not selected_cycle.isdigit():
-        raise ValueError("cycle must have the form YYYYMM")
+    selected_cycle = cycle_label(cycle or cycle_id())
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     lock_path = STATE_ROOT / "dispatch.lock"
     with lock_path.open("a+", encoding="utf-8") as lock_file:
@@ -435,32 +541,80 @@ def dispatch(schedule: MonthlySchedule, *, cycle: str | None = None) -> dict[str
         except BlockingIOError as error:
             raise RuntimeError("another monthly dispatch is already running") from error
 
-        results: list[dict[str, str]] = []
+        state_path = STATE_ROOT / f"{selected_cycle}.json"
+        previous = json.loads(state_path.read_text()) if state_path.is_file() else {}
+        previous_results = {item["run_id"]: item for item in previous.get("results", [])}
+        results: list[dict[str, Any]] = []
+        state = {"schema_version": 1, "cycle": selected_cycle,
+                 "dispatched_at": datetime.now(timezone.utc).isoformat(),
+                 "complete": False, "results": results}
+
+        def record(result: dict[str, Any]) -> None:
+            results.append(result)
+            temporary = state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(state_path)
+
         for provider in schedule.providers:
             run_id = f"monthly-{provider.provider}-{selected_cycle}"
             job_spec = submit.STATE_ROOT / "jobs" / run_id / "job.json"
             if job_spec.is_file():
-                results.append(
+                record(
                     {
                         "provider": provider.provider,
                         "run_id": run_id,
                         "status": "already-submitted",
+                        "previous_status": previous_results.get(run_id, {}).get("previous_status") or previous_results.get(run_id, {}).get("status"),
                     }
                 )
                 continue
-            submit.main(_submission_args(schedule, provider, selected_cycle))
-            results.append(
-                {"provider": provider.provider, "run_id": run_id, "status": "submitted"}
-            )
+            # A prior provider can run for days. Resolve mutable dependencies
+            # again immediately before this provider, and pin the GCP image.
+            launch = _launch_readiness(provider)
+            launch_errors, launch_warnings = _launch_failures_and_warnings(launch)
+            if launch_errors:
+                record({"provider": provider.provider, "run_id": run_id,
+                                "status": "failed", "errors": launch_errors})
+                continue
+            effective = _eligible_provider(provider, launch)
+            if provider.provider == "gcp" and launch.get("worker_image"):
+                effective = replace(provider, worker_image=launch["worker_image"],
+                                    worker_image_project=launch["worker_image_project"])
+            if provider.provider == "azure" and launch.get("image_versions"):
+                effective = replace(provider, worker_image_versions_by_region=launch["image_versions"])
+            try:
+                return_code = submit.main(_submission_args(schedule, effective, selected_cycle))
+                if return_code:
+                    raise subprocess.CalledProcessError(return_code, ["controller.submit"])
+            except subprocess.CalledProcessError as error:
+                record(
+                    {
+                        "provider": provider.provider,
+                        "run_id": run_id,
+                        "status": "failed",
+                        "exit_code": error.returncode,
+                    }
+                )
+                continue
+            result = {"provider": provider.provider, "run_id": run_id,
+                      "status": "completed"}
+            if launch_warnings:
+                result["warnings"] = launch_warnings
+            record(result)
 
         state = {
             "schema_version": 1,
             "cycle": selected_cycle,
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            "complete": all(result["status"] == "completed" or
+                            (result["status"] == "already-submitted" and result.get("previous_status") == "completed")
+                            for result in results),
             "results": results,
         }
         state_path = STATE_ROOT / f"{selected_cycle}.json"
-        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        temporary = state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(state_path)
         return state
 
 
@@ -527,8 +681,9 @@ def main(argv: list[str] | None = None) -> int:
         report = readiness(schedule)
         print(json.dumps(report, indent=2))
         return 0 if report["ready"] else 1
-    print(json.dumps(dispatch(schedule, cycle=args.cycle), indent=2))
-    return 0
+    state = dispatch(schedule, cycle=args.cycle)
+    print(json.dumps(state, indent=2))
+    return 0 if state["complete"] else 1
 
 
 if __name__ == "__main__":

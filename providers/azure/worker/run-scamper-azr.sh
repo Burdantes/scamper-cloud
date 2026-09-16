@@ -55,13 +55,34 @@ TRACE_ARGS="trace -m 20 -g 8 -w 3 -q 2 -P ICMP"
 OUTPUT_DIR="results"
 OUTPUT_PREFIX="$OUTPUT_DIR/$RUN_OUTPUT_PREFIX"
 
+retry_package_command() {
+  local attempt=1
+  local max_attempts=30
+  while ! sudo "$@"; do
+    if (( attempt >= max_attempts )); then
+      echo "Package command failed after $max_attempts attempts: $*" >&2
+      return 1
+    fi
+    echo "Package manager is busy; retrying in 5 seconds ($attempt/$max_attempts)" >&2
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+}
+
+# Azure's Ubuntu image may still be finishing cloud-init package work when SSH
+# first becomes available. Waiting here prevents an otherwise healthy worker
+# from losing a race for /var/lib/apt/lists/lock.
+if command -v cloud-init >/dev/null 2>&1; then
+  sudo cloud-init status --wait || true
+fi
+
 echo "apt-get update and enable universe"
-sudo apt-get update
-sudo add-apt-repository universe -y
-sudo apt-get update
+retry_package_command apt-get update
+retry_package_command add-apt-repository universe -y
+retry_package_command apt-get update
 
 echo "apt install -y scamper python3-pip"
-sudo apt install -y scamper python3-pip
+retry_package_command apt install -y scamper python3-pip
 
 echo "pip install google-cloud-storage"
 sudo python3 -m pip install --upgrade google-cloud-storage

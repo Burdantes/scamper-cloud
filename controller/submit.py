@@ -173,22 +173,53 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
         environment.append(
             f"--setenv={CAMPAIGN_TIMEOUT_ENV[provider]}={campaign_timeout_seconds}"
         )
+    if provider == "azure":
+        from providers import settings
+
+        environment.append(
+            "--setenv=SCAMPER_AZR_LAUNCH_CONCURRENCY="
+            f"{settings.AZR_LAUNCH_CONCURRENCY}"
+        )
     worker_image_project = getattr(args, "worker_image_project", None)
     worker_image_family = getattr(args, "worker_image_family", None)
     if worker_image_project:
         environment.append(f"--setenv=GCP_IMAGE_PROJECT={worker_image_project}")
     if worker_image_family:
         environment.append(f"--setenv=GCP_IMAGE_FAMILY={worker_image_family}")
+    if getattr(args, "worker_image", None):
+        environment.append(f"--setenv=GCP_IMAGE={args.worker_image}")
+    if getattr(args, "worker_machine_types_json", None):
+        overrides = json.loads(args.worker_machine_types_json)
+        if not isinstance(overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in overrides.items()):
+            raise ValueError("worker machine types must be a region-to-size object")
+        variable = {"azure": "SCAMPER_AZR_VM_SIZES_JSON", "gcp": "SCAMPER_GCP_MACHINE_TYPES_JSON"}[provider]
+        environment.append(f"--setenv={variable}={json.dumps(overrides, separators=(',', ':'))}")
+    if getattr(args, "worker_image_versions_json", None):
+        versions = json.loads(args.worker_image_versions_json)
+        if not isinstance(versions, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in versions.items()):
+            raise ValueError("worker image versions must be a region-to-version object")
+        environment.append(f"--setenv=SCAMPER_AZR_IMAGE_VERSIONS_JSON={json.dumps(versions, separators=(',', ':'))}")
+    wait_options = (
+        ["--wait"] if getattr(args, "wait_for_completion", False) else []
+    )
     return [
         "systemd-run",
         f"--unit=scamper-campaign-{args.run_id}",
         "--collect",
+        *wait_options,
         "--property=Type=exec",
+        # Deleting a provider's resources takes minutes (an Azure resource group
+        # took 304s on 2026-09-15). systemd's 90s default would SIGKILL the
+        # driver mid-teardown and leave the workers running and billing.
+        "--property=TimeoutStopSec=900",
         *environment,
         "--uid=scamper-controller",
         "--gid=scamper-controller",
         f"--working-directory={INSTALL_ROOT.resolve()}",
         "/usr/local/bin/scamper-controller-run",
+        # Apply explicit submission settings AFTER the wrapper loads defaults.
+        "/usr/bin/env",
+        *(value.removeprefix("--setenv=") for value in environment),
         *command,
     ]
 
@@ -226,6 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--worker-image-project")
     parser.add_argument("--worker-image-family")
+    parser.add_argument("--worker-image")
+    parser.add_argument("--worker-machine-types-json")
+    parser.add_argument("--worker-image-versions-json")
     parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument("--max-instances", type=positive_int)
     parser.add_argument("--max-targets", type=positive_int)
@@ -240,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--do-not-probe-file", required=True, type=existing_file)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--wait-for-completion",
+        action="store_true",
+        help=(
+            "wait for the transient campaign service and return its terminal "
+            "status; used by serialized schedulers"
+        ),
+    )
     parser.add_argument(
         "--allow-foreign-origin",
         action="store_true",

@@ -270,6 +270,30 @@ def test_dashboard_renders_a_progress_column() -> None:
     assert "progCell" in dashboard.INDEX
 
 
+def test_dashboard_surfaces_unowned_cloud_resources(tmp_path: Path, monkeypatch) -> None:
+    write_json(tmp_path / "orphans.json", {
+        "orphan_count": 1, "swept_at": "2026-09-16T00:00:00+00:00", "errors": [],
+        "orphans": [{"run_id": "monthly-azure-202609-r2", "resource_group": "monthly-azure-202609-r2"}],
+    })
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "inactive", "sub": "dead", "since": "", "exit_code": "0"})
+    value = dashboard.dashboard_state(None, tmp_path, tmp_path / "release")
+    assert value["orphans"]["count"] == 1
+    assert value["orphans"]["runs"] == ["monthly-azure-202609-r2"]
+
+
+def test_dashboard_reports_a_failed_orphan_sweep(tmp_path: Path, monkeypatch) -> None:
+    write_json(tmp_path / "orphans.json", {"orphan_count": 0, "orphans": [], "errors": ["azure: credential expired"]})
+    monkeypatch.setattr(dashboard, "systemd_state", lambda unit: {"active": "inactive", "sub": "dead", "since": "", "exit_code": "0"})
+    value = dashboard.dashboard_state(None, tmp_path, tmp_path / "release")
+    assert value["orphans"]["count"] == 0
+    assert value["orphans"]["errors"] == ["azure: credential expired"]
+
+
+def test_dashboard_has_an_orphan_banner() -> None:
+    assert 'id="orphans"' in dashboard.INDEX
+    assert "drawOrphans" in dashboard.INDEX
+
+
 def test_dashboard_uses_plain_status_table() -> None:
     assert "Scamper run status" in dashboard.INDEX
     assert "<table>" in dashboard.INDEX
