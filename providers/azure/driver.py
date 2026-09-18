@@ -1230,6 +1230,7 @@ def run_azr_scamper(
                             "-i",
                             settings.AZR_SCAMPER_SSH_KEY,
                             "-oStrictHostKeyChecking=no",
+                            *settings.SSH_KEEPALIVE_OPTIONS,
                             f"{settings.AZR_SCAMPER_USER}@{ip}",
                             cmd,
                             "2>&1",

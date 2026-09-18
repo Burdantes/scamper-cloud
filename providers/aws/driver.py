@@ -252,19 +252,74 @@ def wait_for_scp(process, info):
         ) from err
 
 
+def workers_still_measuring(processes):
+    """Names of workers whose scamper is still running, asked over a fresh SSH.
+
+    A dead control channel is not a dead measurement. The worker uploads its
+    own artifacts, so a campaign whose sessions have dropped can still finish
+    and deliver data as long as scamper survives.
+    """
+    alive = []
+    for _process, info, _warts_name in processes:
+        command = [
+            "ssh", "-i", settings.AWS_SCAMPER_SSH_KEY,
+            "-oStrictHostKeyChecking=no", "-oBatchMode=yes", "-oConnectTimeout=10",
+            *settings.SSH_KEEPALIVE_OPTIONS,
+            f"{settings.AWS_SCAMPER_USER}@{info['ip']}",
+            "pgrep -x scamper > /dev/null && echo ALIVE",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=30, check=False)
+        except Exception as error:  # noqa: BLE001
+            # Best-effort diagnosis only: if the probe itself cannot run, treat
+            # the worker as not measuring so the real failure still surfaces.
+            logging.debug("Could not probe %s: %s", info["name"], error)
+            continue
+        if "ALIVE" in result.stdout:
+            alive.append(info["name"])
+    return alive
+
+
 def wait_for_scamper_processes(processes, bucket_name, warts_list):
     timeout_seconds = aws_timeout_seconds("SCAMPER_AWS_SCAMPER_TIMEOUT_SECONDS", 14400)
     poll_seconds = aws_timeout_seconds("SCAMPER_AWS_ARTIFACT_POLL_SECONDS", 30)
     deadline = time.monotonic() + timeout_seconds
     last_missing = None
 
+    reported = set()
     while True:
         running = [(process, info, warts_name) for process, info, warts_name in processes if process.poll() is None]
+        for process, info, _warts_name in processes:
+            code = process.poll()
+            if code is None or info["name"] in reported:
+                continue
+            reported.add(info["name"])
+            logging.warning(
+                "Session for %s exited with code %s; %d of %d still connected%s",
+                info["name"], code, len(running), len(processes),
+                " (255 is an SSH transport failure, not scamper)" if code == 255 else "",
+            )
         if not running:
             exits = [process.wait() for process, _info, _warts_name in processes]
             logging.info("Scamper script exit codes: %s", exits)
             missing = missing_uploaded_artifacts(bucket_name, warts_list)
             if missing:
+                # Every SSH session can drop while the workers keep measuring:
+                # the path to AWS discards idle flows and the kernel only
+                # notices at its 7200s keepalive boundary. Terminating here
+                # threw away 23% of a campaign on 2026-09-16, so keep waiting
+                # while any worker still has scamper running.
+                alive = workers_still_measuring(processes)
+                if alive and time.monotonic() < deadline:
+                    logging.warning(
+                        "All %d SSH sessions have exited but scamper is still running on "
+                        "%d workers (%s); waiting for their own uploads rather than "
+                        "tearing down",
+                        len(processes), len(alive), ", ".join(alive[:5]),
+                    )
+                    time.sleep(poll_seconds)
+                    continue
                 raise RuntimeError(
                     f"missing {len(missing)} expected AWS artifacts after scamper exit: {missing[:5]}"
                 )
@@ -1152,6 +1207,7 @@ def run_aws_scamper(
             )
 
             processes.append((subprocess.Popen(["ssh", "-i", settings.AWS_SCAMPER_SSH_KEY, "-oStrictHostKeyChecking=no",
+                                                *settings.SSH_KEEPALIVE_OPTIONS,
                                                 f"ubuntu@{info['ip']}", cmd, "2>&1"],
                                                stdout=logs[info['name']],
                                                stderr=logs[info['name']]), info, output_prefix))

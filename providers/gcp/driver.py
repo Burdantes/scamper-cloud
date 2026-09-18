@@ -1513,6 +1513,7 @@ def run_gcp_scamper(
                             ssh_key,
                             "-oStrictHostKeyChecking=no",
                             "-oUserKnownHostsFile=/dev/null",
+                            *settings.SSH_KEEPALIVE_OPTIONS,
                             f"{settings.GCP_SCAMPER_USER}@{nat_ip}",
                             cmd,
                             "2>&1",

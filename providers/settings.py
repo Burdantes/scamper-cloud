@@ -5,6 +5,20 @@ from __future__ import annotations
 import os
 
 SCAMPER_IP_DST = os.environ.get("SCAMPER_IP_DST", "./datasets/ipv4-24")
+
+# A campaign's SSH session carries no traffic for hours: scamper writes to a
+# file on the worker, not to the channel. The path to AWS drops such idle
+# flows, and OpenSSH's TCPKeepAlive only probes after the kernel default
+# net.ipv4.tcp_keepalive_time of 7200s, so on 2026-09-16 all 27 AWS sessions
+# died in clusters two hours apart while the workers themselves kept measuring.
+# Application-level keepalives keep the flow warm and surface a dead path in
+# three minutes instead of two hours.
+SSH_KEEPALIVE_OPTIONS = (
+    "-oServerAliveInterval=60",
+    "-oServerAliveCountMax=3",
+    "-oTCPKeepAlive=yes",
+)
+
 SCAMPER_UPLOAD_SCRIPT = "./providers/gcp/worker/upload.py"
 SCAMPER_SMOKE_SCRIPT = "./providers/common/worker/scamper-smoke.sh"
 SCAMPER_CAMPAIGN_RUNNER = "./experiments/common/run_campaign.py"
