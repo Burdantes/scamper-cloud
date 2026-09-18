@@ -142,8 +142,12 @@ def shuffle_targets(
     destination: Path,
     *,
     memory_limit: str = "128M",
+    seed: int | None = None,
 ) -> tuple[int, list[str]]:
-    seed = secrets.randbits(64)
+    # A caller that intends to resume must pin the seed: a random one reorders
+    # the targets, and chunk N would then cover different addresses than the
+    # chunk N already in the bucket.
+    seed = secrets.randbits(64) if seed is None else seed
     random_source = artifact_path(destination, "random-source.tmp")
     random_source.write_bytes(random.Random(seed).randbytes(1024 * 1024))
     command = [
@@ -260,8 +264,24 @@ def convert_and_summarize(
 
 
 
+def chunk_plan(target_sha256: str, chunk_size: int, measurement: str) -> tuple[str, int]:
+    """Fingerprint and shuffle seed for a chunking plan.
+
+    Resuming by chunk index is only sound if the resumed run reproduces the
+    exact same ordering, so the seed is derived from the inputs rather than
+    drawn at random. The fingerprint travels in each chunk's file name, which
+    lets a resumed run prove from a bucket listing alone that the uploaded
+    chunks belong to the same plan. Anything different - another target file,
+    another chunk size - yields a different fingerprint and nothing is skipped.
+    """
+    material = f"{target_sha256}:{measurement}:{chunk_size}".encode()
+    digest = hashlib.sha256(material).hexdigest()
+    return digest[:12], int(digest[:16], 16)
+
+
 def chunk_target_file(
-    source: Path, chunk_size: int, output_prefix: Path, measurement: str
+    source: Path, chunk_size: int, output_prefix: Path, measurement: str,
+    name_suffix: str = "",
 ) -> list[Path]:
     """Split a shuffled target list into fixed-size chunk files.
 
@@ -283,7 +303,8 @@ def chunk_target_file(
                     if handle is not None:
                         handle.close()
                     path = artifact_path(
-                        output_prefix, f"{measurement}.part-{len(chunks) + 1:05d}.targets.txt"
+                        output_prefix,
+                        f"{measurement}{name_suffix}.part-{len(chunks) + 1:05d}.targets.txt",
                     )
                     chunks.append(path)
                     handle = path.open("w", encoding="utf-8")
@@ -333,22 +354,28 @@ def convert_chunk_to_jsonl(
     return return_code, stderr, summary
 
 
-def completed_chunk_indices(path: Path | None) -> set[int]:
-    """Chunk numbers already uploaded, so a resumed run re-measures nothing.
+def completed_chunk_indices(path: Path | None, fingerprint: str | None = None) -> set[int]:
+    """Chunk numbers that are provably complete in the bucket.
 
-    The worker writes this file by listing what is already in the bucket; an
-    unreadable or absent file simply means "start from the beginning".
+    Each chunk uploads its JSONL first and its metadata second, so the metadata
+    object is the commit marker: seeing it proves the data that precedes it
+    landed. A bare .jsonl.gz means the upload was interrupted and that chunk
+    must be measured again. When a fingerprint is given, only chunks carrying
+    it are eligible - chunks from a different plan are not interchangeable.
     """
     if path is None or not path.is_file():
         return set()
+    pattern = re.compile(
+        r"plan-(?P<plan>[0-9a-f]{12})\.part-(?P<index>\d{5})\.metadata\.json$"
+    )
     done: set[int] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text:
+        match = pattern.search(line.strip())
+        if not match:
             continue
-        match = re.search(r"part-(\d{5})", text) or re.fullmatch(r"(\d+)", text)
-        if match:
-            done.add(int(match.group(1)))
+        if fingerprint is not None and match.group("plan") != fingerprint:
+            continue
+        done.add(int(match.group("index")))
     return done
 
 
@@ -395,6 +422,7 @@ def run_measurement_in_chunks(
     chunk_size: int,
     completed: set[int],
     checkpoint_command: list[str] | None,
+    fingerprint: str = "",
 ) -> dict[str, Any]:
     """Measure, convert and upload one chunk at a time.
 
@@ -403,14 +431,15 @@ def run_measurement_in_chunks(
     the very end. Chunks already present are skipped, which is what makes a
     rerun cheap.
     """
-    chunks = chunk_target_file(shuffled_path, chunk_size, output_prefix, measurement)
+    plan = f".plan-{fingerprint}" if fingerprint else ""
+    chunks = chunk_target_file(shuffled_path, chunk_size, output_prefix, measurement, plan)
     results: list[dict[str, Any]] = []
     for index, chunk_targets in enumerate(chunks, start=1):
         if index in completed:
             print(f"CHUNK_SKIPPED[{measurement}]={index}/{len(chunks)} already uploaded", flush=True)
             results.append({"chunk": index, "skipped": True})
             continue
-        stem = f"{measurement}.part-{index:05d}"
+        stem = f"{measurement}{plan}.part-{index:05d}"
         warts_path = artifact_path(output_prefix, f"{stem}.warts")
         jsonl_path = artifact_path(output_prefix, f"{stem}.jsonl.gz")
         metadata_path = artifact_path(output_prefix, f"{stem}.metadata.json")
@@ -444,12 +473,25 @@ def run_measurement_in_chunks(
             "finished_at": finished_at.isoformat(),
             "jsonl_file": str(jsonl_path),
             "jsonl_sha256": sha256_file(jsonl_path) if jsonl_path.is_file() else None,
+            "plan_fingerprint": fingerprint,
+            "chunk_size": chunk_size,
         }
         metadata_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         results.append(record)
 
+        chunk_succeeded = completed_run.returncode == 0 and converter_code == 0
         if checkpoint_command:
-            for artifact in (jsonl_path, metadata_path):
+            # The metadata is the commit marker, so it is uploaded last and only
+            # when the chunk actually succeeded. A failed chunk leaves its JSONL
+            # behind for inspection but stays eligible for re-measurement.
+            artifacts = (jsonl_path, metadata_path) if chunk_succeeded else (jsonl_path,)
+            if not chunk_succeeded:
+                print(
+                    f"CHUNK_INCOMPLETE[{measurement}]={index} scamper={completed_run.returncode} "
+                    f"converter={converter_code}; not committing, it will be retried",
+                    flush=True,
+                )
+            for artifact in artifacts:
                 if not artifact.is_file() or artifact.stat().st_size == 0:
                     raise RuntimeError(f"cannot upload missing chunk artifact: {artifact}")
                 values = {
@@ -737,8 +779,13 @@ def main(argv: list[str] | None = None) -> int:
             "rr": args.rr_rate,
         }[measurement]
         if args.chunk_targets and args.chunk_targets > 0:
+            fingerprint, plan_seed = chunk_plan(
+                normalized_sha256, args.chunk_targets, measurement
+            )
             shuffled_path = artifact_path(args.output_prefix, f"{measurement}.targets.txt")
-            seed, shuffle_command = shuffle_targets(target_path, shuffled_path)
+            seed, shuffle_command = shuffle_targets(
+                target_path, shuffled_path, seed=plan_seed
+            )
             chunk_result = run_measurement_in_chunks(
                 measurement,
                 shuffled_path=shuffled_path,
@@ -747,14 +794,16 @@ def main(argv: list[str] | None = None) -> int:
                 rr_timeout_seconds=args.rr_timeout,
                 payload_text=args.probe_payload,
                 chunk_size=args.chunk_targets,
-                completed=completed_chunk_indices(args.completed_chunks_file),
+                completed=completed_chunk_indices(args.completed_chunks_file, fingerprint),
                 checkpoint_command=args.checkpoint_command,
+                fingerprint=fingerprint,
             )
             statuses[measurement] = chunk_result["return_code"]
             metadata[measurement] = {
                 **chunk_result,
                 "shuffle_seed": seed,
                 "shuffle_command": shuffle_command,
+                "plan_fingerprint": fingerprint,
             }
             target_sets[measurement] = {
                 "source": target_source,
