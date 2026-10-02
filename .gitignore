@@ -5,6 +5,7 @@
 datasets/
 outputs/
 target_generation/ipv4_bgp/ribs/
+target_generation/ipv6_bgp/downloads/
 *.warts
 
 # Credentials and environment configuration

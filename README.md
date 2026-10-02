@@ -26,7 +26,7 @@ See [Architecture](docs/architecture.md) for the ownership boundary and
 | Provider | Campaign workers | Controller authentication | Typical worker size |
 |----------|------------------|---------------------------|---------------------|
 | GCP | Supported | Controller VM service account | `e2-micro` |
-| AWS | Supported | Google workload identity exchanged for a short-lived AWS role session | `t3.micro`, with `t2.micro` fallback |
+| AWS | Supported | Google workload identity exchanged for a short-lived AWS role session | `t3.micro`, with `m5.large` regional fallback |
 | Azure | Supported | Azure service principal configured on the controller | `Standard_B2ts_v2` |
 
 The controller VM is hosted on GCP, but the measurement workers are not limited
@@ -127,21 +127,28 @@ The detailed AWS federation and regional preparation procedure is in
 
 ### 3. Import and register immutable targets once
 
-Start IPv6 with a deterministic canary population. Omit `--max-targets` only
-after the canary is validated:
+Start IPv6 with a deterministic canary population. For the production target
+set, prefer a TUM responsive address and synthesize a deterministic target for
+every other route-selectable announced BGP prefix:
 
 ```bash
 python -m target_generation.ipv6_hitlist.import_hitlist \
   --download-responsive \
   --max-targets 1000 \
   --output datasets/ipv6-hitlist-responsive-1000.txt
+
+python -m target_generation.ipv6_bgp.generate \
+  --download-responsive \
+  --download-latest-rib \
+  --include-unresponsive-prefixes \
+  --output datasets/ipv6-all-route-selectable-prefixes-YYYYMMDD.txt
 ```
 
 ```bash
 python -m controller.manage register-targets --apply \
   --trace-targets /path/to/ipv4-bgp-one-per-24.txt \
   --rr-targets /path/to/rr-responsive-targets.tsv \
-  --trace6-targets datasets/ipv6-hitlist-responsive-1000.txt
+  --trace6-targets datasets/ipv6-all-route-selectable-prefixes-YYYYMMDD.txt
 ```
 
 Any subset can be registered independently when only one population changes;
@@ -163,7 +170,7 @@ python -m controller.manage submit --apply \
   --provider aws \
   --run-id aws-canary-YYYYMMDDa \
   --regions us-east-1 \
-  --worker-machine-type t3.micro,t2.micro \
+  --worker-machine-type t3.micro,m5.large \
   --max-instances 1 \
   --max-targets 10 \
   --max-trace6-targets 10 \
@@ -196,7 +203,18 @@ per traceroute destination, one probe per RR destination, a 25% safety margin,
 and 15 minutes of fixed setup/upload time. Dispatch fails closed when that
 estimate cannot fit inside the provider deadline.
 
+For a production footprint run, configure every intended region explicitly,
+set `max_instances` to the number of configured regions, and set both target
+caps to null. The provider drivers launch one worker per region and use
+availability zones only as fallbacks. An explicit regional run fails closed if
+any requested region is missing, so a partial cloud footprint cannot be
+mistaken for a complete experiment.
+
 The dispatcher validates all three providers before submitting any of them. It
+then runs provider campaigns serially, waiting for each durable systemd service
+to reach a terminal result before starting the next provider. A failed provider
+is recorded without suppressing the remaining providers. This bounds
+controller-side concurrency while preserving independent provider outcomes. It
 refuses to run when targets, worker assets, credentials, exclusions, regions,
 or provider entries are incomplete.
 
@@ -205,9 +223,11 @@ python -m controller.manage schedule-status --apply
 python -m controller.manage schedule-enable --apply
 ```
 
-Monthly run IDs have the form `monthly-PROVIDER-YYYYMM`. Existing job records
-are skipped, and a controller lock prevents overlapping dispatches. Disable the
-timer without deleting configuration or prior job records with:
+Scheduled run IDs have the form `monthly-PROVIDER-YYYYMM`. Existing job records
+are skipped, and a controller lock prevents overlapping dispatches. Use an
+explicit `YYYYMMDD` cycle for a deliberate same-month rerun so it cannot collide
+with the scheduled monthly namespace. Disable the timer without deleting
+configuration or prior job records with:
 
 ```bash
 python -m controller.manage schedule-disable --apply
@@ -233,7 +253,7 @@ python -m controller.manage submit --apply \
 # AWS
 python -m controller.manage submit --apply \
   --provider aws --run-id aws-useast1-YYYYMMDDa \
-  --regions us-east-1 --worker-machine-type t3.micro,t2.micro \
+  --regions us-east-1 --worker-machine-type t3.micro,m5.large \
   --max-instances 1 \
   --trace-target-id sha256:TRACE_SOURCE_SHA256 \
   --rr-target-id sha256:RR_SOURCE_SHA256
