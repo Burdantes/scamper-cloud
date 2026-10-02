@@ -259,9 +259,54 @@ def test_run_aws_scamper_stops_after_max_instances(
 
     aws.run_aws_scamper(str(tmp_path / "logs"), "aws-test", max_instances=2)
 
-    assert setup_regions == ["region-one"]
-    assert terminated == ["aws-test-region-onea", "aws-test-region-oneb"]
+    assert setup_regions == ["region-one", "region-two"]
+    assert terminated == ["aws-test-region-onea", "aws-test-region-twoa"]
     assert recorded_counts == [1, 2, 2]
+
+
+def test_run_aws_scamper_retries_zones_but_creates_one_worker_per_region(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_zones: list[str] = []
+    terminated: list[str] = []
+    patch_common_aws_flow(monkeypatch, tmp_path)
+    monkeypatch.setattr(aws, "get_regions", lambda: ["region-one", "region-two"])
+    monkeypatch.setattr(
+        aws, "get_zones", lambda region: [f"{region}a", f"{region}b"]
+    )
+
+    def create_instance(
+        region: str, zone: str, sg_id: str, name: str
+    ) -> FakeInstance:
+        attempted_zones.append(zone)
+        if zone == "region-onea":
+            raise RuntimeError("zone unavailable")
+        return FakeInstance(name, terminated)
+
+    monkeypatch.setattr(aws, "create_instance", create_instance)
+
+    aws.run_aws_scamper(str(tmp_path / "logs"), "aws-test")
+
+    assert attempted_zones == ["region-onea", "region-oneb", "region-twoa"]
+    assert terminated == ["aws-test-region-oneb", "aws-test-region-twoa"]
+
+
+def test_run_aws_scamper_continues_with_partial_region_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminated, _recorded_counts, _uploaded = patch_common_aws_flow(
+        monkeypatch, tmp_path
+    )
+
+    aws.run_aws_scamper(
+        str(tmp_path / "logs"),
+        "aws-test",
+        regions=("ok-region", "bad-region"),
+    )
+
+    assert terminated == ["aws-test-ok-regiona"]
 
 
 def test_run_aws_scamper_caps_targets_and_cleans_up(
@@ -421,9 +466,10 @@ def test_driver_takes_its_instance_types_from_settings_not_a_literal() -> None:
     text = source.read_text(encoding="utf-8")
     assert "settings.AWS_INSTANCE_TYPES" in text
     assert "instance_types = ['t3.micro','t2.micro']" not in text
-    # The describe filter must follow the configured list, not a second literal.
+    # The configured list is tried directly. A bulk DescribeInstanceTypes call
+    # fails in regions where any one legacy fallback name is unknown.
     assert '"Values":["t2.micro","t3.micro"]' not in text
-    assert "describe_instance_types(InstanceTypes=list(instance_types))" in text
+    assert "describe_instance_types(InstanceTypes=list(instance_types))" not in text
 
 
 def test_aws_controller_uses_isolated_key_and_security_group_names() -> None:

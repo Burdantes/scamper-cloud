@@ -8,6 +8,7 @@ import json
 import os
 import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Mapping, Sequence
 
 from controller.aws_federation import ROLE_ARN_RE
@@ -47,7 +48,23 @@ def _expected_assumed_role_arn(role_arn: str) -> str:
     return f"arn:aws:sts::{match.group('account')}:assumed-role/{match.group('role')}/"
 
 
-def _region_errors(region: str, cidr: str) -> list[str]:
+def available_instance_types(client: Any, candidates: Sequence[str]) -> set[str]:
+    """Return valid regional candidates without letting one invalid type mask others."""
+    available: set[str] = set()
+    for instance_type in candidates:
+        try:
+            response = client.describe_instance_types(InstanceTypes=[instance_type])
+        except driver.client_error_type() as error:
+            if error.response.get("Error", {}).get("Code") == "InvalidInstanceType":
+                continue
+            raise
+        available.update(
+            item["InstanceType"] for item in response.get("InstanceTypes", [])
+        )
+    return available
+
+
+def _region_errors(region: str, cidr: str, instance_types: Sequence[str] | None = None) -> list[str]:
     client = driver.ec2_client(region)
     errors: list[str] = []
     vpcs = client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
@@ -118,14 +135,22 @@ def _region_errors(region: str, cidr: str) -> list[str]:
         ],
     )["Images"]:
         errors.append(f"{region}: no supported Ubuntu Jammy AMI")
-    available_types = {
-        item["InstanceType"]
-        for item in client.describe_instance_types(
-            InstanceTypes=list(driver.instance_types)
-        )["InstanceTypes"]
-    }
+    candidates = instance_types or driver.instance_types
+    available_types = available_instance_types(client, candidates)
     if not available_types:
-        errors.append(f"{region}: none of {driver.instance_types!r} is available")
+        errors.append(f"{region}: none of {candidates!r} is available")
+    zones = client.describe_availability_zones(Filters=[{"Name": "state", "Values": ["available"]}])["AvailabilityZones"]
+    eligible = {subnet["AvailabilityZone"] for subnet in subnets if subnet.get("MapPublicIpOnLaunch")}
+    eligible &= {zone["ZoneName"] for zone in zones}
+    if not eligible:
+        errors.append(f"{region}: no available zone has a public default subnet")
+    else:
+        offerings = client.describe_instance_type_offerings(LocationType="availability-zone", Filters=[
+            {"Name": "location", "Values": sorted(eligible)},
+            {"Name": "instance-type", "Values": list(candidates)},
+        ]).get("InstanceTypeOfferings", [])
+        if not offerings:
+            errors.append(f"{region}: requested sizes have no offering in a zone with a public default subnet")
     return errors
 
 
@@ -134,6 +159,7 @@ def aws_readiness_errors(
     *,
     environment: Mapping[str, str] = os.environ,
     sts_client: Any | None = None,
+    instance_types: Sequence[str] | None = None,
 ) -> list[str]:
     errors = _environment_errors(environment)
     if not regions:
@@ -158,11 +184,14 @@ def aws_readiness_errors(
         return [f"AWS credential exchange or STS identity check failed: {error}"]
     if errors:
         return errors
-    for region in regions:
+    def regional(region: str) -> list[str]:
         try:
-            errors.extend(_region_errors(region, environment["SCAMPER_AWS_SSH_CIDR"]))
+            return _region_errors(region, environment["SCAMPER_AWS_SSH_CIDR"], instance_types)
         except Exception as error:
-            errors.append(f"{region}: AWS regional preflight failed: {error}")
+            return [f"{region}: AWS regional preflight failed: {error}"]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for regional_errors in executor.map(regional, regions):
+            errors.extend(regional_errors)
     return errors
 
 

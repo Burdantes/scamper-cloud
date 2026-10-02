@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from providers.azure import driver as azr
 
@@ -25,8 +29,13 @@ class FakePool:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def map(self, function: object, run_infos: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        return [(location, f"203.0.113.{index + 1}") for index, (_prefix, location) in enumerate(run_infos)]
+    def map(
+        self, function: object, run_infos: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        return [
+            (location, f"203.0.113.{index + 1}")
+            for index, (_prefix, location) in enumerate(run_infos)
+        ]
 
 
 class FakeProcess:
@@ -44,13 +53,166 @@ class FakeProcess:
     def kill(self) -> None:
         self.killed = True
 
+    def poll(self) -> int:
+        return self.exit_code
+
+
+class TimeoutProcess(FakeProcess):
+    def wait(self, timeout: float | None = None) -> int:
+        if not self.terminated and not self.killed:
+            raise azr.subprocess.TimeoutExpired("ssh", timeout)
+        return 124
+
+    def poll(self) -> None:
+        return None
+
+
+class ResultPoller:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def result(self) -> object:
+        return self._result
+
+
+def test_dual_stack_network_uses_internet_routable_ipv6_prefixes(
+    monkeypatch,
+) -> None:
+    requests: dict[str, object] = {}
+
+    class VirtualNetworks:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["vnet"] = parameters
+            return ResultPoller(parameters)
+
+    class Subnets:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            vnet_name: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["subnet"] = parameters
+            return ResultPoller(parameters)
+
+    client = SimpleNamespace(
+        virtual_networks=VirtualNetworks(),
+        subnets=Subnets(),
+    )
+    monkeypatch.setattr(azr, "get_network_client", lambda: client)
+
+    azr.create_vnet("run", "eastus", "vnet", ipv6_enabled=True)
+    azr.create_subnet("run", "vnet", "subnet", ipv6_enabled=True)
+
+    vnet = requests["vnet"]
+    subnet = requests["subnet"]
+    assert vnet.properties.address_space.address_prefixes == [
+        "10.0.0.0/24",
+        azr.IPV6_VNET_PREFIX,
+    ]
+    assert subnet.properties.address_prefixes == [
+        "10.0.0.0/28",
+        azr.IPV6_SUBNET_PREFIX,
+    ]
+    assert ipaddress.ip_network(azr.IPV6_VNET_PREFIX).is_global
+    assert ipaddress.ip_network(azr.IPV6_SUBNET_PREFIX).is_global
+    assert ipaddress.ip_network(azr.IPV6_SUBNET_PREFIX).prefixlen == 64
+
+
+def _fake_ip_client(requests: list[object], echo_tags: bool = True) -> SimpleNamespace:
+    class PublicIPAddresses:
+        def begin_create_or_update(self, resource_group: str, name: str, parameters: object) -> ResultPoller:
+            requests.append(parameters)
+            tags = parameters.properties.ip_tags if echo_tags else None
+            return ResultPoller(SimpleNamespace(ip_tags=tags, ip_address="203.0.113.9"))
+
+    return SimpleNamespace(public_ip_addresses=PublicIPAddresses())
+
+
+def test_ipv4_worker_address_uses_hot_potato_routing(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "Internet")
+
+    azr.create_ip("run", "eastus", "ip")
+    azr.create_ip("run", "eastus", "ip-v6", address_family="IPv6")
+
+    v4, v6 = (request.properties for request in requests)
+    assert [(t.ip_tag_type, t.tag) for t in v4.ip_tags] == [("RoutingPreference", "Internet")]
+    assert not v6.ip_tags  # Azure offers the Internet preference on IPv4 only
+
+
+def test_a_dropped_routing_preference_fails_the_launch(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests, echo_tags=False))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "Internet")
+
+    with pytest.raises(RuntimeError, match="expected Internet"):
+        azr.create_ip("run", "eastus", "ip")
+
+
+def test_cold_potato_remains_available_by_setting(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "MicrosoftNetwork")
+
+    azr.create_ip("run", "eastus", "ip")
+    assert not requests[0].properties.ip_tags
+
+
+def test_routing_preference_is_read_back_from_either_model_shape() -> None:
+    tag = {"ipTagType": "RoutingPreference", "tag": "Internet"}
+    flat = SimpleNamespace(ip_tags=[tag])
+    nested = SimpleNamespace(properties=SimpleNamespace(ip_tags=[tag]))
+    for ip in (flat, nested):
+        azr.verify_routing_preference(ip, "Internet", "ip")
+
+
+def test_dual_stack_nsg_scopes_any_protocol_workaround_to_ipv6_subnet(
+    monkeypatch,
+) -> None:
+    requests: dict[str, object] = {}
+
+    class NetworkSecurityGroups:
+        def begin_create_or_update(
+            self,
+            resource_group: str,
+            name: str,
+            parameters: object,
+        ) -> ResultPoller:
+            requests["nsg"] = parameters
+            return ResultPoller(parameters)
+
+    client = SimpleNamespace(network_security_groups=NetworkSecurityGroups())
+    monkeypatch.setattr(azr, "get_network_client", lambda: client)
+
+    azr.create_nsg("run", "eastus", "nsg", ipv6_enabled=True)
+
+    nsg = requests["nsg"]
+    rules = {rule.name: rule.properties for rule in nsg.properties.security_rules}
+    workaround = rules["AllowIPv6ForGuestICMP"]
+    assert workaround.protocol == "*"
+    assert workaround.source_address_prefix == "Internet"
+    assert workaround.destination_address_prefix == azr.IPV6_SUBNET_PREFIX
+    assert workaround.direction == "Inbound"
+    assert workaround.access == "Allow"
+    assert rules["AllowICMP"].protocol == "Icmp"
+
 
 def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     target_file = tmp_path / "ipv4-24"
-    target_file.write_text("".join(f"192.0.2.{index}\n" for index in range(20)), encoding="utf-8")
+    target_file.write_text(
+        "".join(f"192.0.2.{index}\n" for index in range(20)), encoding="utf-8"
+    )
     log_dir = tmp_path / "logs"
     waited: list[str] = []
     uploaded: list[tuple[str, str | None]] = []
@@ -59,15 +221,22 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     popen_args: list[list[str]] = []
 
     monkeypatch.setattr(azr.settings, "SCAMPER_IP_DST", str(target_file))
-    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "run-scamper-azr.sh"))
+    monkeypatch.setattr(
+        azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "run-scamper-azr.sh")
+    )
     monkeypatch.setattr(azr.settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "azr-key"))
     monkeypatch.setattr(azr.settings, "AZR_SCAMPER_USER", "azureuser")
     monkeypatch.setattr(azr, "create_bucket", lambda bucket: None)
     monkeypatch.setattr(azr, "create_rg", lambda prefix: None)
     monkeypatch.setattr(azr, "delete_rg", lambda prefix: FakePoller(waited, prefix))
-    monkeypatch.setattr(azr, "get_locations", lambda: [f"region-{index}" for index in range(12)])
+    monkeypatch.setattr(
+        azr, "get_locations", lambda: [f"region-{index}" for index in range(12)]
+    )
     monkeypatch.setattr(azr, "Pool", FakePool)
-    def capture_upload(file_name: str, bucket: str, object_name: str | None = None) -> None:
+
+    def capture_upload(
+        file_name: str, bucket: str, object_name: str | None = None
+    ) -> None:
         uploaded.append((Path(file_name).name, object_name))
         if Path(file_name).name == "manifest.json":
             manifests.append(json.loads(Path(file_name).read_text(encoding="utf-8")))
@@ -106,13 +275,40 @@ def test_run_azr_scamper_caps_instances_targets_and_cleans_up(
     ssh_commands = [args for args in popen_args if args and args[0] == "ssh"]
     assert len(scp_commands) == 3
     assert len(ssh_commands) == 3
-    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in scp_commands)
+    assert all(
+        "azr-test-trace-targets-5.txt" in " ".join(args) for args in scp_commands
+    )
     assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in scp_commands)
-    assert all("azr-test-trace-targets-5.txt" in " ".join(args) for args in ssh_commands)
+    assert all(
+        "azr-test-trace-targets-5.txt" in " ".join(args) for args in ssh_commands
+    )
     assert all("azr-test-rr-targets-5.txt" in " ".join(args) for args in ssh_commands)
-    assert all("SCAMPER_MEASUREMENTS=trace,rr" in " ".join(args) for args in ssh_commands)
+    assert all(
+        "SCAMPER_MEASUREMENTS=trace,rr" in " ".join(args) for args in ssh_commands
+    )
     assert all("runs/azr-test/nodes/" in " ".join(args) for args in ssh_commands)
-    assert all("region-3" not in " ".join(args) for args in [*scp_commands, *ssh_commands])
+    assert all(
+        "region-3" not in " ".join(args) for args in [*scp_commands, *ssh_commands]
+    )
+
+
+def test_azure_campaign_timeout_terminates_every_pending_process() -> None:
+    first = TimeoutProcess()
+    second = TimeoutProcess()
+    nodes = [
+        {"node": "azr-eastus", "complete": False, "return_code": None},
+        {"node": "azr-westus", "complete": False, "return_code": None},
+    ]
+
+    with pytest.raises(TimeoutError, match="timed out after 60 seconds"):
+        azr.wait_for_campaign_processes(
+            [(first, nodes[0]), (second, nodes[1])], timeout_seconds=60
+        )
+
+    assert first.terminated is True
+    assert second.terminated is True
+    assert nodes[0]["return_code"] == 124
+    assert nodes[1]["return_code"] == 124
 
 
 def test_launch_locations_keeps_trying_until_requested_successes(monkeypatch) -> None:
@@ -152,6 +348,58 @@ def test_launch_locations_keeps_trying_until_requested_successes(monkeypatch) ->
         [("azr-test", "bad-0"), ("azr-test", "bad-1")],
         [("azr-test", "good-0"), ("azr-test", "good-1")],
     ]
+
+
+def test_launch_locations_caps_provisioning_concurrency(monkeypatch) -> None:
+    pool_sizes: list[int] = []
+
+    class RecordingPool(FakePool):
+        def __init__(self, size: int) -> None:
+            super().__init__(size)
+            pool_sizes.append(size)
+
+    monkeypatch.setattr(azr, "Pool", RecordingPool)
+    monkeypatch.setattr(azr.settings, "AZR_LAUNCH_CONCURRENCY", 2)
+
+    ips = azr.launch_locations(
+        "azr-test",
+        ["region-0", "region-1", "region-2", "region-3", "region-4"],
+        max_instances=4,
+    )
+
+    assert len(ips) == 4
+    assert pool_sizes == [2]
+
+
+def test_run_azr_scamper_continues_with_partial_location_coverage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target_file = tmp_path / "targets.txt"
+    target_file.write_text("192.0.2.1\n", encoding="utf-8")
+    monkeypatch.setattr(azr.settings, "SCAMPER_IP_DST", str(target_file))
+    monkeypatch.setattr(azr, "create_bucket", lambda _bucket: None)
+    monkeypatch.setattr(azr, "create_rg", lambda _prefix: None)
+    monkeypatch.setattr(
+        azr,
+        "launch_locations",
+        lambda *args, **kwargs: [("eastus", "203.0.113.10")],
+    )
+    cleaned: list[str] = []
+    monkeypatch.setattr(azr, "cleanup_resource_group", cleaned.append)
+    monkeypatch.setattr(azr, "record_expense_instances", lambda _count: None)
+    monkeypatch.setattr(azr, "send_to_cloud_storage", lambda *args: None)
+    monkeypatch.setattr(azr.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(0))
+    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_VM_SCRIPT", str(tmp_path / "worker.sh"))
+    monkeypatch.setattr(azr.settings, "AZR_SCAMPER_SSH_KEY", str(tmp_path / "key"))
+
+    azr.run_azr_scamper(
+        str(tmp_path / "logs"),
+        "azr-test",
+        regions=("eastus", "westus"),
+    )
+
+    assert cleaned == ["azr-test"]
 
 
 def test_build_plan_uses_stable_bucket_and_per_run_prefix() -> None:
@@ -202,6 +450,8 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["complete"] is False
     assert manifest["failed_nodes"] == ["azr-eastus"]
     assert manifest["object_prefix"] == "runs/azr-test"
+    assert manifest["campaign_timeout_seconds"] == 14400
+    assert manifest["routing_preference"] == {"ipv4": azr.settings.AZR_ROUTING_PREFERENCE, "ipv6": None}
 
 
 def test_driver_takes_its_vm_size_from_settings_not_a_literal() -> None:
@@ -252,3 +502,23 @@ def test_worker_image_can_run_the_shared_campaign_runner() -> None:
     driver = (root / "providers/azure/driver.py").read_text(encoding="utf-8")
     assert "settings.AZR_IMAGE_SKU" in driver, "image must come from settings"
     assert 'offer="0001-com-ubuntu-server-focal"' not in driver
+
+
+def test_azure_workers_are_not_rebooted_by_platform_patching() -> None:
+    """Azure must not reboot a worker mid-campaign.
+
+    AutomaticByPlatform patches and reboots on Azure's schedule, which killed
+    scamper on 10 of 20 workers 55 minutes into the 2026-09-15 campaign.
+    """
+    source = Path(__file__).resolve().parents[2] / "providers/azure/driver.py"
+    text = source.read_text(encoding="utf-8")
+    assert 'patch_mode="ImageDefault"' in text
+    assert 'patch_mode="AutomaticByPlatform"' not in text
+
+
+def test_controller_pins_an_azure_network_sdk_with_properties_models() -> None:
+    """29.x/30.x lack the *PropertiesFormat models the driver builds."""
+    requirements = (
+        Path(__file__).resolve().parents[2] / "controller/requirements.txt"
+    ).read_text(encoding="utf-8")
+    assert "azure-mgmt-network>=33" in requirements.splitlines()

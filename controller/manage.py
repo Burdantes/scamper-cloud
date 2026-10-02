@@ -94,10 +94,18 @@ def bundle_repository(destination: Path) -> None:
         "skill-observations",
         "warts",
     }
+    excluded_subtrees = {
+        Path("target_generation/ipv6_bgp/downloads"),
+    }
     with tarfile.open(destination, "w:gz") as archive:
         for path in REPO_ROOT.rglob("*"):
             relative = path.relative_to(REPO_ROOT)
             if relative.parts[0] in excluded_top_level:
+                continue
+            if any(
+                relative == subtree or subtree in relative.parents
+                for subtree in excluded_subtrees
+            ):
                 continue
             if "__pycache__" in relative.parts or path.suffix == ".pyc":
                 continue
@@ -266,6 +274,7 @@ def controller_submission_command(
     trace_target: Path,
     rr_target: Path,
     remote_dir: str,
+    trace6_target: Path | None = None,
 ) -> str:
     command = [
         "sudo",
@@ -292,6 +301,8 @@ def controller_submission_command(
         str(args.trace_rate),
         "--rr-rate",
         str(args.rr_rate),
+        "--trace6-rate",
+        str(args.trace6_rate),
         "--rr-timeout",
         str(args.rr_timeout),
         "--probe-payload",
@@ -299,6 +310,12 @@ def controller_submission_command(
         "--measurement-contact",
         args.measurement_contact,
     ]
+    if args.campaign_timeout_seconds is not None:
+        command.extend(
+            ["--campaign-timeout-seconds", str(args.campaign_timeout_seconds)]
+        )
+    if trace6_target is not None:
+        command.extend(["--trace6-targets", str(trace6_target)])
     if args.regions:
         command.extend(["--regions", args.regions])
     if args.worker_machine_type:
@@ -309,6 +326,8 @@ def controller_submission_command(
         command.extend(["--worker-image-family", args.worker_image_family])
     if args.max_targets is not None:
         command.extend(["--max-targets", str(args.max_targets)])
+    if args.max_trace6_targets is not None:
+        command.extend(["--max-trace6-targets", str(args.max_trace6_targets)])
     if args.skip_smoke:
         command.append("--skip-smoke")
     if not args.apply:
@@ -325,6 +344,11 @@ def submit(args: argparse.Namespace) -> None:
         rr_target = resolve_submission_target(
             args, role="rr", staging_root=staging_root
         )
+        trace6_target = None
+        if "trace6" in args.measurements.split(","):
+            trace6_target = resolve_submission_target(
+                args, role="trace6", staging_root=staging_root
+            )
 
     remote_dir = f"/var/lib/scamper-controller/targets/{args.run_id}"
     run(
@@ -344,7 +368,11 @@ def submit(args: argparse.Namespace) -> None:
     ]
     run(ssh_command(args, " && ".join(install_parts)), args.apply)
     remote_command = controller_submission_command(
-        args, trace_target, rr_target, remote_dir
+        args,
+        trace_target,
+        rr_target,
+        remote_dir,
+        trace6_target=trace6_target,
     )
     run(ssh_command(args, remote_command), args.apply)
 
@@ -352,19 +380,19 @@ def submit(args: argparse.Namespace) -> None:
 def register_targets(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="scamper-target-registry-") as temp_dir:
         staging_root = Path(temp_dir)
-        trace = register_target(args, args.trace_targets, staging_root)
-        rr = register_target(args, args.rr_targets, staging_root)
-    print(
-        json.dumps(
-            {
-                "trace_target_id": trace.target_id,
-                "rr_target_id": rr.target_id,
-                "trace_target_count": trace.target_count,
-                "rr_target_count": rr.target_count,
-            },
-            indent=2,
-        )
-    )
+        registrations = {
+            role: register_target(args, source, staging_root)
+            for role in ("trace", "rr", "trace6")
+            if (source := getattr(args, f"{role}_targets")) is not None
+        }
+        trace6 = registrations.get("trace6")
+        if trace6 is not None and trace6.address_family != 6:
+            raise ValueError("--trace6-targets must contain IPv6 destinations")
+    values = {}
+    for role, registration in registrations.items():
+        values[f"{role}_target_id"] = registration.target_id
+        values[f"{role}_target_count"] = registration.target_count
+    print(json.dumps(values, indent=2))
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -392,8 +420,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_parser = subparsers.add_parser("register-targets")
     add_common(register_parser)
-    register_parser.add_argument("--trace-targets", type=Path, required=True)
-    register_parser.add_argument("--rr-targets", type=Path, required=True)
+    register_parser.add_argument("--trace-targets", type=Path)
+    register_parser.add_argument("--rr-targets", type=Path)
+    register_parser.add_argument("--trace6-targets", type=Path)
 
     submit_parser = subparsers.add_parser("submit")
     add_common(submit_parser)
@@ -407,6 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     rr_targets = submit_parser.add_mutually_exclusive_group(required=True)
     rr_targets.add_argument("--rr-targets", type=Path)
     rr_targets.add_argument("--rr-target-id", type=target_id)
+    trace6_targets = submit_parser.add_mutually_exclusive_group()
+    trace6_targets.add_argument("--trace6-targets", type=Path)
+    trace6_targets.add_argument("--trace6-target-id", type=target_id)
     submit_parser.add_argument(
         "--do-not-probe-file", type=Path, default=REPO_ROOT / "config/do-not-probe.txt"
     )
@@ -424,8 +456,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--measurements", default="trace,rr")
     submit_parser.add_argument("--max-instances", type=int, default=1)
     submit_parser.add_argument("--max-targets", type=int)
+    submit_parser.add_argument("--max-trace6-targets", type=int)
+    submit_parser.add_argument("--campaign-timeout-seconds", type=int)
     submit_parser.add_argument("--trace-rate", type=int, default=1000)
     submit_parser.add_argument("--rr-rate", type=int, default=1000)
+    submit_parser.add_argument("--trace6-rate", type=int, default=1000)
     submit_parser.add_argument("--rr-timeout", type=float, default=2.0)
     submit_parser.add_argument(
         "--probe-payload",
@@ -451,8 +486,23 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "deploy":
         deploy(args)
     elif args.action == "register-targets":
+        if not any((args.trace_targets, args.rr_targets, args.trace6_targets)):
+            raise ValueError("at least one target source is required")
         register_targets(args)
     elif args.action == "submit":
+        measurements = tuple(value.strip() for value in args.measurements.split(","))
+        unsupported = set(measurements) - {"trace", "trace6", "rr"}
+        if not all(measurements) or unsupported:
+            raise ValueError(
+                "unsupported measurements: "
+                + ", ".join(sorted(unsupported or {"empty"}))
+            )
+        if "trace6" in measurements and not (
+            args.trace6_targets or args.trace6_target_id
+        ):
+            raise ValueError(
+                "--trace6-targets or --trace6-target-id is required when trace6 is enabled"
+            )
         submit(args)
     elif args.action == "schedule-status":
         remote = (

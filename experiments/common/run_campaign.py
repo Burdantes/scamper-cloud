@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run traceroute and IPv4 Record Route measurements on one probe node."""
+"""Run IPv4/IPv6 traceroute and IPv4 Record Route on one probe node."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import re
 import secrets
 import shlex
 import socket
+import gzip
 import subprocess
 from collections import Counter
 from collections.abc import Iterable
@@ -23,8 +24,10 @@ from typing import Any
 
 MEASUREMENT_COMMANDS = {
     "trace": "trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}",
+    "trace6": "trace -m 20 -g 8 -w 3 -q 2 -P ICMP{payload_option}",
     "rr": "ping -P icmp-echo -R -c 1 -W {timeout}{payload_option}",
 }
+MEASUREMENT_FAMILIES = {"trace": 4, "trace6": 6, "rr": 4}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -80,7 +83,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_and_count_targets(path: Path) -> int:
+def validate_and_count_targets(path: Path, *, expected_family: int = 4) -> int:
     target_count = 0
     with path.open("r", encoding="utf-8") as source:
         for line_number, raw_line in enumerate(source, start=1):
@@ -93,11 +96,14 @@ def validate_and_count_targets(path: Path) -> int:
                 raise ValueError(
                     f"invalid IP target on line {line_number}: {value!r}"
                 ) from error
-            if address.version != 4:
-                raise ValueError(f"non-IPv4 target on line {line_number}: {value!r}")
+            if address.version != expected_family:
+                raise ValueError(
+                    f"non-IPv{expected_family} target on line {line_number}: {value!r}"
+                )
             if value != str(address):
                 raise ValueError(
-                    f"non-canonical IPv4 target on line {line_number}: {value!r}"
+                    f"non-canonical IPv{expected_family} target on line "
+                    f"{line_number}: {value!r}"
                 )
             target_count += 1
     if target_count == 0:
@@ -110,14 +116,17 @@ def verify_target_contract(
     *,
     expected_count: int | None,
     expected_sha256: str | None,
+    expected_family: int = 4,
 ) -> tuple[int, str, str]:
     if (expected_count is None) != (expected_sha256 is None):
         raise ValueError(
             "registered target count and SHA-256 must be provided together"
         )
     if expected_count is None or expected_sha256 is None:
-        target_count = validate_and_count_targets(path)
-        return target_count, sha256_file(path), "strict-ipv4-parse"
+        target_count = validate_and_count_targets(
+            path, expected_family=expected_family
+        )
+        return target_count, sha256_file(path), f"strict-ipv{expected_family}-parse"
 
     actual_sha256 = sha256_file(path)
     if actual_sha256 != expected_sha256:
@@ -133,8 +142,12 @@ def shuffle_targets(
     destination: Path,
     *,
     memory_limit: str = "128M",
+    seed: int | None = None,
 ) -> tuple[int, list[str]]:
-    seed = secrets.randbits(64)
+    # A caller that intends to resume must pin the seed: a random one reorders
+    # the targets, and chunk N would then cover different addresses than the
+    # chunk N already in the bucket.
+    seed = secrets.randbits(64) if seed is None else seed
     random_source = artifact_path(destination, "random-source.tmp")
     random_source.write_bytes(random.Random(seed).randbytes(1024 * 1024))
     command = [
@@ -175,6 +188,7 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
     destination_count = 0
     rr_requested_records = 0
     rr_responses_with_data = 0
+    destination_families: Counter[str] = Counter()
     first_record: dict[str, Any] | None = None
     sample: dict[str, Any] | None = None
 
@@ -191,8 +205,13 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
             sample = record
         record_type = str(record.get("type", "unknown"))
         record_types[record_type] += 1
-        if record.get("dst"):
+        destination = record.get("dst")
+        if destination:
             destination_count += 1
+            try:
+                destination_families[f"ipv{ipaddress.ip_address(destination).version}"] += 1
+            except ValueError:
+                destination_families["invalid"] += 1
         if record_type == "ping" and "v4rr" in flags_for(record):
             rr_requested_records += 1
         for response in record.get("responses", []) or []:
@@ -204,6 +223,7 @@ def summarize_json_lines(lines: Iterable[str], measurement: str) -> dict[str, An
         "record_count": sum(record_types.values()),
         "destination_count": destination_count,
         "record_types": dict(sorted(record_types.items())),
+        "destination_address_families": dict(sorted(destination_families.items())),
         "record_route_requested_records": rr_requested_records,
         "record_route_responses_with_data": rr_responses_with_data,
         "sample": sample or first_record,
@@ -243,6 +263,122 @@ def convert_and_summarize(
     return return_code, stderr, summary if return_code == 0 else None
 
 
+
+def chunk_plan(target_sha256: str, chunk_size: int, measurement: str) -> tuple[str, int]:
+    """Fingerprint and shuffle seed for a chunking plan.
+
+    Resuming by chunk index is only sound if the resumed run reproduces the
+    exact same ordering, so the seed is derived from the inputs rather than
+    drawn at random. The fingerprint travels in each chunk's file name, which
+    lets a resumed run prove from a bucket listing alone that the uploaded
+    chunks belong to the same plan. Anything different - another target file,
+    another chunk size - yields a different fingerprint and nothing is skipped.
+    """
+    material = f"{target_sha256}:{measurement}:{chunk_size}".encode()
+    digest = hashlib.sha256(material).hexdigest()
+    return digest[:12], int(digest[:16], 16)
+
+
+def chunk_target_file(
+    source: Path, chunk_size: int, output_prefix: Path, measurement: str,
+    name_suffix: str = "",
+) -> list[Path]:
+    """Split a shuffled target list into fixed-size chunk files.
+
+    Chunking is what makes a broken campaign resumable: each chunk is measured,
+    converted and uploaded on its own, so an interrupted run loses at most one
+    chunk instead of everything since it started.
+    """
+    if chunk_size <= 0:
+        return [source]
+    chunks: list[Path] = []
+    handle = None
+    written = 0
+    try:
+        with source.open("r", encoding="utf-8") as targets:
+            for line in targets:
+                if not line.strip():
+                    continue
+                if handle is None or written == chunk_size:
+                    if handle is not None:
+                        handle.close()
+                    path = artifact_path(
+                        output_prefix,
+                        f"{measurement}{name_suffix}.part-{len(chunks) + 1:05d}.targets.txt",
+                    )
+                    chunks.append(path)
+                    handle = path.open("w", encoding="utf-8")
+                    written = 0
+                handle.write(line if line.endswith("\n") else line + "\n")
+                written += 1
+    finally:
+        if handle is not None:
+            handle.close()
+    return chunks
+
+
+def convert_chunk_to_jsonl(
+    warts_path: Path, jsonl_path: Path, measurement: str, stderr_path: Path
+) -> tuple[int, str, dict[str, Any] | None]:
+    """Stream sc_warts2json into a gzipped JSONL chunk and summarise it."""
+    converter_command = ["sc_warts2json", str(warts_path)]
+    try:
+        with stderr_path.open("w+", encoding="utf-8") as converter_stderr:
+            process = subprocess.Popen(
+                converter_command,
+                stdout=subprocess.PIPE,
+                stderr=converter_stderr,
+                text=True,
+            )
+            if process.stdout is None:
+                raise RuntimeError("converter stdout pipe was not created")
+            captured: list[str] = []
+            with gzip.open(jsonl_path, "wt", encoding="utf-8") as jsonl:
+                for line in process.stdout:
+                    jsonl.write(line)
+                    captured.append(line)
+            process.stdout.close()
+            return_code = process.wait()
+            converter_stderr.seek(0)
+            stderr = converter_stderr.read().strip()
+    except FileNotFoundError:
+        return 127, "sc_warts2json was not found", None
+    finally:
+        stderr_path.unlink(missing_ok=True)
+    summary = None
+    if return_code == 0:
+        try:
+            summary = summarize_json_lines(captured, measurement)
+        except ValueError:
+            summary = None
+    return return_code, stderr, summary
+
+
+def completed_chunk_indices(path: Path | None, fingerprint: str | None = None) -> set[int]:
+    """Chunk numbers that are provably complete in the bucket.
+
+    Each chunk uploads its JSONL first and its metadata second, so the metadata
+    object is the commit marker: seeing it proves the data that precedes it
+    landed. A bare .jsonl.gz means the upload was interrupted and that chunk
+    must be measured again. When a fingerprint is given, only chunks carrying
+    it are eligible - chunks from a different plan are not interchangeable.
+    """
+    if path is None or not path.is_file():
+        return set()
+    pattern = re.compile(
+        r"plan-(?P<plan>[0-9a-f]{12})\.part-(?P<index>\d{5})\.metadata\.json$"
+    )
+    done: set[int] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = pattern.search(line.strip())
+        if not match:
+            continue
+        if fingerprint is not None and match.group("plan") != fingerprint:
+            continue
+        done.add(int(match.group("index")))
+    return done
+
+
 def measurement_command(
     measurement: str,
     *,
@@ -254,7 +390,7 @@ def measurement_command(
 ) -> list[str]:
     inner = MEASUREMENT_COMMANDS[measurement]
     payload_hex = payload_text.encode("ascii").hex() if payload_text else None
-    payload_flag = "-p" if measurement == "trace" else "-B"
+    payload_flag = "-B" if measurement == "rr" else "-p"
     payload_option = f" {payload_flag} {payload_hex}" if payload_hex else ""
     inner = inner.format(
         timeout=f"{rr_timeout_seconds:g}",
@@ -273,6 +409,114 @@ def measurement_command(
         "-O",
         "warts",
     ]
+
+
+def run_measurement_in_chunks(
+    measurement: str,
+    *,
+    shuffled_path: Path,
+    output_prefix: Path,
+    rate_pps: int,
+    rr_timeout_seconds: float,
+    payload_text: str | None,
+    chunk_size: int,
+    completed: set[int],
+    checkpoint_command: list[str] | None,
+    fingerprint: str = "",
+) -> dict[str, Any]:
+    """Measure, convert and upload one chunk at a time.
+
+    Each chunk is uploaded the moment it is converted, so the campaign's value
+    accumulates in the bucket instead of existing only on a worker's disk until
+    the very end. Chunks already present are skipped, which is what makes a
+    rerun cheap.
+    """
+    plan = f".plan-{fingerprint}" if fingerprint else ""
+    chunks = chunk_target_file(shuffled_path, chunk_size, output_prefix, measurement, plan)
+    results: list[dict[str, Any]] = []
+    for index, chunk_targets in enumerate(chunks, start=1):
+        if index in completed:
+            print(f"CHUNK_SKIPPED[{measurement}]={index}/{len(chunks)} already uploaded", flush=True)
+            results.append({"chunk": index, "skipped": True})
+            continue
+        stem = f"{measurement}{plan}.part-{index:05d}"
+        warts_path = artifact_path(output_prefix, f"{stem}.warts")
+        jsonl_path = artifact_path(output_prefix, f"{stem}.jsonl.gz")
+        metadata_path = artifact_path(output_prefix, f"{stem}.metadata.json")
+        stderr_path = artifact_path(output_prefix, f"{stem}.converter-stderr.tmp")
+
+        command = measurement_command(
+            measurement,
+            target_file=chunk_targets,
+            warts_file=warts_path,
+            rate_pps=rate_pps,
+            rr_timeout_seconds=rr_timeout_seconds,
+            payload_text=payload_text,
+        )
+        print(f"CHUNK_COMMAND[{measurement}]={index}/{len(chunks)} {shlex.join(command)}", flush=True)
+        started_at = utc_now()
+        completed_run = subprocess.run(command, check=False)
+        converter_code, converter_stderr, summary = convert_chunk_to_jsonl(
+            warts_path, jsonl_path, measurement, stderr_path
+        )
+        finished_at = utc_now()
+        record = {
+            "measurement": measurement,
+            "chunk": index,
+            "chunk_count": len(chunks),
+            "targets": sum(1 for _ in chunk_targets.open(encoding="utf-8")),
+            "scamper_return_code": completed_run.returncode,
+            "converter_return_code": converter_code,
+            "converter_stderr": converter_stderr,
+            "parsed_summary": summary,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "jsonl_file": str(jsonl_path),
+            "jsonl_sha256": sha256_file(jsonl_path) if jsonl_path.is_file() else None,
+            "plan_fingerprint": fingerprint,
+            "chunk_size": chunk_size,
+        }
+        metadata_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        results.append(record)
+
+        chunk_succeeded = completed_run.returncode == 0 and converter_code == 0
+        if checkpoint_command:
+            # The metadata is the commit marker, so it is uploaded last and only
+            # when the chunk actually succeeded. A failed chunk leaves its JSONL
+            # behind for inspection but stays eligible for re-measurement.
+            artifacts = (jsonl_path, metadata_path) if chunk_succeeded else (jsonl_path,)
+            if not chunk_succeeded:
+                print(
+                    f"CHUNK_INCOMPLETE[{measurement}]={index} scamper={completed_run.returncode} "
+                    f"converter={converter_code}; not committing, it will be retried",
+                    flush=True,
+                )
+            for artifact in artifacts:
+                if not artifact.is_file() or artifact.stat().st_size == 0:
+                    raise RuntimeError(f"cannot upload missing chunk artifact: {artifact}")
+                values = {
+                    "artifact": str(artifact),
+                    "artifact_name": artifact.name,
+                    "measurement": measurement,
+                    "output_prefix": str(output_prefix),
+                }
+                subprocess.run([a.format_map(values) for a in checkpoint_command], check=True)
+        # The chunk is safe in the bucket now; its warts copy is redundant.
+        warts_path.unlink(missing_ok=True)
+        print(
+            f"CHUNK_COMPLETE[{measurement}]={index}/{len(chunks)} "
+            f"targets={record['targets']} rc={completed_run.returncode}",
+            flush=True,
+        )
+    return {
+        "chunked": True,
+        "chunk_size": chunk_size,
+        "chunk_count": len(chunks),
+        "chunks": results,
+        "return_code": max(
+            (r.get("scamper_return_code", 0) or 0) for r in results if not r.get("skipped")
+        ) if any(not r.get("skipped") for r in results) else 0,
+    }
 
 
 def run_measurement(
@@ -339,10 +583,21 @@ def run_measurement(
                 "decoded destination count does not match target count: "
                 f"{decoded_destinations} != {target_count}"
             )
+        expected_family = f"ipv{MEASUREMENT_FAMILIES[measurement]}"
+        unexpected_families = set(
+            parsed_summary.get("destination_address_families", {})
+        ) - {expected_family}
+        if unexpected_families:
+            return_code = return_code or 67
+            converter_stderr = (converter_stderr + "; " if converter_stderr else "") + (
+                "decoded destinations contain unexpected address families: "
+                + ", ".join(sorted(unexpected_families))
+            )
 
     metadata = {
         **common_metadata,
         "measurement": measurement,
+        "address_family": MEASUREMENT_FAMILIES[measurement],
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "duration_seconds": (finished_at - started_at).total_seconds(),
@@ -418,11 +673,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--trace-targets", type=Path)
     parser.add_argument("--rr-targets", type=Path)
+    parser.add_argument("--trace6-targets", type=Path)
     parser.add_argument("--trace-target-count", type=positive_int)
     parser.add_argument("--rr-target-count", type=positive_int)
+    parser.add_argument("--trace6-target-count", type=positive_int)
     parser.add_argument("--trace-target-sha256", type=sha256_hex)
     parser.add_argument("--rr-target-sha256", type=sha256_hex)
+    parser.add_argument("--trace6-target-sha256", type=sha256_hex)
     parser.add_argument("--output-prefix", type=Path, required=True)
+    parser.add_argument(
+        "--chunk-targets", type=int, default=0,
+        help="measure this many targets per chunk, uploading each chunk's JSONL as "
+             "it completes; 0 keeps the single-shot behaviour",
+    )
+    parser.add_argument(
+        "--completed-chunks-file", type=Path,
+        help="file listing chunk artifacts already in the bucket; those chunks are "
+             "skipped so a resumed run re-measures only what is missing",
+    )
     parser.add_argument("--provider", required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument("--node", required=True)
@@ -432,17 +700,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-target-version")
     parser.add_argument("--rr-target-source")
     parser.add_argument("--rr-target-version")
+    parser.add_argument("--trace6-target-source")
+    parser.add_argument("--trace6-target-version")
     parser.add_argument("--trace-rate", type=positive_int, default=100)
     parser.add_argument("--rr-rate", type=positive_int, default=10)
+    parser.add_argument("--trace6-rate", type=positive_int, default=100)
     parser.add_argument("--rr-timeout", type=positive_float, default=2.0)
     parser.add_argument("--probe-payload", type=probe_payload_text)
     parser.add_argument("--measurement-contact")
     parser.add_argument("--do-not-probe-version")
-    parser.add_argument(
-        "--measurements",
-        choices=("trace,rr", "trace", "rr"),
-        default="trace,rr",
-    )
+    parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument(
         "--checkpoint-command",
         nargs=argparse.REMAINDER,
@@ -457,6 +724,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    measurements = tuple(part.strip() for part in args.measurements.split(","))
+    if not all(measurements) or len(set(measurements)) != len(measurements):
+        parser.error("--measurements must be a non-empty comma-separated unique list")
+    unsupported = set(measurements) - set(MEASUREMENT_COMMANDS)
+    if unsupported:
+        parser.error("unsupported measurements: " + ", ".join(sorted(unsupported)))
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     campaign_started = utc_now()
     common_metadata = {
@@ -472,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
     statuses: dict[str, int] = {}
     metadata: dict[str, Any] = {}
     target_sets: dict[str, dict[str, Any]] = {}
-    for measurement in args.measurements.split(","):
+    for measurement in measurements:
         target_path = getattr(args, f"{measurement}_targets") or args.targets
         target_source = (
             getattr(args, f"{measurement}_target_source") or args.target_source
@@ -498,8 +771,49 @@ def main(argv: list[str] | None = None) -> int:
             target_path,
             expected_count=expected_count,
             expected_sha256=expected_sha256,
+            expected_family=MEASUREMENT_FAMILIES[measurement],
         )
-        rate = args.trace_rate if measurement == "trace" else args.rr_rate
+        rate = {
+            "trace": args.trace_rate,
+            "trace6": args.trace6_rate,
+            "rr": args.rr_rate,
+        }[measurement]
+        if args.chunk_targets and args.chunk_targets > 0:
+            fingerprint, plan_seed = chunk_plan(
+                normalized_sha256, args.chunk_targets, measurement
+            )
+            shuffled_path = artifact_path(args.output_prefix, f"{measurement}.targets.txt")
+            seed, shuffle_command = shuffle_targets(
+                target_path, shuffled_path, seed=plan_seed
+            )
+            chunk_result = run_measurement_in_chunks(
+                measurement,
+                shuffled_path=shuffled_path,
+                output_prefix=args.output_prefix,
+                rate_pps=rate,
+                rr_timeout_seconds=args.rr_timeout,
+                payload_text=args.probe_payload,
+                chunk_size=args.chunk_targets,
+                completed=completed_chunk_indices(args.completed_chunks_file, fingerprint),
+                checkpoint_command=args.checkpoint_command,
+                fingerprint=fingerprint,
+            )
+            statuses[measurement] = chunk_result["return_code"]
+            metadata[measurement] = {
+                **chunk_result,
+                "shuffle_seed": seed,
+                "shuffle_command": shuffle_command,
+                "plan_fingerprint": fingerprint,
+            }
+            target_sets[measurement] = {
+                "source": target_source,
+                "version": target_version,
+                "normalized_file": str(target_path),
+                "normalized_sha256": normalized_sha256,
+                "target_count": target_count,
+                "address_family": MEASUREMENT_FAMILIES[measurement],
+            }
+            continue
         status, result_metadata = run_measurement(
             measurement,
             target_file=target_path,
@@ -523,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
             "normalized_file": str(target_path),
             "normalized_sha256": normalized_sha256,
             "target_count": target_count,
+            "address_family": MEASUREMENT_FAMILIES[measurement],
         }
         if args.checkpoint_command:
             checkpoint_measurement_artifacts(

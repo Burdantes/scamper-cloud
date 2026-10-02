@@ -1,0 +1,19 @@
+[Unit]
+Description=Report cloud workers no running scamper campaign owns
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=scamper-controller
+Group=scamper-controller
+WorkingDirectory=/opt/scamper-cloud/current
+EnvironmentFile=/etc/scamper-controller.env
+EnvironmentFile=/etc/scamper-controller-secrets.env
+ExecStart=/opt/scamper-cloud/current/.venv/bin/python -m controller.orphan_sweep
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scamper-controller
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

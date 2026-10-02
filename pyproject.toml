@@ -13,6 +13,7 @@ requires-python = ">=3.10"
 scamperctl = "scamperctl.cli:main"
 scamper-controller = "controller.manage:main"
 scamper-ipv4-targets = "target_generation.ipv4_bgp.generate:main"
+scamper-ipv6-hitlist = "target_generation.ipv6_hitlist.import_hitlist:main"
 
 [tool.setuptools.packages.find]
 include = ["scamperctl*", "controller*", "experiments*", "providers*", "target_generation*", "legacy*"]

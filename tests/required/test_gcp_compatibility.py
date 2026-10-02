@@ -217,6 +217,49 @@ def test_create_instance_regions_uses_one_zone_per_region_and_retries(
     assert attempted_zones == ["us-east1-a", "us-east1-b", "us-west1-a"]
 
 
+def test_run_gcp_scamper_continues_with_partial_region_coverage(
+    tmp_path, monkeypatch
+) -> None:
+    target_file = tmp_path / "targets.txt"
+    target_file.write_text("192.0.2.1\n", encoding="utf-8")
+    monkeypatch.setattr(gcp.settings, "SCAMPER_IP_DST", str(target_file))
+    monkeypatch.setattr(gcp, "get_zones", lambda: ["region-one-a", "region-two-a"])
+    monkeypatch.setattr(gcp, "create_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        gcp,
+        "create_instance_regions",
+        lambda *args, **kwargs: ["region-one-a"],
+    )
+    monkeypatch.setattr(
+        gcp,
+        "collect_instances",
+        lambda *args, **kwargs: [
+            ("gcp-test-region-one-a", "203.0.113.10", "region-one-a")
+        ],
+    )
+    monkeypatch.setattr(gcp, "record_expense_instances", lambda _count: None)
+    monkeypatch.setattr(gcp, "delete_instances", lambda _instances: {"worker"})
+    monkeypatch.setattr(gcp, "send_to_cloud_storage", lambda *args: None)
+    monkeypatch.setattr(
+        gcp, "verify_standard_network_tier",
+        lambda _instances: {"gcp-test-region-one-a": "STANDARD"},
+    )
+    monkeypatch.setattr(
+        gcp, "uploaded_artifact_sizes",
+        lambda _bucket, names: {name: 1024 for name in names},
+    )
+    monkeypatch.setattr(gcp, "incomplete_uploaded_statuses", lambda *_args: [])
+    monkeypatch.setattr(gcp.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(0))
+    monkeypatch.setattr(gcp.settings, "GCP_SCAMPER_SCRIPT", str(tmp_path / "worker.sh"))
+    monkeypatch.setattr(gcp.settings, "GCP_SCAMPER_SSH_KEY", str(tmp_path / "key"))
+
+    gcp.run_gcp_scamper(
+        str(tmp_path / "logs"),
+        "gcp-test",
+        regions=("region-one", "region-two"),
+    )
+
+
 def test_zones_in_regions_selects_only_requested_region() -> None:
     zones = ["us-central1-a", "us-central1-b", "us-east1-b"]
 
@@ -248,6 +291,15 @@ def test_verify_standard_network_tier_rejects_premium_configuration(
 
     with pytest.raises(RuntimeError, match="must be STANDARD"):
         gcp.verify_standard_network_tier([])
+
+
+def test_controller_ssh_cidr_is_restricted_to_one_ipv4_address(monkeypatch) -> None:
+    monkeypatch.setenv("SCAMPER_GCP_SSH_CIDR", "203.0.113.9")
+    assert gcp.controller_ssh_cidr() == "203.0.113.9/32"
+
+    monkeypatch.setenv("SCAMPER_GCP_SSH_CIDR", "0.0.0.0/0")
+    with pytest.raises(ValueError, match="controller's IPv4 /32"):
+        gcp.controller_ssh_cidr()
 
 
 def test_build_target_file_extracts_tsv_and_full_validation(tmp_path: Path) -> None:

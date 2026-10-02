@@ -1,2 +1,5 @@
+# The provider tests build real SDK models, so CI installs the controller SDKs.
+-r controller/requirements.txt
 pytest
 google-cloud-storage==3.9.0
+pytricia

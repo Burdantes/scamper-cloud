@@ -1,0 +1,20 @@
+[Unit]
+Description=Measure scamper campaign progress on running workers
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=scamper-controller
+Group=scamper-controller
+WorkingDirectory=/opt/scamper-cloud/current
+ExecStart=/opt/scamper-cloud/current/.venv/bin/python -m controller.progress_probe
+RuntimeMaxSec=1200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scamper-controller
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

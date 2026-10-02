@@ -90,6 +90,8 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         str(args.trace_rate),
         "--rr-rate",
         str(args.rr_rate),
+        "--trace6-rate",
+        str(getattr(args, "trace6_rate", 1000)),
         "--rr-timeout",
         str(args.rr_timeout),
         "--probe-payload",
@@ -99,12 +101,16 @@ def campaign_command(args: argparse.Namespace, job_dir: Path) -> list[str]:
         "--do-not-probe-file",
         str(args.do_not_probe_file),
     ]
+    if getattr(args, "trace6_targets", None) is not None:
+        command.extend(["--trace6-target-source", str(args.trace6_targets)])
     if args.regions:
         command.extend(["--regions", args.regions])
     if args.max_instances is not None:
         command.extend(["--max-instances", str(args.max_instances)])
     if args.max_targets is not None:
         command.extend(["--max-targets", str(args.max_targets)])
+    if getattr(args, "max_trace6_targets", None) is not None:
+        command.extend(["--max-trace6-targets", str(args.max_trace6_targets)])
     if args.skip_smoke:
         command.append("--skip-smoke")
     return command
@@ -119,6 +125,27 @@ MACHINE_TYPE_ENV = {
     "aws": "AWS_INSTANCE_TYPES",
     "azure": "AZR_VM_SIZE",
 }
+
+CAMPAIGN_TIMEOUT_ENV = {
+    "gcp": "SCAMPER_GCP_SCAMPER_TIMEOUT_SECONDS",
+    "aws": "SCAMPER_AWS_SCAMPER_TIMEOUT_SECONDS",
+    "azure": "SCAMPER_AZR_SCAMPER_TIMEOUT_SECONDS",
+}
+
+DEFAULT_CAMPAIGN_TIMEOUT_SECONDS = {
+    "gcp": 172800,
+    "aws": 14400,
+    "azure": 14400,
+}
+
+
+def default_campaign_timeout_seconds(provider: str) -> int:
+    try:
+        return DEFAULT_CAMPAIGN_TIMEOUT_SECONDS[provider]
+    except KeyError:  # pragma: no cover - driver_module() rejects these earlier
+        raise SystemExit(
+            f"no campaign timeout is known for provider {provider!r}"
+        ) from None
 
 
 def default_worker_machine_type(provider: str) -> str:
@@ -141,22 +168,58 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
             f"no worker size environment variable is known for provider {provider!r}"
         ) from None
     environment = [f"--setenv={machine_type_env}={args.worker_machine_type}"]
+    campaign_timeout_seconds = getattr(args, "campaign_timeout_seconds", None)
+    if campaign_timeout_seconds is not None:
+        environment.append(
+            f"--setenv={CAMPAIGN_TIMEOUT_ENV[provider]}={campaign_timeout_seconds}"
+        )
+    if provider == "azure":
+        from providers import settings
+
+        environment.append(
+            "--setenv=SCAMPER_AZR_LAUNCH_CONCURRENCY="
+            f"{settings.AZR_LAUNCH_CONCURRENCY}"
+        )
     worker_image_project = getattr(args, "worker_image_project", None)
     worker_image_family = getattr(args, "worker_image_family", None)
     if worker_image_project:
         environment.append(f"--setenv=GCP_IMAGE_PROJECT={worker_image_project}")
     if worker_image_family:
         environment.append(f"--setenv=GCP_IMAGE_FAMILY={worker_image_family}")
+    if getattr(args, "worker_image", None):
+        environment.append(f"--setenv=GCP_IMAGE={args.worker_image}")
+    if getattr(args, "worker_machine_types_json", None):
+        overrides = json.loads(args.worker_machine_types_json)
+        if not isinstance(overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in overrides.items()):
+            raise ValueError("worker machine types must be a region-to-size object")
+        variable = {"azure": "SCAMPER_AZR_VM_SIZES_JSON", "gcp": "SCAMPER_GCP_MACHINE_TYPES_JSON"}[provider]
+        environment.append(f"--setenv={variable}={json.dumps(overrides, separators=(',', ':'))}")
+    if getattr(args, "worker_image_versions_json", None):
+        versions = json.loads(args.worker_image_versions_json)
+        if not isinstance(versions, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in versions.items()):
+            raise ValueError("worker image versions must be a region-to-version object")
+        environment.append(f"--setenv=SCAMPER_AZR_IMAGE_VERSIONS_JSON={json.dumps(versions, separators=(',', ':'))}")
+    wait_options = (
+        ["--wait"] if getattr(args, "wait_for_completion", False) else []
+    )
     return [
         "systemd-run",
         f"--unit=scamper-campaign-{args.run_id}",
         "--collect",
+        *wait_options,
         "--property=Type=exec",
+        # Deleting a provider's resources takes minutes (an Azure resource group
+        # took 304s on 2026-09-15). systemd's 90s default would SIGKILL the
+        # driver mid-teardown and leave the workers running and billing.
+        "--property=TimeoutStopSec=900",
         *environment,
         "--uid=scamper-controller",
         "--gid=scamper-controller",
         f"--working-directory={INSTALL_ROOT.resolve()}",
         "/usr/local/bin/scamper-controller-run",
+        # Apply explicit submission settings AFTER the wrapper loads defaults.
+        "/usr/bin/env",
+        *(value.removeprefix("--setenv=") for value in environment),
         *command,
     ]
 
@@ -177,6 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True, type=run_id)
     parser.add_argument("--trace-targets", required=True, type=existing_file)
     parser.add_argument("--rr-targets", required=True, type=existing_file)
+    parser.add_argument("--trace6-targets", type=existing_file)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--object-prefix")
     parser.add_argument(
@@ -193,17 +257,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--worker-image-project")
     parser.add_argument("--worker-image-family")
+    parser.add_argument("--worker-image")
+    parser.add_argument("--worker-machine-types-json")
+    parser.add_argument("--worker-image-versions-json")
     parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument("--max-instances", type=positive_int)
     parser.add_argument("--max-targets", type=positive_int)
+    parser.add_argument("--max-trace6-targets", type=positive_int)
+    parser.add_argument("--campaign-timeout-seconds", type=positive_int)
     parser.add_argument("--trace-rate", type=positive_int, default=1000)
     parser.add_argument("--rr-rate", type=positive_int, default=1000)
+    parser.add_argument("--trace6-rate", type=positive_int, default=1000)
     parser.add_argument("--rr-timeout", type=float, default=2.0)
     parser.add_argument("--probe-payload", default=DEFAULT_PAYLOAD)
     parser.add_argument("--measurement-contact", default="ls3748@columbia.edu")
     parser.add_argument("--do-not-probe-file", required=True, type=existing_file)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--wait-for-completion",
+        action="store_true",
+        help=(
+            "wait for the transient campaign service and return its terminal "
+            "status; used by serialized schedulers"
+        ),
+    )
     parser.add_argument(
         "--allow-foreign-origin",
         action="store_true",
@@ -218,6 +296,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    measurements = tuple(value.strip() for value in args.measurements.split(","))
+    unsupported = set(measurements) - {"trace", "trace6", "rr"}
+    if (
+        not all(measurements)
+        or len(set(measurements)) != len(measurements)
+        or unsupported
+    ):
+        parser = build_parser()
+        parser.error(
+            "unsupported measurements: " + ", ".join(sorted(unsupported or {"empty"}))
+        )
+    if "trace6" in measurements and args.trace6_targets is None:
+        build_parser().error("--trace6-targets is required when trace6 is enabled")
     origin = assert_controller_origin(args.allow_foreign_origin)
     if args.worker_machine_type is None:
         args.worker_machine_type = default_worker_machine_type(args.provider)

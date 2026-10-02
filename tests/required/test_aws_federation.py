@@ -121,6 +121,27 @@ def test_aws_readiness_requires_federation_explicit_regions_and_controller_only_
     assert any("public IPv4 /32" in error for error in errors)
 
 
+def test_available_instance_types_ignores_invalid_regional_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClientError(Exception):
+        def __init__(self, code: str) -> None:
+            self.response = {"Error": {"Code": code}}
+
+    class FakeClient:
+        def describe_instance_types(self, *, InstanceTypes: list[str]) -> dict:
+            instance_type = InstanceTypes[0]
+            if instance_type == "t2.micro":
+                raise FakeClientError("InvalidInstanceType")
+            return {"InstanceTypes": [{"InstanceType": instance_type}]}
+
+    monkeypatch.setattr(aws_setup.driver, "client_error_type", lambda: FakeClientError)
+
+    assert aws_setup.available_instance_types(
+        FakeClient(), ("t3.micro", "t2.micro")
+    ) == {"t3.micro"}
+
+
 def test_bootstrap_configures_credential_process_at_the_aws_consumer_boundary() -> None:
     from pathlib import Path
 
