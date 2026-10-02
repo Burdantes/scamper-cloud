@@ -75,6 +75,13 @@ AZR_VM_SIZE = os.environ.get(
     "AZR_VM_SIZE",
     _default("providers.azure.client", "DEFAULT_INSTANCE_TYPE", "Standard_B2ts_v2"),
 )
+# Azure routing preference for worker IPv4 addresses. "Internet" is hot potato:
+# egress leaves Microsoft's network near the region, the closest Azure analogue
+# to GCP's Standard tier. "MicrosoftNetwork" is Azure's cold-potato default. It
+# is fixed when the address is created and Azure offers "Internet" for IPv4 only.
+AZR_ROUTING_PREFERENCE = os.environ.get("AZR_ROUTING_PREFERENCE", "Internet")
+if AZR_ROUTING_PREFERENCE not in ("Internet", "MicrosoftNetwork"):
+    raise ValueError("AZR_ROUTING_PREFERENCE must be Internet or MicrosoftNetwork")
 AZR_LAUNCH_CONCURRENCY = int(os.environ.get("SCAMPER_AZR_LAUNCH_CONCURRENCY", "4"))
 if AZR_LAUNCH_CONCURRENCY < 1:
     raise ValueError("SCAMPER_AZR_LAUNCH_CONCURRENCY must be a positive integer")

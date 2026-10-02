@@ -125,6 +125,55 @@ def test_dual_stack_network_uses_internet_routable_ipv6_prefixes(
     assert ipaddress.ip_network(azr.IPV6_SUBNET_PREFIX).prefixlen == 64
 
 
+def _fake_ip_client(requests: list[object], echo_tags: bool = True) -> SimpleNamespace:
+    class PublicIPAddresses:
+        def begin_create_or_update(self, resource_group: str, name: str, parameters: object) -> ResultPoller:
+            requests.append(parameters)
+            tags = parameters.properties.ip_tags if echo_tags else None
+            return ResultPoller(SimpleNamespace(ip_tags=tags, ip_address="203.0.113.9"))
+
+    return SimpleNamespace(public_ip_addresses=PublicIPAddresses())
+
+
+def test_ipv4_worker_address_uses_hot_potato_routing(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "Internet")
+
+    azr.create_ip("run", "eastus", "ip")
+    azr.create_ip("run", "eastus", "ip-v6", address_family="IPv6")
+
+    v4, v6 = (request.properties for request in requests)
+    assert [(t.ip_tag_type, t.tag) for t in v4.ip_tags] == [("RoutingPreference", "Internet")]
+    assert not v6.ip_tags  # Azure offers the Internet preference on IPv4 only
+
+
+def test_a_dropped_routing_preference_fails_the_launch(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests, echo_tags=False))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "Internet")
+
+    with pytest.raises(RuntimeError, match="expected Internet"):
+        azr.create_ip("run", "eastus", "ip")
+
+
+def test_cold_potato_remains_available_by_setting(monkeypatch) -> None:
+    requests: list[object] = []
+    monkeypatch.setattr(azr, "get_network_client", lambda: _fake_ip_client(requests))
+    monkeypatch.setattr(azr.settings, "AZR_ROUTING_PREFERENCE", "MicrosoftNetwork")
+
+    azr.create_ip("run", "eastus", "ip")
+    assert not requests[0].properties.ip_tags
+
+
+def test_routing_preference_is_read_back_from_either_model_shape() -> None:
+    tag = {"ipTagType": "RoutingPreference", "tag": "Internet"}
+    flat = SimpleNamespace(ip_tags=[tag])
+    nested = SimpleNamespace(properties=SimpleNamespace(ip_tags=[tag]))
+    for ip in (flat, nested):
+        azr.verify_routing_preference(ip, "Internet", "ip")
+
+
 def test_dual_stack_nsg_scopes_any_protocol_workaround_to_ipv6_subnet(
     monkeypatch,
 ) -> None:
@@ -402,6 +451,7 @@ def test_write_run_manifest_records_failed_nodes(tmp_path: Path) -> None:
     assert manifest["failed_nodes"] == ["azr-eastus"]
     assert manifest["object_prefix"] == "runs/azr-test"
     assert manifest["campaign_timeout_seconds"] == 14400
+    assert manifest["routing_preference"] == {"ipv4": azr.settings.AZR_ROUTING_PREFERENCE, "ipv6": None}
 
 
 def test_driver_takes_its_vm_size_from_settings_not_a_literal() -> None:

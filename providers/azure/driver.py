@@ -369,6 +369,12 @@ def write_run_manifest(
         "rr_rate_pps": rr_rate,
         "rr_timeout_seconds": rr_timeout,
         "campaign_timeout_seconds": campaign_timeout_seconds(),
+        # Verified on every address at creation (create_ip), so a node that
+        # launched carries exactly these preferences.
+        "routing_preference": {
+            "ipv4": routing_preference("IPv4"),
+            "ipv6": routing_preference("IPv6") if "trace6" in measurements else None,
+        },
         "probe_payload": probe_payload,
         "measurement_contact": measurement_contact,
         "commands": {
@@ -628,11 +634,55 @@ def delete_rg(rg_name):
     return rg_result
 
 
+def routing_preference(address_family="IPv4"):
+    """The routing preference a worker address of this family is created with.
+
+    Azure accepts the "Internet" (hot-potato) preference on IPv4 only, so IPv6
+    addresses always use the Microsoft global network.
+    """
+    return settings.AZR_ROUTING_PREFERENCE if address_family == "IPv4" else "MicrosoftNetwork"
+
+
+def _ip_tags(ip_address):
+    """(type, tag) pairs of a public IP, from either SDK model shape."""
+    tags = getattr(ip_address, "ip_tags", None)
+    if tags is None:
+        tags = getattr(getattr(ip_address, "properties", None), "ip_tags", None)
+    pairs = []
+    for tag in tags or []:
+        if isinstance(tag, dict):
+            pairs.append((tag.get("ipTagType") or tag.get("ip_tag_type"), tag.get("tag")))
+        else:
+            pairs.append((getattr(tag, "ip_tag_type", None), getattr(tag, "tag", None)))
+    return pairs
+
+
+def verify_routing_preference(ip_address, expected, ip_name):
+    """Fail the launch if Azure did not apply the requested routing preference.
+
+    The preference cannot be changed after creation, and a silently dropped tag
+    would leave the campaign on cold-potato routing without any visible sign.
+    """
+    tagged = ("RoutingPreference", "Internet") in _ip_tags(ip_address)
+    if tagged != (expected == "Internet"):
+        raise RuntimeError(
+            f"Azure public IP {ip_name} routing preference is "
+            f"{'Internet' if tagged else 'MicrosoftNetwork'}, expected {expected}"
+        )
+
+
 def create_ip(rg_name, location, ip_name, address_family="IPv4"):
+    from azure.mgmt.network.models import IpTag
     from azure.mgmt.network.models import PublicIPAddress
     from azure.mgmt.network.models import PublicIPAddressPropertiesFormat
     from azure.mgmt.network.models import PublicIPAddressSku
 
+    preference = routing_preference(address_family)
+    ip_tags = (
+        [IpTag(ip_tag_type="RoutingPreference", tag="Internet")]
+        if preference == "Internet"
+        else None
+    )
     poller = get_network_client().public_ip_addresses.begin_create_or_update(
         rg_name,
         ip_name,
@@ -642,11 +692,13 @@ def create_ip(rg_name, location, ip_name, address_family="IPv4"):
             properties=PublicIPAddressPropertiesFormat(
                 public_ip_allocation_method="Static",
                 public_ip_address_version=address_family,
+                ip_tags=ip_tags,
             ),
         ),
     )
 
     ip_address_result = poller.result()
+    verify_routing_preference(ip_address_result, preference, ip_name)
     return ip_address_result
 
 
