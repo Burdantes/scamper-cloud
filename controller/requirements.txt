@@ -8,6 +8,8 @@ python-dotenv
 boto3
 azure-identity
 azure-mgmt-compute
-azure-mgmt-network
+# >=33: the Azure driver builds *PropertiesFormat models, which 29.x and 30.x lack
+# (every Azure launch then fails at import).
+azure-mgmt-network>=33
 azure-mgmt-resource
 azure-mgmt-subscription

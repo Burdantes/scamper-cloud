@@ -514,3 +514,11 @@ def test_azure_workers_are_not_rebooted_by_platform_patching() -> None:
     text = source.read_text(encoding="utf-8")
     assert 'patch_mode="ImageDefault"' in text
     assert 'patch_mode="AutomaticByPlatform"' not in text
+
+
+def test_controller_pins_an_azure_network_sdk_with_properties_models() -> None:
+    """29.x/30.x lack the *PropertiesFormat models the driver builds."""
+    requirements = (
+        Path(__file__).resolve().parents[2] / "controller/requirements.txt"
+    ).read_text(encoding="utf-8")
+    assert "azure-mgmt-network>=33" in requirements.splitlines()
