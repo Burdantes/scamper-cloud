@@ -212,7 +212,8 @@ def progress_summary(progress: dict[str, Any]) -> dict[str, Any]:
 def ended_long_ago(job: dict[str, Any], grace: timedelta = timedelta(hours=1)) -> bool:
     """True when a run was submitted long enough ago that a missing unit means it ended."""
     try:
-        submitted = datetime.fromisoformat(str(job.get("submitted_at")))
+        # Python 3.10's fromisoformat rejects a trailing "Z"; 3.11+ accepts it.
+        submitted = datetime.fromisoformat(str(job.get("submitted_at")).replace("Z", "+00:00"))
     except ValueError:
         return False
     if submitted.tzinfo is None:

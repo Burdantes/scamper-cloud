@@ -211,7 +211,9 @@ def record_outcomes(root: Path = STATE_ROOT,
             continue
         try:
             job = json.loads(job_path.read_text(encoding="utf-8"))
-            submitted = datetime.fromisoformat(str(job.get("submitted_at")))
+            submitted = datetime.fromisoformat(str(job.get("submitted_at")).replace("Z", "+00:00"))
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
         except (OSError, ValueError):
             continue
         if now - submitted < OUTCOME_GRACE:

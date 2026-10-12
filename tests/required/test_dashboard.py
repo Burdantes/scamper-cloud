@@ -89,7 +89,9 @@ def test_dashboard_state_lists_every_submitted_run_regardless_of_name(tmp_path: 
     by_id = {item["run_id"]: item for item in value["runs"]}
     assert by_id["adhoc-gcp-probe"]["provider"] == "gcp"
     assert by_id["adhoc-gcp-probe"]["cycle"] == "20260914"
-    assert by_id["rr-followup"]["state"] == "submitted"
+    # Its unit is long gone and nothing recorded an outcome, so it has ended;
+    # "submitted" would read as still pending.
+    assert by_id["rr-followup"]["state"] == "ended"
 
 
 def test_dashboard_state_still_lists_queued_clouds_for_the_newest_cycle(tmp_path: Path, monkeypatch) -> None:
