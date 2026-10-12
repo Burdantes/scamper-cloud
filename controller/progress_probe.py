@@ -6,6 +6,10 @@ offset in /proc/<pid>/fdinfo against that file's size is an exact position
 rather than an estimate. This probes each worker of each running campaign over
 SSH, one at a time, and writes progress.json into the job directory for the
 dashboard to read. The dashboard never opens an SSH connection itself.
+
+It also records each ended run's outcome (outcome.json, from the run's GCS
+manifest), because the dashboard is read-only and the local logs are deleted
+after upload.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -166,6 +170,83 @@ def running_runs(root: Path = STATE_ROOT) -> list[str]:
     return [name for name in names if RUN_ID_PATTERN.fullmatch(name) and unit_is_active(name)]
 
 
+# A run's outcome lives only in its GCS manifest: the drivers delete their local
+# logs after uploading them. Record it once next to job.json, so the read-only
+# dashboard can show "complete" or "failed" instead of guessing after systemd has
+# collected the transient unit. A run younger than this may still be starting.
+OUTCOME_GRACE = timedelta(minutes=15)
+
+
+def _command_option(command: list[Any], name: str) -> str | None:
+    for index, item in enumerate(command):
+        if item == name and index + 1 < len(command):
+            return str(command[index + 1])
+    return None
+
+
+def manifest_fetcher() -> Callable[[str, str], dict[str, Any] | None]:
+    from google.api_core.exceptions import NotFound
+    from google.cloud import storage
+
+    client = storage.Client()
+
+    def fetch(bucket: str, name: str) -> dict[str, Any] | None:
+        try:
+            return json.loads(client.bucket(bucket).blob(name).download_as_bytes())
+        except NotFound:
+            return None
+
+    return fetch
+
+
+def record_outcomes(root: Path = STATE_ROOT,
+                    fetch: Callable[[str, str], dict[str, Any] | None] | None = None,
+                    now: datetime | None = None) -> list[str]:
+    """Write outcome.json for every ended run that lacks one; return the run IDs written."""
+    now = now or datetime.now(timezone.utc)
+    written = []
+    for job_path in sorted((root / "jobs").glob("*/job.json")):
+        job_dir, run_id = job_path.parent, job_path.parent.name
+        if (job_dir / "outcome.json").exists() or unit_is_active(run_id):
+            continue
+        try:
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            submitted = datetime.fromisoformat(str(job.get("submitted_at")).replace("Z", "+00:00"))
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+        except (OSError, ValueError):
+            continue
+        if now - submitted < OUTCOME_GRACE:
+            continue
+        command = job.get("campaign_command") or []
+        bucket = _command_option(command, "--bucket-name")
+        prefix = _command_option(command, "--object-prefix") or f"runs/{run_id}"
+        if not bucket:
+            continue
+        fetch = fetch or manifest_fetcher()
+        try:
+            manifest = fetch(bucket, f"{prefix}/manifest.json")
+        except Exception as error:  # an unreadable bucket is retried on the next pass
+            print(json.dumps({"run_id": run_id, "outcome_error": f"{type(error).__name__}: {error}"}), flush=True)
+            continue
+        if manifest is None:
+            outcome = {"status": "unrecorded"}
+        else:
+            outcome = {
+                "status": "complete" if manifest.get("complete") else "failed",
+                "failure": manifest.get("failure"),
+                "nodes": len(manifest.get("nodes") or []),
+                "failed_nodes": len(manifest.get("failed_nodes") or []),
+            }
+        outcome.update(manifest=f"gs://{bucket}/{prefix}/manifest.json", checked_at=now.isoformat())
+        path = job_dir / "outcome.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(outcome, indent=1) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        written.append(run_id)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", action="append", default=None)
@@ -174,6 +255,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     deadline = time.monotonic() + args.budget_seconds
+    recorded = record_outcomes(args.state_root)
+    if recorded:
+        print(json.dumps({"outcomes_recorded": recorded}), flush=True)
     targets = args.run_id or running_runs(args.state_root)
     if not targets:
         print(json.dumps({"probed": [], "note": "no running campaigns"}))

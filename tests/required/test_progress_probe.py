@@ -122,3 +122,56 @@ def test_probe_units_are_installed_and_bounded() -> None:
     assert "OnUnitActiveSec=30min" in timer
     assert "scamper-progress.service" in bootstrap
     assert "scamper-progress.timer" in bootstrap
+
+
+def test_record_outcomes_reads_each_ended_runs_manifest_once(tmp_path: Path, monkeypatch) -> None:
+    def job(run_id: str, submitted_at: str = "2026-09-15T00:00:00+00:00") -> None:
+        path = tmp_path / "jobs" / run_id / "job.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "submitted_at": submitted_at,
+            "campaign_command": ["driver", "--bucket-name", "b", "--object-prefix", f"runs/{run_id}"],
+        }), encoding="utf-8")
+
+    for run_id in ("run-ok", "run-bad", "run-lost", "run-active", "run-done-before"):
+        job(run_id)
+    job("run-fresh", "2026-10-12T18:00:00+00:00")
+    (tmp_path / "jobs/run-done-before/outcome.json").write_text('{"status": "complete"}', encoding="utf-8")
+    manifests = {
+        "runs/run-ok/manifest.json": {"complete": True, "nodes": [{}, {}], "failed_nodes": []},
+        "runs/run-bad/manifest.json": {"complete": False, "failure": "boom", "nodes": [{}, {}], "failed_nodes": ["a"]},
+    }
+    fetched: list[str] = []
+
+    def fetch(bucket: str, name: str):
+        fetched.append(name)
+        return manifests.get(name)
+
+    monkeypatch.setattr(progress_probe, "unit_is_active", lambda run_id: run_id == "run-active")
+    from datetime import datetime, timezone
+    now = datetime(2026, 10, 12, 18, 5, tzinfo=timezone.utc)
+    written = progress_probe.record_outcomes(tmp_path, fetch=fetch, now=now)
+
+    read = lambda run_id: json.loads((tmp_path / f"jobs/{run_id}/outcome.json").read_text())
+    assert sorted(written) == ["run-bad", "run-lost", "run-ok"]
+    assert sorted(fetched) == ["runs/run-bad/manifest.json", "runs/run-lost/manifest.json", "runs/run-ok/manifest.json"]
+    assert read("run-ok")["status"] == "complete"
+    assert read("run-bad")["status"] == "failed" and read("run-bad")["failure"] == "boom"
+    assert read("run-bad")["failed_nodes"] == 1 and read("run-bad")["nodes"] == 2
+    assert read("run-lost")["status"] == "unrecorded"
+    assert not (tmp_path / "jobs/run-active/outcome.json").exists()
+    assert not (tmp_path / "jobs/run-fresh/outcome.json").exists()
+
+
+def test_record_outcomes_retries_later_when_the_bucket_cannot_be_read(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "jobs/run-x/job.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"submitted_at": "2026-09-15T00:00:00+00:00",
+                                "campaign_command": ["d", "--bucket-name", "b"]}), encoding="utf-8")
+    monkeypatch.setattr(progress_probe, "unit_is_active", lambda run_id: False)
+
+    def fetch(bucket: str, name: str):
+        raise PermissionError("403")
+
+    assert progress_probe.record_outcomes(tmp_path, fetch=fetch) == []
+    assert not (tmp_path / "jobs/run-x/outcome.json").exists()

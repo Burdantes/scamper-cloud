@@ -89,7 +89,9 @@ def test_dashboard_state_lists_every_submitted_run_regardless_of_name(tmp_path: 
     by_id = {item["run_id"]: item for item in value["runs"]}
     assert by_id["adhoc-gcp-probe"]["provider"] == "gcp"
     assert by_id["adhoc-gcp-probe"]["cycle"] == "20260914"
-    assert by_id["rr-followup"]["state"] == "submitted"
+    # Its unit is long gone and nothing recorded an outcome, so it has ended;
+    # "submitted" would read as still pending.
+    assert by_id["rr-followup"]["state"] == "ended"
 
 
 def test_dashboard_state_still_lists_queued_clouds_for_the_newest_cycle(tmp_path: Path, monkeypatch) -> None:
@@ -320,3 +322,90 @@ def test_dashboard_service_is_local_only_and_installed_by_bootstrap() -> None:
     assert "User=scamper-controller" in unit
     assert "NoNewPrivileges=true" in unit
     assert "scamper-dashboard.service" in bootstrap
+
+
+def _collected(unit: str) -> dict[str, str]:
+    return {"active": "inactive", "sub": "dead", "since": "", "exit_code": ""}
+
+
+def test_an_ended_run_with_no_recorded_outcome_is_not_shown_as_submitted(tmp_path: Path, monkeypatch) -> None:
+    """A collected transient unit used to fall back to "submitted", which reads as pending."""
+    run_id = "repair-gcp-20260913a"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"campaign_command": [], "submitted_at": "2026-09-13T11:54:00+00:00"})
+    monkeypatch.setattr(dashboard, "systemd_state", _collected)
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "ended"
+
+
+def test_a_run_submitted_moments_ago_is_still_submitted(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    run_id = "monthly-gcp-20261012"
+    write_json(tmp_path / f"jobs/{run_id}/job.json",
+               {"campaign_command": [], "submitted_at": datetime.now(timezone.utc).isoformat()})
+    monkeypatch.setattr(dashboard, "systemd_state", _collected)
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "submitted"
+
+
+def test_a_recorded_outcome_gives_an_ended_run_its_real_result(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "systemd_state", _collected)
+    old = {"campaign_command": [], "submitted_at": "2026-09-15T23:42:00+00:00"}
+    write_json(tmp_path / "jobs/run-ok/job.json", old)
+    write_json(tmp_path / "jobs/run-ok/outcome.json", {"status": "complete"})
+    write_json(tmp_path / "jobs/run-bad/job.json", old)
+    write_json(tmp_path / "jobs/run-bad/outcome.json", {"status": "failed", "failure": "RuntimeError: missing 270 artifacts"})
+
+    assert dashboard.run_status("run-ok", tmp_path, {}, {})["state"] == "complete"
+    bad = dashboard.run_status("run-bad", tmp_path, {}, {})
+    assert bad["state"] == "failed"
+    assert bad["failure_reason"] == "RuntimeError: missing 270 artifacts"
+
+
+def test_the_page_folds_earlier_cycles_away() -> None:
+    assert "<details" in dashboard.INDEX
+    assert "Earlier runs" in dashboard.INDEX
+
+
+def test_a_run_with_only_some_nodes_flagged_is_partial_not_failed(tmp_path: Path, monkeypatch) -> None:
+    """Sept GCP flagged 24 of 43 nodes for being <=0.012% short; it delivered 141 GB."""
+    monkeypatch.setattr(dashboard, "systemd_state", _collected)
+    old = {"campaign_command": [], "submitted_at": "2026-09-15T19:13:00+00:00"}
+    write_json(tmp_path / "jobs/some/job.json", old)
+    write_json(tmp_path / "jobs/some/outcome.json",
+               {"status": "failed", "failure": "RuntimeError: incomplete", "nodes": 43, "failed_nodes": 24})
+    write_json(tmp_path / "jobs/all/job.json", old)
+    write_json(tmp_path / "jobs/all/outcome.json",
+               {"status": "failed", "failure": "RuntimeError: missing", "nodes": 27, "failed_nodes": 27})
+
+    some = dashboard.run_status("some", tmp_path, {}, {})
+    assert some["state"] == "partial"
+    assert some["failure_reason"].startswith("24 of 43 nodes flagged")
+    assert dashboard.run_status("all", tmp_path, {}, {})["state"] == "failed"
+
+
+def test_partial_wins_over_a_dispatcher_record_of_the_same_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(dashboard, "systemd_state", _collected)
+    run_id = "monthly-gcp-20260915"
+    write_json(tmp_path / f"jobs/{run_id}/job.json", {"campaign_command": [], "submitted_at": "2026-09-15T19:13:00+00:00"})
+    write_json(tmp_path / f"jobs/{run_id}/outcome.json",
+               {"status": "failed", "failure": "RuntimeError: incomplete", "nodes": 43, "failed_nodes": 24})
+    write_json(tmp_path / "monthly/20260915.json", {"results": [{"provider": "gcp", "run_id": run_id, "status": "failed"}]})
+    assert dashboard.run_status(run_id, tmp_path, {}, {})["state"] == "partial"
+
+
+
+def test_the_page_script_parses(tmp_path: Path) -> None:
+    """INDEX is a plain Python string, so a backslash escape in its JavaScript
+    becomes a real character; a regex containing \\n once broke the whole page."""
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = dashboard.INDEX.split("<script>", 1)[1].split("</script>", 1)[0]
+    path = tmp_path / "page.js"
+    path.write_text(script, encoding="utf-8")
+    result = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
