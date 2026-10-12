@@ -82,6 +82,13 @@ AZR_VM_SIZE = os.environ.get(
 AZR_ROUTING_PREFERENCE = os.environ.get("AZR_ROUTING_PREFERENCE", "Internet")
 if AZR_ROUTING_PREFERENCE not in ("Internet", "MicrosoftNetwork"):
     raise ValueError("AZR_ROUTING_PREFERENCE must be Internet or MicrosoftNetwork")
+# Targets per chunk. Each chunk is uploaded as soon as it is measured, so a
+# stopped or crashed campaign keeps everything up to its last chunk and a rerun
+# into the same object prefix resumes from there. 200000 IPv4 targets is about
+# 15 minutes at 5000 pps (about an hour at 1000 pps). 0 disables chunking.
+SCAMPER_CHUNK_TARGETS = int(os.environ.get("SCAMPER_CHUNK_TARGETS", "200000"))
+if SCAMPER_CHUNK_TARGETS < 0:
+    raise ValueError("SCAMPER_CHUNK_TARGETS must be zero or a positive integer")
 AZR_LAUNCH_CONCURRENCY = int(os.environ.get("SCAMPER_AZR_LAUNCH_CONCURRENCY", "4"))
 if AZR_LAUNCH_CONCURRENCY < 1:
     raise ValueError("SCAMPER_AZR_LAUNCH_CONCURRENCY must be a positive integer")

@@ -399,12 +399,16 @@ def init_cmd(target_files):
     ]
 
 
-def expected_campaign_artifacts(object_prefix, output_prefix, measurements):
+def expected_campaign_artifacts(object_prefix, output_prefix, measurements, chunked=False):
+    """Objects a finished node leaves. A chunked node has no single warts: its
+    chunks (committed one by one) carry the data, and status.json is complete
+    only when all of them are in the bucket."""
     artifacts = [f"{object_prefix}/{output_prefix}.status.json"]
     for measurement in measurements:
+        if not chunked:
+            artifacts.append(f"{object_prefix}/{output_prefix}.{measurement}.warts")
         artifacts.extend(
             [
-                f"{object_prefix}/{output_prefix}.{measurement}.warts",
                 f"{object_prefix}/{output_prefix}.{measurement}.metadata.json",
                 f"{object_prefix}/{output_prefix}.{measurement}.targets.txt",
             ]
@@ -450,6 +454,7 @@ def remote_scamper_command(
         "SCAMPER_TRACE6_RATE_PPS": str(trace6_rate),
         "SCAMPER_RR_TIMEOUT_SECONDS": f"{rr_timeout:g}",
         "SCAMPER_MEASUREMENTS": ",".join(measurements),
+        "SCAMPER_CHUNK_TARGETS": str(settings.SCAMPER_CHUNK_TARGETS),
     }
     if targets.trace6 is not None:
         environment.update(
@@ -1176,8 +1181,7 @@ def run_azr_scamper(
             output_prefix = f"{prefix}-{location}-{ip}"
             node_object_prefix = f"{object_prefix}/nodes/{location}/{node}"
             expected_objects = expected_campaign_artifacts(
-                node_object_prefix, output_prefix, measurements
-            )
+                node_object_prefix, output_prefix, measurements, chunked=settings.SCAMPER_CHUNK_TARGETS > 0)
             manifest_nodes.append(
                 {
                     "node": node,
