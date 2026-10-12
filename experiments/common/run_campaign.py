@@ -558,6 +558,8 @@ def run_measurement_in_chunks(
             "jsonl_sha256": sha256_file(jsonl_path) if jsonl_path.is_file() else None,
             "plan_fingerprint": fingerprint,
             "chunk_size": chunk_size,
+            # What this chunk actually probed; scamper-analysis requires it.
+            "shuffled_target_sha256": sha256_file(chunk_targets),
         }
         chunk_succeeded = completed_run.returncode == 0 and converter_code == 0
         # The fields scamper-analysis validates on every traceroute input, so a
@@ -914,7 +916,14 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 checkpoint_command=args.checkpoint_command,
                 fingerprint=fingerprint,
-                record_extra=common_metadata,
+                # The measurement's target provenance travels with every chunk:
+                # scamper-analysis refuses an input without it.
+                record_extra={
+                    **common_metadata,
+                    "target_source": target_source,
+                    "target_version": target_version,
+                    "normalized_target_sha256": normalized_sha256,
+                },
             )
             statuses[measurement] = chunked_measurement_status(chunk_result)
             metadata[measurement] = {
