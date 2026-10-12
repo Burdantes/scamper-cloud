@@ -7,7 +7,7 @@ import html
 import json
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -209,6 +209,17 @@ def progress_summary(progress: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ended_long_ago(job: dict[str, Any], grace: timedelta = timedelta(hours=1)) -> bool:
+    """True when a run was submitted long enough ago that a missing unit means it ended."""
+    try:
+        submitted = datetime.fromisoformat(str(job.get("submitted_at")))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - submitted > grace
+
+
 def run_status(run_id: str, root: Path, readiness: dict[str, Any], result: dict[str, Any],
                scope_cycle: str | None = None) -> dict[str, Any]:
     job_dir = root / "jobs" / run_id
@@ -219,6 +230,8 @@ def run_status(run_id: str, root: Path, readiness: dict[str, Any], result: dict[
     log_path = job_dir / "logs" / f"{run_id}.log"
     lines = clean_log_lines(log_path, 500)
     summary = read_json(job_dir / "summary.json")
+    outcome = read_json(job_dir / "outcome.json")
+    outcome_note = None
     if scope_cycle is not None and cycle != scope_cycle:
         readiness, result = {}, {}
     blocked = result.get("blocked", {}).get(provider) or readiness.get("providers", {}).get(provider, {}).get("errors", [])
@@ -237,16 +250,27 @@ def run_status(run_id: str, root: Path, readiness: dict[str, Any], result: dict[
         state = "complete"
     elif recorded_status == "failed" or (job and service["active"] == "failed"):
         state = "failed"
+    elif outcome.get("status") in {"complete", "failed"}:
+        state = outcome["status"]
     elif blocked:
         state = "blocked"
     elif job and ran and exit_code not in {"", "0"}:
         state = "failed"
     elif job and ran and exit_code == "0":
         state = "complete"
+    elif job and ended_long_ago(job):
+        # The transient unit is gone and nothing recorded how the run went.
+        state = "ended"
     elif job:
         state = "submitted"
     else:
         state = "queued"
+    nodes, flagged = outcome.get("nodes") or 0, outcome.get("failed_nodes") or 0
+    if state == "failed" and 0 < flagged < nodes:
+        # Only some nodes were flagged and the rest delivered; "failed" would
+        # overstate it, whether the failure came from the manifest or the dispatcher.
+        state = "partial"
+        outcome_note = f"{flagged} of {nodes} nodes flagged: {outcome.get('failure') or ''}".strip(": ")
     command = job.get("campaign_command", [])
     regions = (command_option(command, "--regions") or "").split(",") if command else []
     measurements = (command_option(command, "--measurements") or "").split(",") if command else []
@@ -265,7 +289,7 @@ def run_status(run_id: str, root: Path, readiness: dict[str, Any], result: dict[
         "blocked_reasons": blocked[:6],
         "blocked_count": len(blocked),
         "exit_code": recorded.get("exit_code") or service.get("exit_code"),
-        "failure_reason": summary.get("failure_reason") or recorded.get("failure_reason"),
+        "failure_reason": outcome_note or summary.get("failure_reason") or recorded.get("failure_reason") or outcome.get("failure"),
         "recent": lines[-12:],
     }
 
@@ -384,18 +408,20 @@ def dashboard_state(cycle: str | None = None, root: Path = STATE_ROOT,
 INDEX = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Scamper run status</title><style>
-*{box-sizing:border-box}body{margin:0;background:#fff;color:#222;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}.page{max-width:1100px;margin:0 auto;padding:32px 20px 48px}header{border-bottom:1px solid #ddd;padding-bottom:16px;margin-bottom:24px}h1{font-size:24px;margin:0 0 6px}.muted,.meta{color:#666}.meta{font-size:13px}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:11px 10px;border-bottom:1px solid #ddd}th{font-size:12px;color:#555;background:#f7f7f7}tbody tr{cursor:pointer}tbody tr.selected{background:#eef3fb}.run{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}.cloud{font-weight:600}.state{font-weight:600}.running,.complete{color:#176b3a}.failed,.blocked{color:#a32626}.queued,.submitted{color:#745600}.details{min-width:240px}.results a{color:#15499a;word-break:break-all}.loghead{font-size:13px;margin:18px 0 8px;color:#555}#instances table{margin-top:10px}#instances th,#instances td{padding:6px 8px;font-size:13px}.phase-measuring,.phase-uploading{color:#176b3a;font-weight:600}.phase-failed{color:#a32626;font-weight:600}.phase-starting,.phase-installing,.phase-smoke-testing{color:#745600}.addr{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#555}.prog{white-space:nowrap}.bar{display:inline-block;width:70px;height:8px;background:#e3e3e3;border-radius:4px;overflow:hidden;vertical-align:middle}.fill{display:block;height:100%;background:#176b3a}.pctlabel{margin-left:6px;font-size:12px;color:#444}.results a:visited{color:#15499a}.events{margin-top:30px}.events h2{font-size:16px;margin:0 0 10px}.log{height:260px;overflow:auto;white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:12px;color:#777;font-size:12px}.orphan{display:none;background:#fff6e5;color:#7a4b00;padding:10px;margin-bottom:16px;border:1px solid #e0c48c;font-weight:600}.error{display:none;background:#fff3f3;color:#8a1f1f;padding:10px;margin-bottom:16px;border:1px solid #e5bcbc}@media(max-width:720px){.page{padding:20px 12px}table{display:block;overflow-x:auto}.footer{display:block}.footer span{display:block;margin-top:4px}}
-</style></head><body><main class="page"><header><h1>Scamper run status</h1><div id="summary" class="meta">Loading…</div></header><div id="error" class="error"></div><div id="orphans" class="orphan"></div><table><thead><tr><th>Run</th><th>Cloud</th><th>Cycle</th><th>Status</th><th>Regions</th><th>Created</th><th>Ready</th><th>Progress</th><th>Artifacts left</th><th>Results</th><th>Details</th></tr></thead><tbody id="runs"></tbody></table><section class="events"><h2>Run detail &mdash; <span id="event-run">none</span></h2><div id="detail-summary" class="meta">Select a run.</div><div id="instances"></div><h3 class="loghead">Campaign log</h3><div class="log" id="log"></div></section><div class="footer"><span id="bucket">Data —</span><span id="release">Release —</span><span id="updated">Updated —</span></div></main><script>
+*{box-sizing:border-box}body{margin:0;background:#fff;color:#222;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}.page{max-width:1100px;margin:0 auto;padding:32px 20px 48px}header{border-bottom:1px solid #ddd;padding-bottom:16px;margin-bottom:24px}h1{font-size:24px;margin:0 0 6px}.muted,.meta{color:#666}.meta{font-size:13px}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:11px 10px;border-bottom:1px solid #ddd}th{font-size:12px;color:#555;background:#f7f7f7}tbody tr{cursor:pointer}tbody tr.selected{background:#eef3fb}.run{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all;min-width:210px}.cloud{font-weight:600}.state{font-weight:600}.running,.complete{color:#176b3a}.failed,.blocked{color:#a32626}.queued,.submitted{color:#745600}.ended{color:#777}.partial{color:#9a5b00}.earlier{margin-top:22px}.earlier summary{cursor:pointer;font-weight:600;color:#444;padding:6px 0}.earlier table{margin-top:6px}.details{min-width:240px;max-width:380px}.results{max-width:200px}.results a{color:#15499a;word-break:break-all}.loghead{font-size:13px;margin:18px 0 8px;color:#555}#instances table{margin-top:10px}#instances th,#instances td{padding:6px 8px;font-size:13px}.phase-measuring,.phase-uploading{color:#176b3a;font-weight:600}.phase-failed{color:#a32626;font-weight:600}.phase-starting,.phase-installing,.phase-smoke-testing{color:#745600}.addr{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#555}.prog{white-space:nowrap}.bar{display:inline-block;width:70px;height:8px;background:#e3e3e3;border-radius:4px;overflow:hidden;vertical-align:middle}.fill{display:block;height:100%;background:#176b3a}.pctlabel{margin-left:6px;font-size:12px;color:#444}.results a:visited{color:#15499a}.events{margin-top:30px}.events h2{font-size:16px;margin:0 0 10px}.log{height:260px;overflow:auto;white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.footer{display:flex;justify-content:space-between;gap:16px;margin-top:12px;color:#777;font-size:12px}.orphan{display:none;background:#fff6e5;color:#7a4b00;padding:10px;margin-bottom:16px;border:1px solid #e0c48c;font-weight:600}.error{display:none;background:#fff3f3;color:#8a1f1f;padding:10px;margin-bottom:16px;border:1px solid #e5bcbc}@media(max-width:720px){.page{padding:20px 12px}table{display:block;overflow-x:auto}.footer{display:block}.footer span{display:block;margin-top:4px}}
+</style></head><body><main class="page"><header><h1>Scamper run status</h1><div id="summary" class="meta">Loading…</div></header><div id="error" class="error"></div><div id="orphans" class="orphan"></div><table><thead><tr><th>Run</th><th>Cloud</th><th>Cycle</th><th>Status</th><th>Regions</th><th>Created</th><th>Ready</th><th>Progress</th><th>Artifacts left</th><th>Results</th><th>Details</th></tr></thead><tbody id="runs"></tbody></table><details class="earlier" id="earlier"><summary>Earlier runs (<span id="earlier-count">0</span>)</summary><table><thead><tr><th>Run</th><th>Cloud</th><th>Cycle</th><th>Outcome</th><th>Regions</th><th>Results</th><th>Details</th></tr></thead><tbody id="earlier-runs"></tbody></table></details><section class="events"><h2>Run detail &mdash; <span id="event-run">none</span></h2><div id="detail-summary" class="meta">Select a run.</div><div id="instances"></div><h3 class="loghead">Campaign log</h3><div class="log" id="log"></div></section><div class="footer"><span id="bucket">Data —</span><span id="release">Release —</span><span id="updated">Updated —</span></div></main><script>
 const esc=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=n=>n==null?'—':Number(n).toLocaleString();
 let latest=null,selected=null,shownDetail=null;
 const pct=f=>f==null?null:(100*f).toFixed(f<0.01?2:1)+'%';
 function progCell(p){const g=p.progress;if(!g||g.fraction==null)return '\u2014';const bar=Math.max(1,Math.round(100*g.fraction));return `<span class="bar" title="${esc(g.measurement||'')} · slowest ${esc(pct(g.slowest))} · fastest ${esc(pct(g.fastest))} · probed ${esc(ago(g.probed_at))}"><span class="fill" style="width:${bar}%"></span></span><span class="pctlabel">${esc(pct(g.fraction))} ${esc(g.measurement||'')}</span>`;}
-function detailOf(p){return p.failure_reason||(p.blocked_count?`${p.blocked_count} preflight findings. ${p.blocked_reasons[0]}`:(p.state==='failed'?`Exited with code ${p.exit_code}`:'—'));}
+const clip=(t,n=140)=>{t=String(t??'');const cut=t.indexOf(': [');const first=cut>0?t.slice(0,cut):t;return first.length>n?first.slice(0,n)+'…':first;};
+function detailCell(p){const full=detailOf(p);return `<td class="details" title="${esc(full)}">${esc(clip(full))}</td>`;}
+function detailOf(p){if(p.state==='ended'&&!p.failure_reason)return 'Ended; outcome not recorded';return p.failure_reason||(p.blocked_count?`${p.blocked_count} preflight findings. ${p.blocked_reasons[0]}`:(p.state==='failed'?`Exited with code ${p.exit_code}`:'—'));}
 function resultsCell(p){const r=p.results;if(!r||!r.bucket)return '&mdash;';return `<a href="${esc(r.console)}" target="_blank" rel="noopener" title="${esc(r.uri)}">${esc(r.prefix||r.bucket)}</a>`;}
-function shown(d){const runs=d.runs||[];return runs.find(p=>p.run_id===selected)||runs.find(p=>p.state==='running')||runs.find(p=>p.recent?.length)||runs[0];}
+function shown(d){const all=d.runs||[];const runs=all.filter(p=>d.cycle_filter||p.cycle===d.cycle).concat(all);return runs.find(p=>p.run_id===selected)||runs.find(p=>p.state==='running')||runs.find(p=>p.recent?.length)||runs[0];}
 function drawOrphans(d){const n=document.querySelector('#orphans');const o=d.orphans||{};if(o.count){n.textContent=`${o.count} unowned resource group(s) holding ${o.billable||0} billable resources (${o.idle||0} with disks/IPs but no VM): ${(o.runs||[]).join(', ')} — these are billing now. Swept ${ago(o.swept_at)}.`;n.style.display='block';}else if((o.errors||[]).length){n.textContent='Orphan sweep could not check: '+o.errors[0];n.style.display='block';}else{n.style.display='none';}}
-function draw(d){latest=d;drawOrphans(d);const runs=d.runs||[];const total=Object.values(d.targets||{}).reduce((a,n)=>a+(n||0),0);const scope=d.cycle_filter?`cycle ${d.cycle_filter}`:'all runs';document.querySelector('#summary').textContent=`${num(d.run_count)} runs (${scope}) · newest cycle ${d.cycle} · ${d.overall} · active run: ${d.active_run||'none'} · ${num(total)} targets per cloud · refreshes every 15 seconds`;const current=shown(d);document.querySelector('#runs').innerHTML=runs.map(p=>`<tr data-run="${esc(p.run_id)}" class="${p.run_id===current?.run_id?'selected':''}"><td class="run">${esc(p.run_id)}</td><td class="cloud">${esc(p.provider.toUpperCase())}</td><td>${esc(p.cycle||'—')}</td><td class="state ${esc(p.state)}">${esc(p.state)}</td><td>${num(p.regions)}</td><td>${num(p.milestones?.created)}</td><td>${num(p.milestones?.ready)}</td><td class="prog">${progCell(p)}</td><td>${num(p.milestones?.artifacts_remaining)}</td><td class="results">${resultsCell(p)}</td><td class="details">${esc(detailOf(p))}</td></tr>`).join('');document.querySelector('#event-run').textContent=current?.run_id||'none';if(current&&current.run_id!==shownDetail){shownDetail=current.run_id;loadDetail(current.run_id);}document.querySelector('#bucket').textContent=current?.results?.uri?`Data ${current.results.uri}`:(d.bucket?`Data gs://${d.bucket}`:'Data —');document.querySelector('#release').textContent=`Release ${d.release?.release||'unknown'} · ${(d.release?.bundle_sha256||d.release?.sha256||'').slice(0,12)}`;document.querySelector('#updated').textContent=`Updated ${new Date(d.generated_at).toLocaleString()}`;}
+function draw(d){latest=d;drawOrphans(d);const runs=d.runs||[];const total=Object.values(d.targets||{}).reduce((a,n)=>a+(n||0),0);const scope=d.cycle_filter?`cycle ${d.cycle_filter}`:'all runs';const mine=d.cycle_filter?runs:runs.filter(p=>p.cycle===d.cycle),older=d.cycle_filter?[]:runs.filter(p=>p.cycle!==d.cycle);const live=mine.filter(p=>p.state==='running').length;document.querySelector('#summary').textContent=`Cycle ${d.cycle_filter||d.cycle} · ${num(mine.length)} runs, ${live} running · ${d.overall} · ${num(older.length)} earlier runs below · refreshes every 15 seconds`;const current=shown(d);document.querySelector('#earlier-count').textContent=older.length;document.querySelector('#earlier').style.display=older.length?'':'none';document.querySelector('#earlier-runs').innerHTML=older.map(p=>`<tr data-run="${esc(p.run_id)}" class="${p.run_id===current?.run_id?'selected':''}"><td class="run">${esc(p.run_id)}</td><td class="cloud">${esc(p.provider.toUpperCase())}</td><td>${esc(p.cycle||'—')}</td><td class="state ${esc(p.state)}">${esc(p.state)}</td><td>${num(p.regions)}</td><td class="results">${resultsCell(p)}</td>${detailCell(p)}</tr>`).join('');document.querySelector('#runs').innerHTML=mine.map(p=>`<tr data-run="${esc(p.run_id)}" class="${p.run_id===current?.run_id?'selected':''}"><td class="run">${esc(p.run_id)}</td><td class="cloud">${esc(p.provider.toUpperCase())}</td><td>${esc(p.cycle||'—')}</td><td class="state ${esc(p.state)}">${esc(p.state)}</td><td>${num(p.regions)}</td><td>${num(p.milestones?.created)}</td><td>${num(p.milestones?.ready)}</td><td class="prog">${progCell(p)}</td><td>${num(p.milestones?.artifacts_remaining)}</td><td class="results">${resultsCell(p)}</td>${detailCell(p)}</tr>`).join('');document.querySelector('#event-run').textContent=current?.run_id||'none';if(current&&current.run_id!==shownDetail){shownDetail=current.run_id;loadDetail(current.run_id);}document.querySelector('#bucket').textContent=current?.results?.uri?`Data ${current.results.uri}`:(d.bucket?`Data gs://${d.bucket}`:'Data —');document.querySelector('#release').textContent=`Release ${d.release?.release||'unknown'} · ${(d.release?.bundle_sha256||d.release?.sha256||'').slice(0,12)}`;document.querySelector('#updated').textContent=`Updated ${new Date(d.generated_at).toLocaleString()}`;}
 const ago=iso=>{if(!iso)return '—';const s=(Date.now()-new Date(iso).getTime())/1000;if(s<90)return Math.round(s)+'s ago';if(s<5400)return Math.round(s/60)+'m ago';if(s<172800)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago';};
 const kb=n=>n==null?'—':(n>=1048576?(n/1048576).toFixed(1)+' MB':Math.round(n/1024)+' KB');
 async function loadDetail(runId){try{const r=await fetch('/api/run?run_id='+encodeURIComponent(runId),{cache:'no-store'});if(!r.ok)throw Error('status '+r.status);const d=await r.json();if(shownDetail!==runId)return;renderDetail(d);}catch(e){document.querySelector('#detail-summary').textContent='Could not load run detail: '+e.message;}}
@@ -404,7 +430,7 @@ const g=d.run?.progress||{};const measured=g.fraction!=null?` · ${pct(g.fractio
 const rows=(d.instances||[]).map(i=>`<tr><td>${esc(i.location)}</td><td class="addr">${esc(i.address)}</td><td class="phase-${esc(i.phase)}">${esc(i.phase)}</td><td>${i.smoke_ok?esc(i.smoke_ok):'—'}</td><td>${i.fraction!=null?esc(pct(i.fraction))+' '+esc(i.measurement||''):esc(i.probe_state||'—')}</td><td>${kb(i.warts_bytes)}</td><td>${kb(i.size)}</td><td>${esc(ago(i.modified))}</td><td class="details">${esc(i.last_line)}</td></tr>`).join('');
 document.querySelector('#instances').innerHTML=rows?`<table><thead><tr><th>Location</th><th>Address</th><th>Phase</th><th>Smoke</th><th>Measured</th><th>Warts</th><th>Log</th><th>Last write</th><th>Last line</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="muted">No per-worker logs yet.</p>';
 document.querySelector('#log').textContent=(d.log||[]).join('\\n')||'No recent events.';}
-document.querySelector('#runs').addEventListener('click',e=>{const row=e.target.closest('tr[data-run]');if(!row||!latest)return;selected=row.dataset.run;shownDetail=null;draw(latest);});
+for(const id of ['#runs','#earlier-runs'])document.querySelector(id).addEventListener('click',e=>{const row=e.target.closest('tr[data-run]');if(!row||!latest)return;selected=row.dataset.run;shownDetail=null;draw(latest);});
 async function refresh(){try{const cycle=new URLSearchParams(location.search).get('cycle')||'';const r=await fetch('/api/status?cycle='+encodeURIComponent(cycle),{cache:'no-store'});if(!r.ok)throw Error('status '+r.status);draw(await r.json());document.querySelector('#error').style.display='none'}catch(e){const n=document.querySelector('#error');n.textContent='Dashboard refresh failed: '+e.message;n.style.display='block'}}
 refresh();setInterval(refresh,15000);setInterval(()=>{if(shownDetail)loadDetail(shownDetail);},30000);
 </script></body></html>"""
