@@ -180,6 +180,10 @@ def systemd_command(args: argparse.Namespace, command: list[str]) -> list[str]:
             "--setenv=SCAMPER_AZR_LAUNCH_CONCURRENCY="
             f"{settings.AZR_LAUNCH_CONCURRENCY}"
         )
+    chunk_targets = getattr(args, "chunk_targets", None)
+    if chunk_targets is not None:
+        # Read by the driver (providers.settings) and by the progress prober.
+        environment.append(f"--setenv=SCAMPER_CHUNK_TARGETS={chunk_targets}")
     worker_image_project = getattr(args, "worker_image_project", None)
     worker_image_family = getattr(args, "worker_image_family", None)
     if worker_image_project:
@@ -272,6 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-payload", default=DEFAULT_PAYLOAD)
     parser.add_argument("--measurement-contact", default="ls3748@columbia.edu")
     parser.add_argument("--do-not-probe-file", required=True, type=existing_file)
+    parser.add_argument(
+        "--chunk-targets", type=int,
+        help="targets per uploaded chunk for this run (0 = single-shot); "
+             "defaults to the controller's SCAMPER_CHUNK_TARGETS",
+    )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(

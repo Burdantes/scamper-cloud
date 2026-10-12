@@ -328,6 +328,8 @@ def controller_submission_command(
         command.extend(["--max-targets", str(args.max_targets)])
     if args.max_trace6_targets is not None:
         command.extend(["--max-trace6-targets", str(args.max_trace6_targets)])
+    if getattr(args, "chunk_targets", None) is not None:
+        command.extend(["--chunk-targets", str(args.chunk_targets)])
     if args.skip_smoke:
         command.append("--skip-smoke")
     if not args.apply:
@@ -467,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="Academic probing; please reach out to ls3748@columbia.edu to opt out.",
     )
     submit_parser.add_argument("--measurement-contact", default="ls3748@columbia.edu")
+    submit_parser.add_argument("--chunk-targets", type=int)
     submit_parser.add_argument("--skip-smoke", action="store_true")
 
     status_parser = subparsers.add_parser("status")

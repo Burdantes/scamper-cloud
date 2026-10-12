@@ -79,3 +79,23 @@ def test_each_driver_decides_chunked_mode_from_the_setting(name: str) -> None:
     call_sites = source.count("expected_campaign_artifacts(") - 1  # minus the definition
     assert call_sites >= 1
     assert source.count("chunked=settings.SCAMPER_CHUNK_TARGETS > 0") == call_sites
+
+
+def test_a_run_can_set_its_own_chunk_size_at_submission() -> None:
+    import argparse
+
+    from controller import submit
+
+    args = argparse.Namespace(provider="aws", run_id="r", worker_machine_type="t3.micro", chunk_targets=300)
+    assert "--setenv=SCAMPER_CHUNK_TARGETS=300" in submit.systemd_command(args, ["python", "aws.py"])
+    args.chunk_targets = None  # the controller default applies
+    assert not any("SCAMPER_CHUNK_TARGETS" in item for item in submit.systemd_command(args, ["python"]))
+
+
+def test_submit_accepts_a_chunk_size_option() -> None:
+    from controller import submit
+
+    source = (REPO_ROOT / "controller/submit.py").read_text(encoding="utf-8")
+    assert '"--chunk-targets"' in source
+    manage = (REPO_ROOT / "controller/manage.py").read_text(encoding="utf-8")
+    assert '"--chunk-targets"' in manage
