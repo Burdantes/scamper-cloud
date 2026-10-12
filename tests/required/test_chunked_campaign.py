@@ -373,3 +373,69 @@ def test_a_chunked_run_checkpoints_its_measurement_summary_and_target_list(tmp_p
     assert sum(name.endswith(".metadata.json") and ".part-" in name for name in uploads) == 3
     status = json.loads((tmp_path / "out.status.json").read_text())
     assert status["complete"] is True
+
+
+def test_committed_chunks_are_recognised_from_bucket_object_names() -> None:
+    names = [
+        "runs/x/nodes/r/old-node/old.trace.plan-aaaaaaaaaaaa.part-00001.metadata.json",
+        "runs/x/nodes/r/old-node/old.trace.plan-aaaaaaaaaaaa.part-00002.warts",  # no marker
+        "runs/x/nodes/r/new-node/new.trace.plan-aaaaaaaaaaaa.part-00004.metadata.json",
+        "runs/x/nodes/r/old-node/old.trace.plan-bbbbbbbbbbbb.part-00003.metadata.json",  # other plan
+    ]
+    assert rc.completed_chunk_indices_from_names(names, "aaaaaaaaaaaa") == {1, 4}
+
+
+def test_a_chunked_run_asks_the_bucket_which_chunks_are_done(tmp_path: Path, monkeypatch) -> None:
+    """Resume: chunks committed by an earlier worker in this region are skipped."""
+    targets = write_targets(tmp_path / "in.txt", 6)
+    asked: list[str] = []
+    measured: list[str] = []
+
+    def fake_run(command, check=False, **kwargs):
+        if command and command[0] != "upload":
+            measured.append(Path(command[command.index("-f") + 1]).name)
+            Path(command[command.index("-o") + 1]).write_text("warts", encoding="utf-8")
+        class Result:
+            returncode = 0
+        return Result()
+
+    def fake_shuffle(source, destination, seed=None):
+        Path(destination).write_text(Path(source).read_text(encoding="utf-8"), encoding="utf-8")
+        return seed or 1, ["shuf"]
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    monkeypatch.setattr(rc, "shuffle_targets", fake_shuffle)
+    plan: dict[str, str] = {}
+    real_plan = rc.chunk_plan
+
+    def spy_plan(sha, size, measurement):
+        fingerprint, seed = real_plan(sha, size, measurement)
+        plan["fingerprint"] = fingerprint
+        return fingerprint, seed
+
+    monkeypatch.setattr(rc, "chunk_plan", spy_plan)
+    # Chunk 2 of this exact plan is already committed in the bucket.
+    monkeypatch.setattr(rc, "list_committed_chunk_objects", lambda uri: (asked.append(uri), [
+        f"runs/x/nodes/r/old/old.trace.plan-{plan['fingerprint']}.part-00002.metadata.json"])[1])
+    rc.main([
+        "--trace-targets", str(targets), "--rr-targets", str(targets),
+        "--trace-target-source", "test", "--trace-target-version", "v1",
+        "--rr-target-source", "test", "--rr-target-version", "v1",
+        "--output-prefix", str(tmp_path / "out"), "--provider", "gcp", "--region", "r", "--node", "n",
+        "--measurements", "trace", "--chunk-targets", "2",
+        "--completed-chunks-prefix", "gs://b/runs/x/nodes/r/",
+        "--checkpoint-command", "upload", "{artifact}",
+    ])
+    assert asked == ["gs://b/runs/x/nodes/r/"]
+    assert [name for name in measured if ".part-" in name] == [
+        f"out.trace.plan-{plan['fingerprint']}.part-00001.targets.txt",
+        f"out.trace.plan-{plan['fingerprint']}.part-00003.targets.txt",
+    ]
+
+
+def test_an_unreadable_bucket_means_measuring_everything(monkeypatch) -> None:
+    def broken(prefix_uri: str):
+        raise PermissionError("403")
+    monkeypatch.setattr(rc, "list_committed_chunk_objects", broken)
+    assert rc.bucket_completed_chunks("gs://b/p/", "aaaaaaaaaaaa") == set()

@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Iterable, Any
 
 
 MEASUREMENT_COMMANDS = {
@@ -352,6 +352,50 @@ def convert_chunk_to_jsonl(
         except ValueError:
             summary = None
     return return_code, stderr, summary
+
+
+CHUNK_MARKER = re.compile(r"plan-(?P<plan>[0-9a-f]{12})\.part-(?P<index>\d{5})\.metadata\.json$")
+
+
+def completed_chunk_indices_from_names(names: Iterable[str], fingerprint: str) -> set[int]:
+    """Chunk numbers of this plan whose commit marker is among the given object names."""
+    done = set()
+    for name in names:
+        match = CHUNK_MARKER.search(name.strip())
+        if match and match.group("plan") == fingerprint:
+            done.add(int(match.group("index")))
+    return done
+
+
+def list_committed_chunk_objects(prefix_uri: str) -> list[str]:
+    """Commit-marker object names below gs://bucket/prefix, recursively.
+
+    Uses the worker's upload.py credentials, the same ones its uploads use.
+    """
+    from upload import storage_client  # shipped next to this script on every worker
+
+    bucket, _, prefix = prefix_uri.removeprefix("gs://").partition("/")
+    return [
+        blob.name
+        for blob in storage_client().list_blobs(bucket, prefix=prefix)
+        if CHUNK_MARKER.search(blob.name)
+    ]
+
+
+def bucket_completed_chunks(prefix_uri: str, fingerprint: str) -> set[int]:
+    """Chunks of this plan already committed under prefix_uri; empty if unreadable.
+
+    A listing failure must cost time, never data: measuring everything again is
+    safe, skipping a chunk that is not really in the bucket is not.
+    """
+    try:
+        names = list_committed_chunk_objects(prefix_uri)
+    except Exception as error:  # credentials, network, library
+        print(f"CHUNK_RESUME_UNAVAILABLE {prefix_uri}: {type(error).__name__}: {error}", flush=True)
+        return set()
+    done = completed_chunk_indices_from_names(names, fingerprint)
+    print(f"CHUNK_RESUME {prefix_uri} plan={fingerprint} committed={sorted(done)}", flush=True)
+    return done
 
 
 def completed_chunk_indices(path: Path | None, fingerprint: str | None = None) -> set[int]:
@@ -744,6 +788,11 @@ def build_parser() -> argparse.ArgumentParser:
              "it completes; 0 keeps the single-shot behaviour",
     )
     parser.add_argument(
+        "--completed-chunks-prefix",
+        help="gs:// prefix searched (recursively) for chunks already committed by "
+             "an earlier worker of this region; those chunks are skipped",
+    )
+    parser.add_argument(
         "--completed-chunks-file", type=Path,
         help="file listing chunk artifacts already in the bucket; those chunks are "
              "skipped so a resumed run re-measures only what is missing",
@@ -851,7 +900,10 @@ def main(argv: list[str] | None = None) -> int:
                 rr_timeout_seconds=args.rr_timeout,
                 payload_text=args.probe_payload,
                 chunk_size=args.chunk_targets,
-                completed=completed_chunk_indices(args.completed_chunks_file, fingerprint),
+                completed=completed_chunk_indices(args.completed_chunks_file, fingerprint) | (
+                    bucket_completed_chunks(args.completed_chunks_prefix, fingerprint)
+                    if args.completed_chunks_prefix else set()
+                ),
                 checkpoint_command=args.checkpoint_command,
                 fingerprint=fingerprint,
             )

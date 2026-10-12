@@ -344,3 +344,19 @@ def test_probe_configuration_history_is_recorded() -> None:
     for flag in ("-P UDP-Paris", "-f 6", "-g 10", "-q 1"):
         assert flag in doc, f"{flag} is no longer recorded anywhere"
     assert "load-balancer" in doc, "the rationale for UDP-Paris must be preserved"
+
+
+@pytest.mark.parametrize(
+    "worker",
+    ["providers/gcp/worker/run-scamper-gcp.sh", "providers/aws/worker/run-scamper-aws.sh",
+     "providers/azure/worker/run-scamper-azr.sh"],
+)
+def test_workers_pass_chunking_and_a_per_chunk_upload_to_the_runner(worker: str) -> None:
+    script = (REPO_ROOT / worker).read_text(encoding="utf-8")
+    assert '--chunk-targets "$SCAMPER_CHUNK_TARGETS"' in script
+    assert '--completed-chunks-prefix "gs://$BUCKET_NAME/$(dirname "$OBJECT_PREFIX")/"' in script
+    assert "--checkpoint-command" in script
+    # --checkpoint-command consumes the rest of the argument list, so nothing
+    # may be appended to campaign_args after it.
+    tail = script[script.rindex("--checkpoint-command"):script.index("run_campaign.py \"${campaign_args[@]}\"")]
+    assert "campaign_args+=(" not in tail.split("\n", 2)[-1]
