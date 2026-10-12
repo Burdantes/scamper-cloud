@@ -439,3 +439,19 @@ def test_an_unreadable_bucket_means_measuring_everything(monkeypatch) -> None:
         raise PermissionError("403")
     monkeypatch.setattr(rc, "list_committed_chunk_objects", broken)
     assert rc.bucket_completed_chunks("gs://b/p/", "aaaaaaaaaaaa") == set()
+
+
+def test_chunk_metadata_carries_the_worker_identity(tmp_path: Path, monkeypatch) -> None:
+    """The mapper names the vantage point from metadata (probe, node, probe_ip)."""
+    shuffled = write_targets(tmp_path / "s.txt", 2)
+    monkeypatch.setattr(rc.subprocess, "run", _ok_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    rc.run_measurement_in_chunks(
+        "trace", shuffled_path=shuffled, output_prefix=tmp_path / "out",
+        rate_pps=1000, rr_timeout_seconds=2.0, payload_text=None,
+        chunk_size=2, completed=set(), checkpoint_command=None,
+        record_extra={"provider": "gcp", "region": "us-west1", "node": "n1", "probe_ip": "34.1.2.3"},
+    )
+    record = json.loads((tmp_path / "out.trace.part-00001.metadata.json").read_text())
+    assert (record["provider"], record["node"], record["probe_ip"]) == ("gcp", "n1", "34.1.2.3")
+    assert record["measurement"] == "trace"  # the chunk's own fields still win

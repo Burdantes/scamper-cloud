@@ -498,6 +498,7 @@ def run_measurement_in_chunks(
     completed: set[int],
     checkpoint_command: list[str] | None,
     fingerprint: str = "",
+    record_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Measure, convert and upload one chunk at a time.
 
@@ -540,6 +541,9 @@ def run_measurement_in_chunks(
         )
         finished_at = utc_now()
         record = {
+            # The worker's identity (provider, region, node, probe IP), as in a
+            # single-shot measurement's metadata; the chunk's own fields follow.
+            **(record_extra or {}),
             "measurement": measurement,
             "chunk": index,
             "chunk_count": len(chunks),
@@ -910,6 +914,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 checkpoint_command=args.checkpoint_command,
                 fingerprint=fingerprint,
+                record_extra=common_metadata,
             )
             statuses[measurement] = chunked_measurement_status(chunk_result)
             metadata[measurement] = {
