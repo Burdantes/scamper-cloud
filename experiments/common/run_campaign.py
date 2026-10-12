@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Any
+from typing import Iterable, Iterator, Any
 
 
 MEASUREMENT_COMMANDS = {
@@ -332,11 +332,22 @@ def convert_chunk_to_jsonl(
             )
             if process.stdout is None:
                 raise RuntimeError("converter stdout pipe was not created")
-            captured: list[str] = []
+            # Summarise while streaming: a 200k-traceroute chunk held in a list
+            # was hundreds of MB and OOM-killed 1 GiB workers (2026-10-12).
             with gzip.open(jsonl_path, "wt", encoding="utf-8") as jsonl:
-                for line in process.stdout:
-                    jsonl.write(line)
-                    captured.append(line)
+
+                def written_lines() -> Iterator[str]:
+                    for line in process.stdout:
+                        jsonl.write(line)
+                        yield line
+
+                lines = written_lines()
+                try:
+                    summary = summarize_json_lines(lines, measurement)
+                except ValueError:
+                    summary = None
+                for _rest in lines:  # an unparseable line drops the summary, never the data
+                    pass
             process.stdout.close()
             return_code = process.wait()
             converter_stderr.seek(0)
@@ -345,13 +356,7 @@ def convert_chunk_to_jsonl(
         return 127, "sc_warts2json was not found", None
     finally:
         stderr_path.unlink(missing_ok=True)
-    summary = None
-    if return_code == 0:
-        try:
-            summary = summarize_json_lines(captured, measurement)
-        except ValueError:
-            summary = None
-    return return_code, stderr, summary
+    return return_code, stderr, summary if return_code == 0 else None
 
 
 CHUNK_MARKER = re.compile(r"plan-(?P<plan>[0-9a-f]{12})\.part-(?P<index>\d{5})\.metadata\.json$")
