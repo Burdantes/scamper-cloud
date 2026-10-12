@@ -507,3 +507,55 @@ def test_a_chunked_run_passes_the_measurement_provenance_to_every_chunk(tmp_path
     ])
     assert seen["target_version"] == "v1" and seen["target_source"] == "src"
     assert len(seen["normalized_target_sha256"]) == 64
+
+
+def _fake_converter(tmp_path: Path, monkeypatch, lines: int, bad_line_at: int | None = None) -> Path:
+    """A stand-in sc_warts2json on PATH that prints `lines` trace records (~1 KB each)."""
+    import os
+    import stat
+    import sys as _sys
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "sc_warts2json"
+    bad = "" if bad_line_at is None else f"\n    if i == {bad_line_at}: print('{{not json')"
+    script.write_text(
+        f"#!{_sys.executable}\n"
+        "pad = 'x' * 1000\n"
+        f"for i in range({lines}):{bad}\n"
+        "    print('{\"type\": \"trace\", \"dst\": \"10.0.%d.%d\", \"pad\": \"%s\"}' % (i // 250 % 250, i % 250, pad))\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    warts = tmp_path / "c.warts"
+    warts.write_text("warts", encoding="utf-8")
+    return warts
+
+
+def test_chunk_conversion_streams_instead_of_holding_every_line(tmp_path: Path, monkeypatch) -> None:
+    """Holding a 200k-traceroute chunk's JSON in memory OOM-killed every 1 GiB
+    Azure worker and AWS workers on 2026-10-12. Peak memory must not grow with
+    the chunk: 60k lines of ~1 KB would be ~60 MB if retained."""
+    import tracemalloc
+
+    warts = _fake_converter(tmp_path, monkeypatch, lines=60000)
+    tracemalloc.start()
+    code, _stderr, summary = rc.convert_chunk_to_jsonl(
+        warts, tmp_path / "c.jsonl.gz", "trace", tmp_path / "c.err")
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert code == 0
+    assert summary is not None
+    assert peak < 15_000_000, f"peak {peak / 1e6:.1f} MB: conversion is holding the chunk in memory"
+    with gzip.open(tmp_path / "c.jsonl.gz", "rt", encoding="utf-8") as handle:
+        assert sum(1 for _ in handle) == 60000
+
+
+def test_a_bad_line_still_writes_the_whole_jsonl_and_drops_only_the_summary(tmp_path: Path, monkeypatch) -> None:
+    warts = _fake_converter(tmp_path, monkeypatch, lines=100, bad_line_at=50)
+    code, _stderr, summary = rc.convert_chunk_to_jsonl(
+        warts, tmp_path / "c.jsonl.gz", "trace", tmp_path / "c.err")
+    assert code == 0 and summary is None
+    with gzip.open(tmp_path / "c.jsonl.gz", "rt", encoding="utf-8") as handle:
+        assert sum(1 for _ in handle) == 101
