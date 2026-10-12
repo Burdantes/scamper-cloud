@@ -379,6 +379,37 @@ def completed_chunk_indices(path: Path | None, fingerprint: str | None = None) -
     return done
 
 
+def chunked_measurement_status(result: dict[str, Any]) -> int:
+    """0 only when every chunk is in the bucket; a gap means the run is incomplete."""
+    return 0 if result.get("committed") == result.get("chunk_count") else 1
+
+
+def write_chunked_measurement_metadata(
+    output_prefix: Path, measurement: str, result: dict[str, Any],
+    common_metadata: dict[str, Any], *, target_count: int, plan_fingerprint: str,
+    **extra: Any,
+) -> Path:
+    """The per-measurement summary a single-shot run writes, for a chunked run.
+
+    Drivers expect <prefix>.<measurement>.metadata.json, and status.json lists it.
+    """
+    path = artifact_path(output_prefix, f"{measurement}.metadata.json")
+    summary = {
+        **common_metadata,
+        **result,
+        **extra,
+        # Last, so the chunk loop's own "return_code" (the highest scamper exit
+        # code) cannot mask a chunk that never committed.
+        "measurement": measurement,
+        "address_family": MEASUREMENT_FAMILIES[measurement],
+        "target_count": target_count,
+        "return_code": chunked_measurement_status(result),
+        "plan_fingerprint": plan_fingerprint,
+    }
+    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def measurement_command(
     measurement: str,
     *,
@@ -476,15 +507,25 @@ def run_measurement_in_chunks(
             "plan_fingerprint": fingerprint,
             "chunk_size": chunk_size,
         }
+        chunk_succeeded = completed_run.returncode == 0 and converter_code == 0
+        # The fields scamper-analysis validates on every traceroute input, so a
+        # chunk is checked exactly like a single-shot measurement file.
+        record.update(
+            measurement=measurement,
+            address_family=MEASUREMENT_FAMILIES[measurement],
+            target_count=record["targets"],
+            return_code=completed_run.returncode or converter_code,
+        )
         metadata_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         results.append(record)
-
-        chunk_succeeded = completed_run.returncode == 0 and converter_code == 0
         if checkpoint_command:
             # The metadata is the commit marker, so it is uploaded last and only
             # when the chunk actually succeeded. A failed chunk leaves its JSONL
             # behind for inspection but stays eligible for re-measurement.
-            artifacts = (jsonl_path, metadata_path) if chunk_succeeded else (jsonl_path,)
+            # Raw warts first (what mapping reads), metadata last: it is the
+            # commit marker. JSONL is only this worker's validation step and is
+            # not uploaded, which would double the egress for no reader.
+            artifacts = (warts_path, metadata_path) if chunk_succeeded else (warts_path,)
             if not chunk_succeeded:
                 print(
                     f"CHUNK_INCOMPLETE[{measurement}]={index} scamper={completed_run.returncode} "
@@ -493,6 +534,8 @@ def run_measurement_in_chunks(
                 )
             for artifact in artifacts:
                 if not artifact.is_file() or artifact.stat().st_size == 0:
+                    if not chunk_succeeded:
+                        continue  # nothing to keep for inspection
                     raise RuntimeError(f"cannot upload missing chunk artifact: {artifact}")
                 values = {
                     "artifact": str(artifact),
@@ -501,17 +544,29 @@ def run_measurement_in_chunks(
                     "output_prefix": str(output_prefix),
                 }
                 subprocess.run([a.format_map(values) for a in checkpoint_command], check=True)
-        # The chunk is safe in the bucket now; its warts copy is redundant.
-        warts_path.unlink(missing_ok=True)
+        if checkpoint_command:
+            # Uploaded (and, if it succeeded, committed): drop the local copies so
+            # the worker's final "upload every <prefix>.* file" step does not send
+            # them again and the disk does not fill over a multi-day run.
+            warts_path.unlink(missing_ok=True)
+            jsonl_path.unlink(missing_ok=True)
+            if chunk_succeeded:
+                metadata_path.unlink(missing_ok=True)
+                chunk_targets.unlink(missing_ok=True)
         print(
             f"CHUNK_COMPLETE[{measurement}]={index}/{len(chunks)} "
             f"targets={record['targets']} rc={completed_run.returncode}",
             flush=True,
         )
+    committed = sum(
+        1 for r in results
+        if r.get("skipped") or (r.get("scamper_return_code") == 0 and r.get("converter_return_code") == 0)
+    )
     return {
         "chunked": True,
         "chunk_size": chunk_size,
         "chunk_count": len(chunks),
+        "committed": committed,
         "chunks": results,
         "return_code": max(
             (r.get("scamper_return_code", 0) or 0) for r in results if not r.get("skipped")
@@ -643,9 +698,11 @@ def checkpoint_measurement_artifacts(
     *,
     measurement: str,
     output_prefix: Path,
+    include_warts: bool = True,
 ) -> None:
+    # A chunked measurement has no single warts: its chunks already carry the data.
     artifacts = (
-        artifact_path(output_prefix, f"{measurement}.warts"),
+        *((artifact_path(output_prefix, f"{measurement}.warts"),) if include_warts else ()),
         artifact_path(output_prefix, f"{measurement}.metadata.json"),
         artifact_path(output_prefix, f"{measurement}.targets.txt"),
     )
@@ -798,13 +855,27 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_command=args.checkpoint_command,
                 fingerprint=fingerprint,
             )
-            statuses[measurement] = chunk_result["return_code"]
+            statuses[measurement] = chunked_measurement_status(chunk_result)
             metadata[measurement] = {
                 **chunk_result,
                 "shuffle_seed": seed,
                 "shuffle_command": shuffle_command,
                 "plan_fingerprint": fingerprint,
             }
+            write_chunked_measurement_metadata(
+                args.output_prefix, measurement, chunk_result, common_metadata,
+                target_count=target_count, plan_fingerprint=fingerprint,
+                shuffle_seed=seed, shuffle_command=shuffle_command,
+                target_source=target_source, target_version=target_version,
+                normalized_target_sha256=normalized_sha256,
+            )
+            if args.checkpoint_command:
+                # GCP's worker uploads only status.json at the end and relies on
+                # this checkpoint for the rest, exactly as in single-shot mode.
+                checkpoint_measurement_artifacts(
+                    args.checkpoint_command, measurement=measurement,
+                    output_prefix=args.output_prefix, include_warts=False,
+                )
             target_sets[measurement] = {
                 "source": target_source,
                 "version": target_version,
