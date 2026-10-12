@@ -119,6 +119,15 @@ fi
 if [[ -n "${SCAMPER_TRACE6_TARGET_SHA256:-}" ]]; then
   campaign_args+=(--trace6-target-sha256 "$SCAMPER_TRACE6_TARGET_SHA256")
 fi
+# Chunked mode: each chunk of targets is uploaded the moment it is measured,
+# so a stopped or crashed campaign keeps everything up to its last chunk and
+# can resume from the chunks already in the bucket.
+if [[ "${SCAMPER_CHUNK_TARGETS:-0}" -gt 0 ]]; then
+  campaign_args+=(--chunk-targets "$SCAMPER_CHUNK_TARGETS")
+  # Resume: skip chunks of this plan already committed by any earlier worker of
+  # this region (the parent of this worker's own object prefix).
+  campaign_args+=(--completed-chunks-prefix "gs://$BUCKET_NAME/$(dirname "$OBJECT_PREFIX")/")
+fi
 campaign_args+=(
   --checkpoint-command
   "$WORKER_PYTHON" ./upload.py "{artifact}" "$BUCKET_NAME" "$OBJECT_PREFIX/{artifact_name}"

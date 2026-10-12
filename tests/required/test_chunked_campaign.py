@@ -104,11 +104,13 @@ def test_each_chunk_is_uploaded_as_it_completes(tmp_path: Path, monkeypatch) -> 
         chunk_size=2, completed=set(), checkpoint_command=["upload", "{artifact}"],
     )
     assert result["chunk_count"] == 3
-    # Three chunks, each uploading its JSONL and metadata as it finishes.
+    # Three chunks, each uploading its raw warts (what mapping reads) and then
+    # its metadata, the commit marker, as it finishes. JSONL stays local: it is
+    # only the validation step, and uploading it would double the egress.
     assert uploads == [
-        "out.trace.part-00001.jsonl.gz", "out.trace.part-00001.metadata.json",
-        "out.trace.part-00002.jsonl.gz", "out.trace.part-00002.metadata.json",
-        "out.trace.part-00003.jsonl.gz", "out.trace.part-00003.metadata.json",
+        "out.trace.part-00001.warts", "out.trace.part-00001.metadata.json",
+        "out.trace.part-00002.warts", "out.trace.part-00002.metadata.json",
+        "out.trace.part-00003.warts", "out.trace.part-00003.metadata.json",
     ]
     # Uploads are interleaved with measurement, not batched at the end.
     assert order[:3] == ["measure", "upload", "upload"]
@@ -239,6 +241,217 @@ def test_a_failed_chunk_is_not_committed(tmp_path: Path, monkeypatch) -> None:
         chunk_size=2, completed=set(), checkpoint_command=["upload", "{artifact}"],
         fingerprint="aaaaaaaaaaaa",
     )
-    # JSONL is kept for inspection, but no metadata means not committed.
-    assert any(name.endswith(".jsonl.gz") for name in uploads)
+    # The raw warts is uploaded for inspection, but no metadata means not committed.
+    assert any(name.endswith(".warts") for name in uploads)
     assert not any(name.endswith(".metadata.json") for name in uploads)
+
+
+
+def _ok_run(command, check=False, **kwargs):
+    if command and command[0] != "upload":
+        Path(command[command.index("-o") + 1]).write_text("warts", encoding="utf-8")
+    class Result:
+        returncode = 0
+    return Result()
+
+
+def _ok_convert(warts_path, jsonl_path, measurement, stderr_path):
+    with gzip.open(jsonl_path, "wt", encoding="utf-8") as handle:
+        handle.write('{"type":"trace"}\n')
+    return 0, "", {"records": 1}
+
+
+def test_committed_chunks_leave_nothing_behind_to_reupload(tmp_path: Path, monkeypatch) -> None:
+    """The worker's final step uploads every <prefix>.* file; committed chunks must not be among them."""
+    shuffled = write_targets(tmp_path / "s.txt", 5)
+    monkeypatch.setattr(rc.subprocess, "run", _ok_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    rc.run_measurement_in_chunks(
+        "trace", shuffled_path=shuffled, output_prefix=tmp_path / "out",
+        rate_pps=1000, rr_timeout_seconds=2.0, payload_text=None,
+        chunk_size=2, completed=set(), checkpoint_command=["upload", "{artifact}"],
+    )
+    assert sorted(p.name for p in tmp_path.glob("out.trace.part-*")) == []
+
+
+def test_chunk_metadata_carries_the_fields_mapping_validates(tmp_path: Path, monkeypatch) -> None:
+    """scamper-analysis checks measurement, address_family, return_code and target_count."""
+    shuffled = write_targets(tmp_path / "s.txt", 3)
+    monkeypatch.setattr(rc.subprocess, "run", _ok_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    rc.run_measurement_in_chunks(
+        "trace", shuffled_path=shuffled, output_prefix=tmp_path / "out",
+        rate_pps=1000, rr_timeout_seconds=2.0, payload_text=None,
+        chunk_size=2, completed=set(), checkpoint_command=None,
+    )
+    record = json.loads((tmp_path / "out.trace.part-00001.metadata.json").read_text())
+    assert record["measurement"] == "trace"
+    assert record["address_family"] == 4
+    assert record["return_code"] == 0
+    assert record["target_count"] == 2
+
+
+def test_a_chunk_whose_conversion_failed_records_a_failing_return_code(tmp_path: Path, monkeypatch) -> None:
+    shuffled = write_targets(tmp_path / "s.txt", 2)
+    monkeypatch.setattr(rc.subprocess, "run", _ok_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl",
+                        lambda w, j, m, s: (gzip.open(j, "wt").close(), (2, "truncated", None))[1])
+    result = rc.run_measurement_in_chunks(
+        "trace", shuffled_path=shuffled, output_prefix=tmp_path / "out",
+        rate_pps=1000, rr_timeout_seconds=2.0, payload_text=None,
+        chunk_size=2, completed=set(), checkpoint_command=None,
+    )
+    assert result["chunks"][0]["return_code"] != 0
+    assert result["committed"] == 0 and result["chunk_count"] == 1
+
+
+def test_a_measurement_is_complete_only_when_every_chunk_is_committed() -> None:
+    done = {"chunk_count": 3, "committed": 2, "chunks": [{"skipped": True}, {"chunk": 2}, {"chunk": 3}]}
+    assert rc.chunked_measurement_status({**done, "committed": 3}) == 0
+    assert rc.chunked_measurement_status(done) != 0
+
+
+def test_chunk_mode_writes_the_measurement_summary_drivers_expect(tmp_path: Path) -> None:
+    # A real loop result also carries "return_code" (highest scamper exit code).
+    result = {"chunked": True, "chunk_size": 2, "chunk_count": 2, "committed": 2, "return_code": 0,
+              "chunks": [{"chunk": 1, "return_code": 0}, {"chunk": 2, "return_code": 0}]}
+    path = rc.write_chunked_measurement_metadata(
+        tmp_path / "out", "trace6", result, {"node": "n1"}, target_count=3,
+        plan_fingerprint="aaaaaaaaaaaa",
+    )
+    assert path.name == "out.trace6.metadata.json"
+    summary = json.loads(path.read_text())
+    assert summary["chunked"] is True and summary["plan_fingerprint"] == "aaaaaaaaaaaa"
+    assert summary["measurement"] == "trace6" and summary["address_family"] == 6
+    assert summary["target_count"] == 3 and summary["return_code"] == 0 and summary["node"] == "n1"
+
+
+
+def test_an_uncommitted_chunk_fails_the_summary_even_if_scamper_exited_cleanly(tmp_path: Path) -> None:
+    result = {"chunked": True, "chunk_size": 2, "chunk_count": 2, "committed": 1, "return_code": 0,
+              "chunks": [{"chunk": 1, "return_code": 0}, {"chunk": 2, "return_code": 2}]}
+    path = rc.write_chunked_measurement_metadata(
+        tmp_path / "out", "trace", result, {}, target_count=3, plan_fingerprint="aaaaaaaaaaaa",
+    )
+    assert json.loads(path.read_text())["return_code"] != 0
+
+
+def test_a_chunked_run_checkpoints_its_measurement_summary_and_target_list(tmp_path: Path, monkeypatch) -> None:
+    """GCP uploads only status.json at the end, relying on the per-measurement
+    checkpoint. In chunk mode that checkpoint must still send the summary and
+    the shuffled target list, or the driver waits for them forever."""
+    targets = write_targets(tmp_path / "in.txt", 5)
+    uploads: list[str] = []
+
+    def fake_run(command, check=False, **kwargs):
+        if command and command[0] == "upload":
+            uploads.append(Path(command[1]).name)
+        else:
+            Path(command[command.index("-o") + 1]).write_text("warts", encoding="utf-8")
+        class Result:
+            returncode = 0
+        return Result()
+
+    def fake_shuffle(source, destination, seed=None):
+        Path(destination).write_text(Path(source).read_text(encoding="utf-8"), encoding="utf-8")
+        return seed or 1, ["shuf"]
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    monkeypatch.setattr(rc, "shuffle_targets", fake_shuffle)
+    code = rc.main([
+        "--trace-targets", str(targets), "--rr-targets", str(targets),
+        "--output-prefix", str(tmp_path / "out"), "--provider", "gcp", "--region", "r", "--node", "n",
+        "--trace-target-source", "test", "--trace-target-version", "v1",
+        "--rr-target-source", "test", "--rr-target-version", "v1",
+        "--measurements", "trace", "--chunk-targets", "2",
+        "--checkpoint-command", "upload", "{artifact}",
+    ])
+    assert code == 0
+    assert "out.trace.metadata.json" in uploads and "out.trace.targets.txt" in uploads
+    assert "out.trace.warts" not in uploads  # the chunks carry the raw data
+    assert sum(name.endswith(".metadata.json") and ".part-" in name for name in uploads) == 3
+    status = json.loads((tmp_path / "out.status.json").read_text())
+    assert status["complete"] is True
+
+
+def test_committed_chunks_are_recognised_from_bucket_object_names() -> None:
+    names = [
+        "runs/x/nodes/r/old-node/old.trace.plan-aaaaaaaaaaaa.part-00001.metadata.json",
+        "runs/x/nodes/r/old-node/old.trace.plan-aaaaaaaaaaaa.part-00002.warts",  # no marker
+        "runs/x/nodes/r/new-node/new.trace.plan-aaaaaaaaaaaa.part-00004.metadata.json",
+        "runs/x/nodes/r/old-node/old.trace.plan-bbbbbbbbbbbb.part-00003.metadata.json",  # other plan
+    ]
+    assert rc.completed_chunk_indices_from_names(names, "aaaaaaaaaaaa") == {1, 4}
+
+
+def test_a_chunked_run_asks_the_bucket_which_chunks_are_done(tmp_path: Path, monkeypatch) -> None:
+    """Resume: chunks committed by an earlier worker in this region are skipped."""
+    targets = write_targets(tmp_path / "in.txt", 6)
+    asked: list[str] = []
+    measured: list[str] = []
+
+    def fake_run(command, check=False, **kwargs):
+        if command and command[0] != "upload":
+            measured.append(Path(command[command.index("-f") + 1]).name)
+            Path(command[command.index("-o") + 1]).write_text("warts", encoding="utf-8")
+        class Result:
+            returncode = 0
+        return Result()
+
+    def fake_shuffle(source, destination, seed=None):
+        Path(destination).write_text(Path(source).read_text(encoding="utf-8"), encoding="utf-8")
+        return seed or 1, ["shuf"]
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    monkeypatch.setattr(rc, "shuffle_targets", fake_shuffle)
+    plan: dict[str, str] = {}
+    real_plan = rc.chunk_plan
+
+    def spy_plan(sha, size, measurement):
+        fingerprint, seed = real_plan(sha, size, measurement)
+        plan["fingerprint"] = fingerprint
+        return fingerprint, seed
+
+    monkeypatch.setattr(rc, "chunk_plan", spy_plan)
+    # Chunk 2 of this exact plan is already committed in the bucket.
+    monkeypatch.setattr(rc, "list_committed_chunk_objects", lambda uri: (asked.append(uri), [
+        f"runs/x/nodes/r/old/old.trace.plan-{plan['fingerprint']}.part-00002.metadata.json"])[1])
+    rc.main([
+        "--trace-targets", str(targets), "--rr-targets", str(targets),
+        "--trace-target-source", "test", "--trace-target-version", "v1",
+        "--rr-target-source", "test", "--rr-target-version", "v1",
+        "--output-prefix", str(tmp_path / "out"), "--provider", "gcp", "--region", "r", "--node", "n",
+        "--measurements", "trace", "--chunk-targets", "2",
+        "--completed-chunks-prefix", "gs://b/runs/x/nodes/r/",
+        "--checkpoint-command", "upload", "{artifact}",
+    ])
+    assert asked == ["gs://b/runs/x/nodes/r/"]
+    assert [name for name in measured if ".part-" in name] == [
+        f"out.trace.plan-{plan['fingerprint']}.part-00001.targets.txt",
+        f"out.trace.plan-{plan['fingerprint']}.part-00003.targets.txt",
+    ]
+
+
+def test_an_unreadable_bucket_means_measuring_everything(monkeypatch) -> None:
+    def broken(prefix_uri: str):
+        raise PermissionError("403")
+    monkeypatch.setattr(rc, "list_committed_chunk_objects", broken)
+    assert rc.bucket_completed_chunks("gs://b/p/", "aaaaaaaaaaaa") == set()
+
+
+def test_chunk_metadata_carries_the_worker_identity(tmp_path: Path, monkeypatch) -> None:
+    """The mapper names the vantage point from metadata (probe, node, probe_ip)."""
+    shuffled = write_targets(tmp_path / "s.txt", 2)
+    monkeypatch.setattr(rc.subprocess, "run", _ok_run)
+    monkeypatch.setattr(rc, "convert_chunk_to_jsonl", _ok_convert)
+    rc.run_measurement_in_chunks(
+        "trace", shuffled_path=shuffled, output_prefix=tmp_path / "out",
+        rate_pps=1000, rr_timeout_seconds=2.0, payload_text=None,
+        chunk_size=2, completed=set(), checkpoint_command=None,
+        record_extra={"provider": "gcp", "region": "us-west1", "node": "n1", "probe_ip": "34.1.2.3"},
+    )
+    record = json.loads((tmp_path / "out.trace.part-00001.metadata.json").read_text())
+    assert (record["provider"], record["node"], record["probe_ip"]) == ("gcp", "n1", "34.1.2.3")
+    assert record["measurement"] == "trace"  # the chunk's own fields still win
