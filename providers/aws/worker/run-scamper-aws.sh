@@ -32,11 +32,35 @@ TRACE_ARGS="trace -m 20 -g 8 -w 3 -q 2 -P ICMP"
 OUTPUT_DIR="results"
 OUTPUT_PREFIX="$OUTPUT_DIR/$RUN_OUTPUT_PREFIX"
 
-echo "apt-get update"
-sudo apt-get update
+retry_package_command() {
+  local attempt=1
+  local max_attempts=30
+  while ! sudo "$@"; do
+    if (( attempt >= max_attempts )); then
+      echo "Package command failed after $max_attempts attempts: $*" >&2
+      return 1
+    fi
+    echo "Package manager is busy; retrying in 5 seconds ($attempt/$max_attempts)" >&2
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+}
+
+# On first boot cloud-init rewrites apt sources (archive.ubuntu.com -> the
+# regional EC2 mirror) after SSH is already open. An apt-get update that runs
+# first leaves an index without scamper, and the install fails with "Unable to
+# locate package scamper" (canary 2026-10-12). Wait for it, as on Azure.
+if command -v cloud-init >/dev/null 2>&1; then
+  sudo cloud-init status --wait || true
+fi
+
+echo "apt-get update and enable universe"
+retry_package_command apt-get update
+retry_package_command add-apt-repository universe -y
+retry_package_command apt-get update
 
 echo "apt install -y scamper python3-pip"
-sudo apt install -y scamper python3-pip
+retry_package_command apt install -y scamper python3-pip
 
 echo "pip install google-cloud-storage"
 sudo pip install google-cloud-storage

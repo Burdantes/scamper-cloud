@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).parents[2]
 SMOKE_SCRIPT = REPO_ROOT / "providers/common/worker/scamper-smoke.sh"
@@ -87,12 +89,21 @@ def test_azure_ipv6_guest_firewall_allows_icmp_and_drops_other_input() -> None:
     assert '[[ "$provider" == "azr" ]]' in script
 
 
-def test_azure_worker_waits_for_cloud_init_and_retries_package_locks() -> None:
-    script = (REPO_ROOT / "providers/azure/worker/run-scamper-azr.sh").read_text(
-        encoding="utf-8"
-    )
+@pytest.mark.parametrize(
+    "worker",
+    ["providers/azure/worker/run-scamper-azr.sh", "providers/aws/worker/run-scamper-aws.sh"],
+)
+def test_ubuntu_workers_wait_for_cloud_init_and_retry_package_commands(worker: str) -> None:
+    """First-boot cloud-init can still be rewriting apt sources when SSH opens.
+
+    On AWS it switches archive.ubuntu.com to the regional EC2 mirror; an
+    apt-get update that runs first leaves an index without scamper, and the
+    install fails with "Unable to locate package scamper" (canary 2026-10-12).
+    """
+    script = (REPO_ROOT / worker).read_text(encoding="utf-8")
 
     assert "cloud-init status --wait" in script
+    assert "retry_package_command add-apt-repository universe -y" in script
     assert "retry_package_command apt-get update" in script
     assert "retry_package_command apt install -y scamper python3-pip" in script
 
