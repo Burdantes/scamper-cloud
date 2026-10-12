@@ -175,3 +175,39 @@ def test_record_outcomes_retries_later_when_the_bucket_cannot_be_read(tmp_path: 
 
     assert progress_probe.record_outcomes(tmp_path, fetch=fetch) == []
     assert not (tmp_path / "jobs/run-x/outcome.json").exists()
+
+
+def test_measurement_is_read_from_chunk_target_names() -> None:
+    assert progress_probe.measurement_of("results/x.trace.plan-aaaaaaaaaaaa.part-00003.targets.txt") == "trace"
+    assert progress_probe.measurement_of("results/x.trace6.plan-aaaaaaaaaaaa.part-00001.targets.txt") == "trace6"
+    assert progress_probe.measurement_of("results/x.trace.targets.txt") == "trace"
+
+
+def test_a_chunked_worker_reports_progress_across_all_chunks() -> None:
+    """scamper only ever has the current chunk open; the run-wide position is
+    (chunks done + position in this chunk) / all chunks."""
+    output = (
+        "POS results/x.trace.plan-aaaaaaaaaaaa.part-00021.targets.txt 500 1000\n"
+        "PARTS trace 40\n"                      # chunk files still pending, current included
+        "TOTAL results/x.trace.targets.txt 12000000\n"
+        "WARTS results/x.trace.plan-aaaaaaaaaaaa.part-00021.warts 7\n"
+    )
+    value = progress_probe.parse_probe(output, chunk_targets=200000)
+    assert value["measurement"] == "trace"
+    assert value["chunks"] == {"total": 60, "done": 20}
+    assert value["fraction"] == round((20 + 0.5) / 60, 6)
+
+
+def test_the_remote_script_reports_pending_chunks_and_the_full_list_length() -> None:
+    assert "PARTS" in progress_probe.REMOTE_SCRIPT
+    assert "TOTAL" in progress_probe.REMOTE_SCRIPT
+
+
+def test_the_chunk_size_comes_from_the_run_or_the_controller_default(monkeypatch) -> None:
+    from providers import settings
+
+    monkeypatch.setattr(settings, "SCAMPER_CHUNK_TARGETS", 200000)
+    job = {"systemd_command": ["systemd-run", "--setenv=GCP_MACHINE_TYPE=e2-micro",
+                               "--setenv=SCAMPER_CHUNK_TARGETS=50000"]}
+    assert progress_probe.chunk_targets_of(job) == 50000
+    assert progress_probe.chunk_targets_of({"systemd_command": ["systemd-run"]}) == 200000

@@ -513,6 +513,10 @@ def run_measurement_in_chunks(
         if index in completed:
             print(f"CHUNK_SKIPPED[{measurement}]={index}/{len(chunks)} already uploaded", flush=True)
             results.append({"chunk": index, "skipped": True})
+            if checkpoint_command:
+                # Already in the bucket: not pending, so the progress prober's
+                # count of remaining chunk files stays honest on a resumed run.
+                chunk_targets.unlink(missing_ok=True)
             continue
         stem = f"{measurement}{plan}.part-{index:05d}"
         warts_path = artifact_path(output_prefix, f"{stem}.warts")

@@ -48,6 +48,15 @@ done
 for w in results/*.warts; do
   [ -f "$w" ] && echo "WARTS $w $(stat -c %s "$w")"
 done
+# Chunked runs: scamper only has the current chunk open, so also report how many
+# chunk files are still pending and how long the full shuffled list is.
+for m in trace trace6 rr; do
+  n=$(ls results/*.$m.plan-*.part-*.targets.txt 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && echo "PARTS $m $n"
+  for t in results/*.$m.targets.txt; do
+    [ -f "$t" ] && echo "TOTAL $t $(wc -l < "$t")"
+  done
+done
 """
 
 
@@ -65,12 +74,17 @@ def ssh_runner(user: str, address: str, script: str, timeout: int = PER_WORKER_T
 
 
 def measurement_of(path: str) -> str:
-    match = re.search(r"\.([a-z0-9]+)\.targets\.txt$", path)
+    # Single-shot: <prefix>.trace.targets.txt. Chunked: <prefix>.trace.plan-<fp>.part-<n>.targets.txt.
+    match = re.search(r"\.([a-z0-9]+)(?:\.plan-[0-9a-f]+\.part-\d+)?\.targets\.txt$", path)
     return match.group(1) if match else "unknown"
 
 
-def parse_probe(output: str) -> dict[str, Any]:
-    """Turn the remote script's output into one worker's progress."""
+def parse_probe(output: str, chunk_targets: int = 0) -> dict[str, Any]:
+    """Turn the remote script's output into one worker's progress.
+
+    For a chunked run, chunk_targets (the run's chunk size) turns the position
+    in the open chunk into a position across the whole measurement.
+    """
     if "NOSCAMPER" in output:
         return {"state": "no-scamper"}
     if not output.strip():
@@ -78,16 +92,24 @@ def parse_probe(output: str) -> dict[str, Any]:
     position = size = None
     measurement = "unknown"
     warts = 0
+    chunked = False
+    pending: dict[str, int] = {}
+    totals: dict[str, int] = {}
     for line in output.splitlines():
         fields = line.split()
         if fields[:1] == ["POS"] and len(fields) == 4:
             measurement = measurement_of(fields[1])
+            chunked = ".part-" in fields[1]
             position, size = int(fields[2]), int(fields[3])
         elif fields[:1] == ["WARTS"] and len(fields) == 3:
             warts += int(fields[2])
+        elif fields[:1] == ["PARTS"] and len(fields) == 3:
+            pending[fields[1]] = int(fields[2])
+        elif fields[:1] == ["TOTAL"] and len(fields) == 3:
+            totals[measurement_of(fields[1])] = int(fields[2])
     if position is None or not size:
         return {"state": "unknown"}
-    return {
+    value = {
         "state": "measuring",
         "measurement": measurement,
         "position": position,
@@ -95,6 +117,23 @@ def parse_probe(output: str) -> dict[str, Any]:
         "fraction": round(position / size, 6),
         "warts_bytes": warts,
     }
+    if chunked and chunk_targets > 0 and measurement in pending and totals.get(measurement):
+        total = -(-totals[measurement] // chunk_targets)
+        done = max(total - pending[measurement], 0)
+        value["chunks"] = {"total": total, "done": done}
+        value["fraction"] = round(min((done + position / size) / total, 1.0), 6)
+    return value
+
+
+def chunk_targets_of(job: dict[str, Any]) -> int:
+    """The run's chunk size: its own SCAMPER_CHUNK_TARGETS if the job set one,
+    otherwise the controller default the drivers used."""
+    for item in job.get("systemd_command") or []:
+        if str(item).startswith("--setenv=SCAMPER_CHUNK_TARGETS="):
+            return int(str(item).rsplit("=", 1)[1])
+    from providers import settings
+
+    return settings.SCAMPER_CHUNK_TARGETS
 
 
 def workers_of(job_dir: Path, run_id: str) -> list[tuple[str, str]]:
@@ -127,6 +166,7 @@ def probe_run(run_id: str, root: Path = STATE_ROOT, runner: Callable[..., str] =
     except (OSError, json.JSONDecodeError):
         job = {}
     user = SSH_USERS.get(job.get("provider", ""), "ubuntu")
+    chunk_targets = chunk_targets_of(job)
     workers = []
     for location, address in workers_of(job_dir, run_id):
         if deadline is not None and time.monotonic() >= deadline:
@@ -134,7 +174,7 @@ def probe_run(run_id: str, root: Path = STATE_ROOT, runner: Callable[..., str] =
             continue
         entry = {"location": location, "address": address}
         try:
-            entry.update(parse_probe(runner(user, address, REMOTE_SCRIPT)))
+            entry.update(parse_probe(runner(user, address, REMOTE_SCRIPT), chunk_targets))
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
             entry.update({"state": "unreachable", "error": f"{type(error).__name__}: {error}"})
         workers.append(entry)
