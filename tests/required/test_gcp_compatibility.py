@@ -179,6 +179,7 @@ def test_create_instance_zones_keeps_trying_until_requested_successes(
 
     monkeypatch.setattr(gcp, "create_instance", create_instance)
     monkeypatch.setattr(gcp, "wait_zone_operation", wait_zone_operation)
+    monkeypatch.setattr(gcp, "discard_failed_worker", lambda project, zone, name: False)
 
     zones = gcp.create_instance_zones(
         "gcp-test",
@@ -205,6 +206,7 @@ def test_create_instance_regions_uses_one_zone_per_region_and_retries(
 
     monkeypatch.setattr(gcp, "create_instance", create_instance)
     monkeypatch.setattr(gcp, "wait_zone_operation", wait_zone_operation)
+    monkeypatch.setattr(gcp, "discard_failed_worker", lambda project, zone, name: False)
 
     zones = gcp.create_instance_regions(
         "gcp-test",
@@ -571,3 +573,99 @@ def test_build_plan_normalizes_custom_object_prefix() -> None:
 def test_normalized_object_prefix_rejects_parent_traversal() -> None:
     with pytest.raises(gcp.argparse.ArgumentTypeError, match="object prefix"):
         gcp.normalized_object_prefix("runs/../elsewhere")
+
+
+
+class _HttpError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.resp = type("Resp", (), {"status": status})()
+
+
+def test_a_failed_zone_is_cleaned_up_before_falling_back(monkeypatch) -> None:
+    """2026-10-13: the insert in southamerica-east1-b raised "The read operation
+    timed out" but GCP created the VM anyway; the driver fell back to -c and the
+    -b worker ran untracked for 27 hours."""
+    events: list[tuple[str, str]] = []
+
+    def create_instance(project, zone, name):
+        events.append(("create", zone))
+        if zone.endswith("-b"):
+            raise TimeoutError("The read operation timed out")
+        return {"name": f"op-{zone}"}
+
+    monkeypatch.setattr(gcp, "create_instance", create_instance)
+    monkeypatch.setattr(gcp, "wait_zone_operation", lambda project, zone, operation: None)
+    monkeypatch.setattr(gcp, "discard_failed_worker",
+                        lambda project, zone, name: events.append(("discard", f"{zone}:{name}")))
+    zones = gcp.create_instance_regions("run", ["sa-east1-b", "sa-east1-c"], ["sa-east1"])
+    assert zones == ["sa-east1-c"]
+    assert events == [("create", "sa-east1-b"), ("discard", "sa-east1-b:run-sa-east1-b"), ("create", "sa-east1-c")]
+
+
+def test_the_zonal_loop_cleans_up_failed_zones_too(monkeypatch) -> None:
+    discarded: list[str] = []
+    monkeypatch.setattr(gcp, "create_instance", lambda project, zone, name: {"name": f"op-{zone}"})
+
+    def wait(project, zone, operation):
+        if zone == "bad-0":
+            raise RuntimeError("operation failed")
+
+    monkeypatch.setattr(gcp, "wait_zone_operation", wait)
+    monkeypatch.setattr(gcp, "discard_failed_worker", lambda project, zone, name: discarded.append(name))
+    assert gcp.create_instance_zones("run", ["bad-0", "good-0"], max_instances=1) == ["good-0"]
+    assert discarded == ["run-bad-0"]
+
+
+def _fake_compute(get_results):
+    calls: list[str] = []
+
+    class Request:
+        def __init__(self, action):
+            self.action = action
+
+        def execute(self):
+            calls.append(self.action)
+            if self.action == "get":
+                result = get_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return {"name": "delete-op"}
+
+    class Instances:
+        def get(self, project, zone, instance):
+            return Request("get")
+
+        def delete(self, project, zone, instance):
+            return Request("delete")
+
+    return type("Compute", (), {"instances": lambda self: Instances()})(), calls
+
+
+def test_discard_deletes_a_worker_that_exists_despite_the_failure(monkeypatch) -> None:
+    compute, calls = _fake_compute([{"name": "run-sa-east1-b", "status": "RUNNING"}])
+    monkeypatch.setattr(gcp, "get_compute", lambda: compute)
+    waited: list[str] = []
+    monkeypatch.setattr(gcp, "wait_zone_operation", lambda project, zone, operation: waited.append(operation))
+    assert gcp.discard_failed_worker("p", "sa-east1-b", "run-sa-east1-b") is True
+    assert calls == ["get", "delete"] and waited == ["delete-op"]
+
+
+def test_discard_does_nothing_when_no_worker_was_created(monkeypatch) -> None:
+    import googleapiclient.errors as errors
+
+    monkeypatch.setattr(errors, "HttpError", _HttpError)
+    compute, calls = _fake_compute([_HttpError(404)])
+    monkeypatch.setattr(gcp, "get_compute", lambda: compute)
+    assert gcp.discard_failed_worker("p", "z", "n") is False
+    assert calls == ["get"]
+
+
+def test_discard_reports_when_it_cannot_tell(monkeypatch, caplog) -> None:
+    compute, calls = _fake_compute([TimeoutError("t")] * 3)
+    monkeypatch.setattr(gcp, "get_compute", lambda: compute)
+    monkeypatch.setattr(gcp.time, "sleep", lambda seconds: None)
+    assert gcp.discard_failed_worker("p", "z", "n") is None
+    assert calls == ["get", "get", "get"]
+    assert "leaked" in caplog.text
