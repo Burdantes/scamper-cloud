@@ -981,6 +981,41 @@ def delete_instance(project, zone, name):
     )
 
 
+def discard_failed_worker(project, zone, name, attempts=3):
+    """Make sure a create that failed on our side left no VM behind.
+
+    A create call can raise while GCP creates the VM anyway: on 2026-10-13 the
+    insert in southamerica-east1-b raised "The read operation timed out", the
+    driver fell back to -c, and the -b worker ran untracked for 27 hours.
+    Returns True if a VM existed and was deleted, False if none existed, and
+    None if neither could be confirmed (logged as a possible leak).
+    """
+    from googleapiclient.errors import HttpError
+
+    for attempt in range(1, attempts + 1):
+        try:
+            get_compute().instances().get(project=project, zone=zone, instance=name).execute()
+        except HttpError as error:
+            if getattr(error.resp, "status", None) == 404:
+                return False
+            logging.warning("Could not look up %s in %s (attempt %d): %s", name, zone, attempt, error)
+        except Exception as error:  # timeouts, transport errors
+            logging.warning("Could not look up %s in %s (attempt %d): %s", name, zone, attempt, error)
+        else:
+            try:
+                operation = delete_instance(project, zone, name)["name"]
+                wait_zone_operation(project, zone, operation)
+                logging.warning("Deleted %s in %s: it was created despite the failed create call", name, zone)
+                return True
+            except Exception as error:
+                logging.warning("Could not delete %s in %s (attempt %d): %s", name, zone, attempt, error)
+        time.sleep(5 * attempt)
+    logging.error(
+        "Could not confirm that %s in %s does not exist; it may be a leaked, billing VM", name, zone
+    )
+    return None
+
+
 def wait_zone_operation(project, zone, operation):
     while True:
         result = (
@@ -1027,6 +1062,7 @@ def create_instance_zones(prefix, zones, max_instances=None, ipv6_enabled=False)
                 operations.append((zone, operation))
             except Exception as err:
                 logging.warning("Skipping zone %s: %s", zone, err)
+                discard_failed_worker(settings.GCP_PROJECT, zone, f"{prefix}-{zone}")
 
         if not operations:
             break
@@ -1038,6 +1074,7 @@ def create_instance_zones(prefix, zones, max_instances=None, ipv6_enabled=False)
                 logging.info("Instance %s created", zone)
             except Exception as err:
                 logging.warning("Skipping created zone %s: %s", zone, err)
+                discard_failed_worker(settings.GCP_PROJECT, zone, f"{prefix}-{zone}")
 
         if max_instances is None:
             break
@@ -1096,6 +1133,9 @@ def create_instance_regions(
                     region,
                     err,
                 )
+                # Before trying the next zone: the failed call may still have
+                # created a VM that nothing would ever delete.
+                discard_failed_worker(settings.GCP_PROJECT, zone, f"{prefix}-{zone}")
         else:
             logging.error("No worker could be created in GCP region %s", region)
 
