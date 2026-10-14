@@ -141,9 +141,29 @@ run_scamper_smoke_test() {
     log_ipv6_network_state "$target"
   fi
 
-  echo "Running scamper smoke test for $provider against $target"
-  echo "sudo scamper -c \"$trace_args\" -p $pps -f $target_file -o $warts_file -O warts"
-  sudo scamper -c "$trace_args" -p "$pps" -f "$target_file" -o "$warts_file" -O warts 2>&1 | tee "$log_file"
-  sudo sc_warts2text "$warts_file" > "$text_file"
-  validate_scamper_smoke_text "$text_file" "$target" "$min_hops"
+  # Retry with backoff before failing. Azure IPv6 smoke failures (no reply at
+  # all, not even from hop 1, while a TCP check had just succeeded) were
+  # intermittent across regions on 2026-10-12/13, consistent with a fresh VM
+  # whose path is not ready yet. A worker that never gets replies still fails;
+  # the per-attempt timestamps show whether waiting fixed it.
+  local delays=(${SCAMPER_SMOKE_RETRY_SECONDS:-30 60 120})
+  local attempts=$(( ${#delays[@]} + 1 ))
+  local attempt
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    echo "Running scamper smoke test for $provider against $target (attempt $attempt/$attempts at $(date -u +%H:%M:%SZ))"
+    echo "sudo scamper -c \"$trace_args\" -p $pps -f $target_file -o $warts_file -O warts"
+    sudo scamper -c "$trace_args" -p "$pps" -f "$target_file" -o "$warts_file" -O warts 2>&1 | tee "$log_file"
+    sudo sc_warts2text "$warts_file" > "$text_file"
+    if validate_scamper_smoke_text "$text_file" "$target" "$min_hops"; then
+      echo "SCAMPER_SMOKE_ATTEMPT target=$target attempt=$attempt/$attempts"
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      local wait_seconds="${delays[$((attempt - 1))]}"
+      echo "SCAMPER_SMOKE_RETRY attempt=$attempt/$attempts target=$target retry_in=${wait_seconds}s"
+      sleep "$wait_seconds"
+    fi
+  done
+  echo "SCAMPER_SMOKE_FAILED attempts=$attempts target=$target"
+  return 1
 }

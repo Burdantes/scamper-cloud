@@ -360,3 +360,54 @@ def test_workers_pass_chunking_and_a_per_chunk_upload_to_the_runner(worker: str)
     # may be appended to campaign_args after it.
     tail = script[script.rindex("--checkpoint-command"):script.index("run_campaign.py \"${campaign_args[@]}\"")]
     assert "campaign_args+=(" not in tail.split("\n", 2)[-1]
+
+
+def _fake_smoke_bin(tmp_path: Path, answered_from_attempt: int) -> Path:
+    """Fake scamper/sc_warts2text/sudo: attempts before `answered_from_attempt`
+    get no replies (all '*'), later ones see real hops."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    counter = tmp_path / "attempts"
+    counter.write_text("0", encoding="utf-8")
+    (bin_dir / "sudo").write_text('#!/bin/bash\n"$@"\n', encoding="utf-8")
+    (bin_dir / "scamper").write_text(
+        f'#!/bin/bash\nn=$(( $(cat {counter}) + 1 )); echo $n > {counter}\n'
+        'out=""; while [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && out="$2"; shift; done; echo w > "$out"\n',
+        encoding="utf-8",
+    )
+    (bin_dir / "sc_warts2text").write_text(
+        f'#!/bin/bash\nn=$(cat {counter})\n'
+        'echo "traceroute from 2404::4 to 2606:4700:4700::1111"\n'
+        f'if (( n >= {answered_from_attempt} )); then echo " 1  fe80::1  1.0 ms"; echo " 2  2001:db8::1  2.0 ms";'
+        ' else echo " 1  *"; echo " 2  *"; fi\n',
+        encoding="utf-8",
+    )
+    for tool in bin_dir.iterdir():
+        tool.chmod(0o755)
+    return bin_dir
+
+
+def test_an_ipv6_smoke_test_that_fails_first_is_retried_and_can_pass(tmp_path: Path) -> None:
+    """Azure IPv6 smoke failures (all '*', even hop 1) were intermittent across
+    regions on 2026-10-12/13; a fresh VM may not have its IPv6 path ready yet."""
+    bin_dir = _fake_smoke_bin(tmp_path, answered_from_attempt=2)
+    result = run_bash(
+        f"export PATH={bin_dir}:$PATH SCAMPER_SMOKE_DIR={tmp_path}/s SCAMPER_SMOKE_RETRY_SECONDS='0 0 0'; "
+        f"source {SMOKE_SCRIPT}; log_ipv6_network_state() {{ :; }}; "
+        "run_scamper_smoke_test gcp 'trace -m 20' 6"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SCAMPER_SMOKE_RETRY attempt=1/4" in result.stdout
+    assert "SCAMPER_SMOKE_OK" in result.stdout and "attempt=2/4" in result.stdout
+
+
+def test_a_smoke_test_that_never_gets_replies_still_fails(tmp_path: Path) -> None:
+    bin_dir = _fake_smoke_bin(tmp_path, answered_from_attempt=99)
+    result = run_bash(
+        f"export PATH={bin_dir}:$PATH SCAMPER_SMOKE_DIR={tmp_path}/s SCAMPER_SMOKE_RETRY_SECONDS='0 0 0'; "
+        f"source {SMOKE_SCRIPT}; log_ipv6_network_state() {{ :; }}; "
+        "run_scamper_smoke_test gcp 'trace -m 20' 6"
+    )
+    assert result.returncode != 0
+    assert result.stdout.count("SCAMPER_SMOKE_RETRY") == 3
+    assert "SCAMPER_SMOKE_FAILED attempts=4" in result.stdout + result.stderr
