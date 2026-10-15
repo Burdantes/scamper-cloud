@@ -167,3 +167,45 @@ run_scamper_smoke_test() {
   echo "SCAMPER_SMOKE_FAILED attempts=$attempts target=$target"
   return 1
 }
+
+# Pre-measurement check, run by run_campaign.py --preflight-command right
+# before each measurement:
+#
+#   scamper-smoke.sh preflight PROVIDER MEASUREMENT
+#
+# The launch smoke test alone missed the 2026-10-12 Azure failure: 38 of 39
+# workers passed it, then ~18 h later every trace6 probe failed with
+# "scamper_icmp6_open: could not bind" (link-local source) and the empty
+# chunks were committed. For trace6 this re-runs the IPv6 smoke test (with its
+# retries) and logs the IPv6 address/route state before and, on failure, after
+# it, so the log shows what changed. Other measurements pass through.
+scamper_preflight() {
+  local provider="$1"
+  local measurement="$2"
+  if [[ "${SCAMPER_SKIP_PREFLIGHT:-0}" == "1" ]]; then
+    echo "SCAMPER_PREFLIGHT_SKIPPED measurement=$measurement"
+    return 0
+  fi
+  case "$measurement" in
+    trace6)
+      local trace_args="${SCAMPER_PREFLIGHT_TRACE_ARGS:-trace -m 20 -g 8 -w 3 -q 2 -P ICMP}"
+      echo "SCAMPER_PREFLIGHT measurement=$measurement provider=$provider at $(date -u +%FT%TZ)"
+      if run_scamper_smoke_test "$provider" "$trace_args" 6; then
+        echo "SCAMPER_PREFLIGHT_OK measurement=$measurement"
+        return 0
+      fi
+      echo "SCAMPER_PREFLIGHT_FAILED measurement=$measurement; IPv6 state after the retries:"
+      log_ipv6_network_state "$(smoke_target_for_provider "$provider" 6)"
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == "preflight" ]]; then
+  shift
+  scamper_preflight "$@"
+  exit $?
+fi

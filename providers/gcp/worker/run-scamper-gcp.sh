@@ -119,6 +119,9 @@ fi
 if [[ -n "${SCAMPER_TRACE6_TARGET_SHA256:-}" ]]; then
   campaign_args+=(--trace6-target-sha256 "$SCAMPER_TRACE6_TARGET_SHA256")
 fi
+# Re-check right before each measurement, not only at launch: a worker can lose
+# its IPv6 source hours into a campaign (see scamper-smoke.sh scamper_preflight).
+campaign_args+=(--preflight-command "bash $SCRIPT_DIR/scamper-smoke.sh preflight gcp {measurement}")
 # Chunked mode: each chunk of targets is uploaded the moment it is measured,
 # so a stopped or crashed campaign keeps everything up to its last chunk and
 # can resume from the chunks already in the bucket.
