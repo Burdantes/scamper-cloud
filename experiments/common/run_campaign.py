@@ -428,6 +428,47 @@ def completed_chunk_indices(path: Path | None, fingerprint: str | None = None) -
     return done
 
 
+# Return code recorded for a measurement whose preflight check failed. It is
+# distinct from scamper's own codes so a status.json reader can tell "never ran"
+# from "ran and failed".
+PREFLIGHT_FAILED = 3
+PREFLIGHT_TIMEOUT_SECONDS = 1800
+
+
+def run_preflight(command: str | None, measurement: str) -> dict[str, Any] | None:
+    """Run the worker's pre-measurement check; return a failure record, or None.
+
+    A worker can lose a usable source address hours into a campaign: on the
+    2026-10-12 Azure run, 38 of 39 IPv6 workers passed the launch smoke test,
+    then ~18 h later every trace6 probe failed with "scamper_icmp6_open: could
+    not bind" and committed empty chunks with rc=0. Checking right before the
+    measurement keeps that from being recorded as a measured region. Its output
+    is not captured, so the network state it logs lands in the worker log.
+    """
+    if not command:
+        return None
+    argv = [part.format(measurement=measurement) for part in shlex.split(command)]
+    started = utc_now()
+    try:
+        returncode = subprocess.run(argv, check=False, timeout=PREFLIGHT_TIMEOUT_SECONDS).returncode
+    except subprocess.TimeoutExpired:
+        returncode = None
+    except OSError as err:
+        print(f"PREFLIGHT_ERROR[{measurement}] {err}", flush=True)
+        returncode = None
+    if returncode == 0:
+        print(f"PREFLIGHT_OK[{measurement}]", flush=True)
+        return None
+    print(f"PREFLIGHT_FAILED[{measurement}] return_code={returncode}; not measuring", flush=True)
+    return {
+        "preflight_failed": True,
+        "preflight_command": argv,
+        "preflight_return_code": returncode,
+        "preflight_started_at": started.isoformat(),
+        "preflight_finished_at": utc_now().isoformat(),
+    }
+
+
 def chunked_measurement_status(result: dict[str, Any]) -> int:
     """0 only when every chunk is in the bucket; a gap means the run is incomplete."""
     return 0 if result.get("committed") == result.get("chunk_count") else 1
@@ -832,6 +873,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--do-not-probe-version")
     parser.add_argument("--measurements", default="trace,rr")
     parser.add_argument(
+        "--preflight-command",
+        help=(
+            "command run immediately before each measurement ({measurement} is "
+            "substituted); if it fails, that measurement is not run and is "
+            f"recorded with return code {PREFLIGHT_FAILED}"
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-command",
         nargs=argparse.REMAINDER,
         help=(
@@ -894,6 +943,41 @@ def main(argv: list[str] | None = None) -> int:
             expected_sha256=expected_sha256,
             expected_family=MEASUREMENT_FAMILIES[measurement],
         )
+        preflight_failure = run_preflight(args.preflight_command, measurement)
+        if preflight_failure is not None:
+            # Nothing is measured, so no chunk is committed and a resume into the
+            # same prefix measures this one again. The record says why.
+            statuses[measurement] = PREFLIGHT_FAILED
+            metadata[measurement] = preflight_failure
+            failure_path = artifact_path(args.output_prefix, f"{measurement}.metadata.json")
+            failure_path.write_text(
+                json.dumps(
+                    {
+                        **common_metadata,
+                        **preflight_failure,
+                        "measurement": measurement,
+                        "address_family": MEASUREMENT_FAMILIES[measurement],
+                        "target_count": target_count,
+                        "return_code": PREFLIGHT_FAILED,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if args.checkpoint_command:
+                # Only the failure record exists: no targets were shuffled or measured.
+                values = {
+                    "artifact": str(failure_path),
+                    "artifact_name": failure_path.name,
+                    "measurement": measurement,
+                    "output_prefix": str(args.output_prefix),
+                }
+                subprocess.run(
+                    [argument.format_map(values) for argument in args.checkpoint_command],
+                    check=True,
+                )
+            continue
         rate = {
             "trace": args.trace_rate,
             "trace6": args.trace6_rate,
